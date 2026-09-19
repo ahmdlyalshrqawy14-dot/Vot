@@ -1,10 +1,10 @@
-name: Test Pipeline (Phase 1 & Phase 2)
+name: Full Production Test (Phases 1, 2 & 3)
 
 on:
   workflow_dispatch:
 
 jobs:
-  build:
+  run-pipeline:
     runs-on: ubuntu-latest
 
     steps:
@@ -36,12 +36,24 @@ jobs:
         run: |
           python src/generate_audio.py
 
-      - name: Upload Audio & Sync Artifacts
+      - name: Run Phase 3 (Parallel Image Engine)
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
+          GEMINI_API_KEY_3: ${{ secrets.GEMINI_API_KEY_3 }}
+          GEMINI_API_KEY_4: ${{ secrets.GEMINI_API_KEY_4 }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python src/generate_images.py
+
+      - name: Upload Episode Assets
         uses: actions/upload-artifact@v4
         with:
-          name: audio_and_sync_package
+          name: episode_full_assets
           path: |
             current_episode.json
             audio/full_voiceover.mp3
             audio/sync_map.json
+            images/timeline/
+            images/thumbnails/
           retention-days: 5
