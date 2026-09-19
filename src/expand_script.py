@@ -5,14 +5,26 @@ import re
 from google import genai
 from google.genai import types
 
-# قائمة النماذج حسب أولويتك المحددة
 MODELS_PRIORITY = [
     "gemini-3.8-flash",
     "gemini-3.7-flash",
     "gemini-3.6-flash",
     "gemini-3.1-flash",
-    "gemini-3.5-flash-lite"
+    "gemini-3.5-flash-lite",
+    "gemini-2.5-flash"  # احتياطي في حال عدم توفر أسماء الإصدارات التجريبية
 ]
+
+# القائمة الرسمية الحصرية للانفعالات وفق دليل الإنتاج
+APPROVED_EMOTIONS = (
+    "[admiration], [aggression], [amusement], [anger], [anxiety], [apology], [approval], "
+    "[awe], [boredom], [calm], [celebration], [concern], [contempt], [contentment], "
+    "[curiosity], [determination], [disapproval], [disbelief], [disgust], [embarrassment], "
+    "[empathy], [enthusiasm], [excitement], [fear], [frustration], [gasps], [gratitude], "
+    "[hope], [humor], [interest], [joy], [laughs], [longing], [love], [nervousness], "
+    "[nostalgia], [pride], [relief], [sadness], [sarcasm], [satisfaction], [shock], "
+    "[sighs], [suspense], [sympathy], [tenderness], [tiredness], [trust], [uncertainty], "
+    "[urgency], [vulnerability], [warning], [whispers], [wonder], [cries]"
+)
 
 def get_next_episode(bank_path="episodes_bank.json"):
     if not os.path.exists(bank_path):
@@ -30,7 +42,6 @@ def get_next_episode(bank_path="episodes_bank.json"):
     sys.exit(0)
 
 def clean_json_response(text: str) -> str:
-    """تنظيف الرد في حال تم إرجاع علامات الماركداون"""
     text = text.strip()
     match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
     if match:
@@ -41,20 +52,36 @@ def expand_episode_with_fallback(episode_data, api_key):
     client = genai.Client(api_key=api_key)
     
     prompt = f"""
-You are a senior YouTube scriptwriter, biomechanics expert, and creative director for an evidence-based fitness channel.
+You are a Lead YouTube Scriptwriter and Biomechanics Production Specialist.
 
 Transform this episode blueprint into a full, high-retention YouTube production package:
-Blueprint:
 {json.dumps(episode_data, indent=2)}
 
 STRICT PRODUCTION RULES:
 1. Language: 100% English across all fields.
 2. Script Length & Pacing: Expand into 40 to 55 punchy sentences. Every sentence MUST end with a period (.), express one complete thought, and be suited for a single natural breath.
-3. Narrative Structure: Include 3 hooks in metadata. In the timeline, use the strongest hook first, develop relatable analogies, insert a retention-reset question mid-way, state the core takeaway ("The Zaytouna"), add a tailored subscribe CTA, and conclude with the comment question.
-4. Image Prompts (1-to-1 Mapping): Provide an image prompt for EVERY sentence. Use this exact base prompt, altering ONLY the pose/action and maintaining the orange color:
-   "Create a 2D muscular character illustration in the exact style of the provided example. The figure should be orange, with a smooth head, large white oval eyes, no mouth, and a defined muscular body wearing black shorts. Maintain the same proportions and facial features as in the reference. [INSERT SPECIFIC POSE HERE]. Background must be plain white. Clean, cel-shaded, and expressive style. Keep the style consistent across all generated images."
-5. Voice TTS: Wrap 1 to 2 emotions in square brackets (e.g., [shock] [urgency], [calm], [sarcasm]) selected from the approved list, followed by the spoken sentence containing natural emojis. Never repeat the same emotion 3 times consecutively.
-6. Packaging: Generate 3 distinct titles (Curiosity, Pain Point, Outcome), 3 thumbnail prompts matching those angles, an engaging description, and comma-separated tags.
+3. Narrative Structure:
+   - In metadata: 3 distinct clickable titles (Curiosity, Pain Point, Outcome).
+   - In timeline: Open with the strongest pattern-interrupt hook, translate anatomy/science into vivid relatable scenarios, insert a retention-reset question mid-way, present the core takeaway ("The Zaytouna"), add a smart tailored subscribe CTA, and finish with a high-engagement comment question.
+4. Base Character Image Prompts (1-to-1 Mapping for BOTH Timeline AND Thumbnails):
+   You MUST use this EXACT template for every single image prompt in timeline AND in thumbnails:
+   "Create a 2D muscular character illustration in the exact style of the provided example. The figure should be orange, with a smooth head, large white oval eyes, no mouth, and a defined muscular body wearing black shorts. Maintain the same proportions and facial features as in the reference. [INSERT DYNAMIC POSE HERE]. Background must be plain white. Clean, cel-shaded, and expressive style. Keep the style consistent across all generated images."
+   - STRICT CONSTRAINT: Do NOT add text overlays, subtitles, split screens, or colored backgrounds. Only plain white background. Alter ONLY the [INSERT DYNAMIC POSE HERE].
+   - Thumbnails must depict extreme, high-visibility expressive character poses representing each angle (Curiosity, Pain Point, Outcome) using the same exact Base Prompt.
+5. Google TTS Emotion Tagging (STRICT WHITELIST):
+   - You are ONLY permitted to use emotions from this exact list:
+     {APPROVED_EMOTIONS}
+   - STRICT FORBIDDEN WORDS: NEVER use unapproved emotions like [authority], [focus], [caution], [reflective], [serious], etc. If you want authority, use [trust] or [determination]. If you want caution, use [warning] or [concern]. If you want focus, use [interest] or [calm].
+   - Put 1 to 2 emotions in square brackets at the start of each sentence, followed by the spoken sentence with natural emojis placed inside.
+   - Do NOT repeat the exact same emotion 3 times consecutively.
+6. Description Formatting:
+   The description field must strictly follow this structure:
+   [Line 1-2: Hook and core benefit summary]
+   [Brief 2-3 sentence overview of the video's science-backed solution]
+   
+   Question of the day: [The exact comment question]
+   Subscribe: [Tailored call to action]
+7. Tags: A single comma-separated line from broad to niche keywords.
 
 Return ONLY a valid raw JSON object matching this schema:
 {{
@@ -67,16 +94,16 @@ Return ONLY a valid raw JSON object matching this schema:
     "tags": ""
   }},
   "thumbnails": [
-    {{ "angle": "curiosity", "prompt": "" }},
-    {{ "angle": "pain_point", "prompt": "" }},
-    {{ "angle": "outcome_gain", "prompt": "" }}
+    {{ "angle": "curiosity", "prompt": "Exact base prompt with extreme curiosity pose" }},
+    {{ "angle": "pain_point", "prompt": "Exact base prompt with extreme defeat/pain pose" }},
+    {{ "angle": "outcome_gain", "prompt": "Exact base prompt with extreme victory/strength pose" }}
   ],
   "timeline": [
     {{
       "id": 1,
       "script_sentence": "Sentence here.",
       "voice_tts": "[emotion] \\"Sentence with emoji.\\"",
-      "image_prompt": "Base character prompt with pose."
+      "image_prompt": "Exact base prompt with pose."
     }}
   ]
 }}
@@ -104,7 +131,7 @@ Return ONLY a valid raw JSON object matching this schema:
             last_error = e
             continue
 
-    print(f"Error: All fallback models failed. Last error: {last_error}")
+    print(f"Error: All models failed. Last error: {last_error}")
     sys.exit(1)
 
 def main():
@@ -117,7 +144,7 @@ def main():
     episode, all_episodes = get_next_episode()
     print(f"Selected Episode {episode['id']}: {episode['topic']}")
     
-    print("Expanding episode with fallback pipeline...")
+    print("Expanding episode with strict rules...")
     expanded_data = expand_episode_with_fallback(episode, api_key)
     
     output_file = "current_episode.json"
