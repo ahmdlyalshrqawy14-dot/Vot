@@ -11,20 +11,36 @@ MODELS_PRIORITY = [
     "gemini-3.6-flash",
     "gemini-3.1-flash",
     "gemini-3.5-flash-lite",
-    "gemini-2.5-flash"  # احتياطي في حال عدم توفر أسماء الإصدارات التجريبية
+    "gemini-3.1-flash-lite"
 ]
 
 # القائمة الرسمية الحصرية للانفعالات وفق دليل الإنتاج
-APPROVED_EMOTIONS = (
-    "[admiration], [aggression], [amusement], [anger], [anxiety], [apology], [approval], "
-    "[awe], [boredom], [calm], [celebration], [concern], [contempt], [contentment], "
-    "[curiosity], [determination], [disapproval], [disbelief], [disgust], [embarrassment], "
-    "[empathy], [enthusiasm], [excitement], [fear], [frustration], [gasps], [gratitude], "
-    "[hope], [humor], [interest], [joy], [laughs], [longing], [love], [nervousness], "
-    "[nostalgia], [pride], [relief], [sadness], [sarcasm], [satisfaction], [shock], "
-    "[sighs], [suspense], [sympathy], [tenderness], [tiredness], [trust], [uncertainty], "
-    "[urgency], [vulnerability], [warning], [whispers], [wonder], [cries]"
-)
+APPROVED_EMOTIONS_LIST = [
+    "admiration", "aggression", "amusement", "anger", "anxiety", "apology", "approval",
+    "awe", "boredom", "calm", "celebration", "concern", "contempt", "contentment",
+    "curiosity", "determination", "disapproval", "disbelief", "disgust", "embarrassment",
+    "empathy", "enthusiasm", "excitement", "fear", "frustration", "gasps", "gratitude",
+    "hope", "humor", "interest", "joy", "laughs", "longing", "love", "nervousness",
+    "nostalgia", "pride", "relief", "sadness", "sarcasm", "satisfaction", "shock",
+    "sighs", "suspense", "sympathy", "tenderness", "tiredness", "trust", "uncertainty",
+    "urgency", "vulnerability", "warning", "whispers", "wonder", "cries"
+]
+APPROVED_EMOTIONS_SET = set(APPROVED_EMOTIONS_LIST)
+
+# قاموس تحويل المترادفات والابتكارات الشائعة إلى القائمة الرسمية
+SYNONYMS_MAP = {
+    "authority": "trust",
+    "focus": "interest",
+    "caution": "warning",
+    "facepalm": "frustration",
+    "patience": "calm",
+    "inspiration": "determination",
+    "warmth": "tenderness",
+    "reflective": "interest",
+    "serious": "determination",
+    "questioning": "curiosity",
+    "alarm": "warning"
+}
 
 def get_next_episode(bank_path="episodes_bank.json"):
     if not os.path.exists(bank_path):
@@ -48,8 +64,56 @@ def clean_json_response(text: str) -> str:
         return match.group(1).strip()
     return text
 
+def sanitize_timeline_emotions(timeline):
+    """تنقية انفعالات الصوت برمجياً وضمان مطابقتها لشروط الدليل 100%"""
+    recent_emotions = []
+    
+    for item in timeline:
+        voice_text = item.get("voice_tts", "")
+        # استخراج الوسوم بين الأقواس المربعة
+        tags = re.findall(r"\[(.*?)\]", voice_text)
+        cleaned_tags = []
+        
+        for tag in tags:
+            tag_clean = tag.lower().strip()
+            # 1. فحص المترادفات
+            if tag_clean in SYNONYMS_MAP:
+                tag_clean = SYNONYMS_MAP[tag_clean]
+            # 2. فحص القائمة المعتمدة
+            if tag_clean not in APPROVED_EMOTIONS_SET:
+                tag_clean = "calm"
+            cleaned_tags.append(tag_clean)
+            
+        if not cleaned_tags:
+            cleaned_tags = ["calm"]
+            
+        primary = cleaned_tags[0]
+        
+        # 3. كسر التكرار في حال تكرر نفس الانفعال 3 مرات متتالية
+        if len(recent_emotions) >= 2 and recent_emotions[-1] == primary and recent_emotions[-2] == primary:
+            alternatives = {
+                "curiosity": "interest",
+                "interest": "trust",
+                "determination": "urgency",
+                "warning": "concern",
+                "calm": "trust"
+            }
+            primary = alternatives.get(primary, "calm")
+            cleaned_tags[0] = primary
+            
+        recent_emotions.append(primary)
+        
+        # استخراج النص الصوتي وإعادة تركيبه بالوسوم النظيفة
+        speech_clean = re.sub(r"^(\s*\[.*?\]\s*)+", "", voice_text).strip()
+        tags_prefix = "".join([f"[{t}] " for t in cleaned_tags])
+        item["voice_tts"] = f"{tags_prefix}{speech_clean}"
+        
+    return timeline
+
 def expand_episode_with_fallback(episode_data, api_key):
     client = genai.Client(api_key=api_key)
+    
+    approved_str = ", ".join([f"[{e}]" for e in APPROVED_EMOTIONS_LIST])
     
     prompt = f"""
 You are a Lead YouTube Scriptwriter and Biomechanics Production Specialist.
@@ -70,8 +134,8 @@ STRICT PRODUCTION RULES:
    - Thumbnails must depict extreme, high-visibility expressive character poses representing each angle (Curiosity, Pain Point, Outcome) using the same exact Base Prompt.
 5. Google TTS Emotion Tagging (STRICT WHITELIST):
    - You are ONLY permitted to use emotions from this exact list:
-     {APPROVED_EMOTIONS}
-   - STRICT FORBIDDEN WORDS: NEVER use unapproved emotions like [authority], [focus], [caution], [reflective], [serious], etc. If you want authority, use [trust] or [determination]. If you want caution, use [warning] or [concern]. If you want focus, use [interest] or [calm].
+     {approved_str}
+   - STRICT FORBIDDEN WORDS: NEVER use unapproved emotions like [authority], [focus], [caution], [reflective], [serious], [facepalm], etc.
    - Put 1 to 2 emotions in square brackets at the start of each sentence, followed by the spoken sentence with natural emojis placed inside.
    - Do NOT repeat the exact same emotion 3 times consecutively.
 6. Description Formatting:
@@ -144,8 +208,13 @@ def main():
     episode, all_episodes = get_next_episode()
     print(f"Selected Episode {episode['id']}: {episode['topic']}")
     
-    print("Expanding episode with strict rules...")
+    print("Expanding episode with fallback pipeline...")
     expanded_data = expand_episode_with_fallback(episode, api_key)
+    
+    # تطبيق التنقية البرمجية لضمان انضباط الانفعالات 100%
+    if "timeline" in expanded_data:
+        print("Sanitizing voice emotions and breaking repetitions...")
+        expanded_data["timeline"] = sanitize_timeline_emotions(expanded_data["timeline"])
     
     output_file = "current_episode.json"
     with open(output_file, "w", encoding="utf-8") as f:
