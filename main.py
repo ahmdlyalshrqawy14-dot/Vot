@@ -7,6 +7,7 @@ from stages.stage2_images import run_stage_2
 from stages.stage2_render_images import render_all_images
 from stages.stage3_audio import run_stage_3
 from stages.stage4_metadata import run_stage_4
+from stages.stage5_video import run_stage_5
 
 def load_episodes():
     if not DATA_FILE.exists():
@@ -28,20 +29,23 @@ def process_single_episode(episode: dict):
     episode_dir = OUTPUT_DIR / f"episode_{ep_id:03d}"
     episode_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. إنتاج السكربت الإنجليزي
+    # 1. السكربت الإنجليزي
     script_text = run_stage_1(episode, episode_dir)
 
-    # 2. استخراج أوامر الصور لكل جملة
+    # 2. أوامر الصور
     image_prompts = run_stage_2(script_text, episode_dir)
 
-    # 2.5 توليد وفحص الصور تسلسلياً (Azure + Pollinations Fallback)
+    # 2.5 توليد وفحص الصور
     render_all_images(image_prompts, episode_dir)
 
-    # 3. النص المرمز عاطفياً وتوليد الصوت البشري
+    # 3. الصوت البشري
     audio_data = run_stage_3(script_text, episode_dir)
 
-    # 4. الميتاداتا والثامبنيل والكلمات الدلالية
+    # 4. الميتاداتا
     metadata_text = run_stage_4(episode, script_text, episode_dir)
+
+    # 5. المونتاج والفيديو النهائي المتزامن
+    run_stage_5(episode_dir)
 
     print(f"\n==================================================")
     print(f"   SUCCESSFULLY FINISHED EPISODE #{ep_id}")
@@ -53,10 +57,9 @@ def main():
     pending_episodes = [ep for ep in episodes if ep.get("status") == "pending"]
 
     if not pending_episodes:
-        print("All episodes are already completed! Nothing to run.")
+        print("All episodes are already completed!")
         return
 
-    # استهداف حلقة واحدة فقط في كل تشغيل
     target_episode = pending_episodes[0]
     ep_id = target_episode.get("id")
     print(f"Targeting single episode: #{ep_id} ({target_episode.get('topic')})")
@@ -65,7 +68,7 @@ def main():
         process_single_episode(target_episode)
         target_episode["status"] = "completed"
         save_episodes(episodes)
-        print(f"\nEpisode #{ep_id} marked as COMPLETED. Execution finished.")
+        print(f"\nEpisode #{ep_id} marked as COMPLETED. Pipeline finished successfully.")
     except Exception as e:
         print(f"\n[ERROR] Pipeline failed on Episode #{ep_id}: {str(e)}")
         sys.exit(1)
