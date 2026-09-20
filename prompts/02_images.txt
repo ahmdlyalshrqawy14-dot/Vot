@@ -17,5 +17,3 @@ Create a 2D muscular character illustration in the exact style of the provided e
 - Separate each prompt with exactly ONE blank line.
 - Do NOT include sentence numbers, labels, explanations, or the original script sentences inside or around the code block.
 ```[span_1](start_span)[span_1](end_span)
-
-أنشئ هذا الملف داخل `prompts/` باسم `02_images.txt`، واكتب **«تم»** لننتقل للملف الثالث (`03_audio.txt`).
