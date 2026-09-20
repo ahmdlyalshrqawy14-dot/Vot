@@ -1,460 +1,286 @@
 import os
-import json
 import sys
 import time
-import base64
-import threading
-import queue
-import logging
-import urllib.parse
 import requests
 from io import BytesIO
 from PIL import Image
-from google import genai
-from google.genai import types
+from openai import AzureOpenAI
 
-# ============ الإعدادات (Config) ============
-GOOGLE_MODELS = ["gemini-3.1-flash-image", "gemini-3.1-flash-lite-image"]
-GOOGLE_RPM_PER_KEY = int(os.getenv("GOOGLE_RPM_PER_KEY", "8"))
-BACKUP_RPM = int(os.getenv("BACKUP_RPM", "15"))
-GOOGLE_INTERVAL = 60.0 / GOOGLE_RPM_PER_KEY
-BACKUP_INTERVAL = 60.0 / BACKUP_RPM
-MAX_ATTEMPTS_PER_TASK = 6
-MAX_BACKUP_RETRIES = 3
-GOOGLE_REQUEST_TIMEOUT_MS = 30000
-STALL_TIMEOUT_SECONDS = 600
-KEY_STATE_FILE = "key_state.json"
-THREAD_JOIN_TIMEOUT = 20  # ثانية لكل ثريد عند الإغلاق
+# 1. أوامر مشاهد الفيديو الـ 45
+TIMELINE_PROMPTS = {
+    1: "pointing an accusing finger forward with a questioning posture",
+    2: "arms folded tightly across chest, shaking head in firm disapproval",
+    3: "holding a heavy sledgehammer/mallet raised, ready to strike downward",
+    4: "standing proud, flexing defined leg muscles with confidence",
+    5: "giving a double thumbs-up with an encouraging nod",
+    6: "holding a small classic pink piggy bank carefully with both hands",
+    7: "happily juggling three glowing gold coins in the air",
+    8: "holding a sturdy metallic defensive shield firmly in front of chest",
+    9: "raising one hand in a worried open-palm stop warning gesture",
+    10: "demonstrating a smooth, graceful, controlled deep squat descent",
+    11: "looking down at knees with a worried, anxious expression",
+    12: "peering closely through a large magnifying glass with intense curiosity",
+    13: "standing in a rock-solid, wide-stance balanced athletic pose",
+    14: "pointing directly at inner quadriceps muscle with focused attention",
+    15: "crossing arms tightly over chest mimicking a locked seatbelt buckle",
+    16: "halting abruptly mid-squat with wide, startled eyes",
+    17: "tapping temple thoughtfully next to a floating glowing brain icon",
+    18: "measuring growing bicep with a tailor's tape measure",
+    19: "bouncing a basketball with energetic athletic movement",
+    20: "standing relaxed while clean sparkle effects float around joints",
+    21: "pointing a firm warning finger toward knee and quadriceps",
+    22: "standing tall and heroic with an imaginary flowing cape pose",
+    23: "classic frustrated facepalm gesture with one hand over face",
+    24: "holding a large floating question mark sign overhead",
+    25: "leaning forward expectantly with an intense, curious gaze",
+    26: "holding a wrench and a hammer in a ready-to-work posture",
+    27: "demonstrating a clean biomechanical hip hinge movement pattern",
+    28: "pointing downward at feet to emphasize knee-over-toe alignment",
+    29: "raising both hands in a strict stop sign gesture",
+    30: "stacking small barbell weight plates carefully one by one",
+    31: "pointing toward a wall calendar graphic to emphasize patience",
+    32: "running hurriedly with an anxious and hurried expression",
+    33: "moving fluidly through a complete deep squat movement cycle",
+    34: "holding a drafting compass drawing a clean geometric arc",
+    35: "looking down into a small hole in the ground with a disappointed frown",
+    36: "closing an imaginary padlock with a firm decisive nod",
+    37: "deep full squat at bottom range in a powerful confident stance",
+    38: "stretching arms out wide as radiant glowing light bursts around",
+    39: "pointing enthusiastically toward a ringing notification bell graphic",
+    40: "waving hello warmly with a friendly welcoming hand gesture",
+    41: "pointing downward toward an empty chat bubble graphic",
+    42: "tilting head in deep reflection with a questioning chin hand gesture",
+    43: "gesturing downward invitingly toward the comments section",
+    44: "typing actively and enthusiastically on an imaginary keyboard",
+    45: "bowing slightly in respectful gratitude with open arms"
+}
 
-# ============ إعداد السجلات ============
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler("production.log", encoding="utf-8"),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
-log = logging.getLogger("image_factory")
-
-
-class TemporaryFailure(Exception):
-    pass
-
-
-class PermanentFailure(Exception):
-    pass
-
-
-# ============ حالة المفاتيح المشتركة ============
-state_lock = threading.Lock()
-file_lock = threading.Lock()
-key_status = {}
-key_fail_streak = {}
-
-
-def load_dead_keys():
-    if not os.path.exists(KEY_STATE_FILE):
-        return set()
-    try:
-        with open(KEY_STATE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if data.get("date") == time.strftime("%Y-%m-%d"):
-            return set(data.get("dead_keys", []))
-    except Exception:
-        pass
-    return set()
-
-
-def save_dead_keys():
-    with state_lock:
-        dead = [k for k, v in key_status.items() if v == "dead"]
-    payload = {"date": time.strftime("%Y-%m-%d"), "dead_keys": dead}
-    tmp_path = KEY_STATE_FILE + ".tmp"
-    with file_lock:
-        try:
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2)
-            os.replace(tmp_path, KEY_STATE_FILE)
-        except Exception as e:
-            log.warning(f"تعذر حفظ حالة المفاتيح: {e}")
-
-
-def mark_key_dead(key_name, reason):
-    with state_lock:
-        key_status[key_name] = "dead"
-    log.error(f"[{key_name}] تم تعطيل المفتاح نهائيًا | السبب: {reason}")
-    save_dead_keys()
-
-
-def alive_keys_count():
-    with state_lock:
-        return sum(1 for v in key_status.values() if v == "alive")
-
-
-def register_failure_and_get_backoff(key_name):
-    with state_lock:
-        streak = key_fail_streak.get(key_name, 0) + 1
-        key_fail_streak[key_name] = streak
-    return min(1 * (2 ** (streak - 1)), 30)
-
-
-def reset_backoff(key_name):
-    with state_lock:
-        key_fail_streak[key_name] = 0
-
-
-# ============ الطوابير ============
-main_queue = queue.Queue()
-backup_queue = queue.Queue()
-failed_tasks = []
-failed_lock = threading.Lock()
-last_progress_time = time.time()
-progress_lock = threading.Lock()
-
-in_flight_lock = threading.Lock()
-in_flight_count = 0
-
-
-def in_flight_inc():
-    global in_flight_count
-    with in_flight_lock:
-        in_flight_count += 1
-
-
-def in_flight_dec():
-    global in_flight_count
-    with in_flight_lock:
-        in_flight_count -= 1
-
-
-def get_in_flight():
-    with in_flight_lock:
-        return in_flight_count
-
-
-def touch_progress():
-    global last_progress_time
-    with progress_lock:
-        last_progress_time = time.time()
-
-
-def seconds_since_progress():
-    with progress_lock:
-        return time.time() - last_progress_time
-
-
-def init_google_clients():
-    keys = []
-    env_names = ["GEMINI_API_KEY", "GEMINI_API_KEY_2", "GEMINI_API_KEY_3", "GEMINI_API_KEY_4"]
-    for name in env_names:
-        key = os.getenv(name)
-        if key and key.strip():
-            keys.append((name, key.strip()))
-    return keys
-
-
-def try_google_generate(client, prompt):
-    last_err = None
-    for model_name in GOOGLE_MODELS:
-        try:
-            response = client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_modalities=["IMAGE"],
-                    image_config=types.ImageConfig(aspect_ratio="16:9")
-                )
-            )
-            if response.candidates:
-                for candidate in response.candidates:
-                    if candidate.content and candidate.content.parts:
-                        for part in candidate.content.parts:
-                            if part.inline_data and part.inline_data.data:
-                                data = part.inline_data.data
-                                return base64.b64decode(data) if isinstance(data, str) else data
-        except Exception as e:
-            last_err = e
-            err_str = str(e)
-            err_lower = err_str.lower()
-
-            if any(x in err_str for x in ["API_KEY_INVALID", "PERMISSION_DENIED", "UNAUTHENTICATED"]):
-                raise PermanentFailure(err_str)
-
-            if "limit: 0" in err_str:
-                raise PermanentFailure(f"Quota is 0 for this model: {err_str}")
-
-            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                if "retry in" in err_lower or "retrydelay" in err_lower:
-                    raise TemporaryFailure(err_str)
-                if any(x in err_lower for x in ["daily", "per day"]):
-                    raise PermanentFailure(f"استُنفدت الحصة اليومية: {err_str}")
-                raise TemporaryFailure(err_str)
-
-            continue
-
-    raise TemporaryFailure(str(last_err) if last_err else "لم يرجع الرد أي صورة")
-
-
-def try_pollinations_generate(prompt):
-    encoded = urllib.parse.quote(prompt)
-    seed = int(time.time() * 1000) % 999999
-    url = f"https://image.pollinations.ai/prompt/{encoded}?width=1280&height=720&model=flux&nologo=true&seed={seed}"
-    response = requests.get(url, timeout=50)
-    if response.status_code == 200:
-        return response.content
-    raise TemporaryFailure(f"HTTP {response.status_code}")
-
-
-def save_processed_image(image_bytes, output_path):
-    if not image_bytes or len(image_bytes) < 100:
-        raise TemporaryFailure("بيانات الصورة فارغة أو تالفة")
-    try:
-        image = Image.open(BytesIO(image_bytes))
-        image.load()
-    except Exception as e:
-        raise TemporaryFailure(f"فشل فك تشفير الصورة: {e}")
-
-    image = image.convert("RGB")
-    image = image.resize((1280, 720), Image.Resampling.LANCZOS)
-
-    tmp_output = output_path + ".part"
-    image.save(tmp_output, "PNG", quality=95)
-    os.replace(tmp_output, output_path)
-
-
-def google_worker(key_name, key_val):
-    client = genai.Client(
-        api_key=key_val,
-        http_options=types.HttpOptions(timeout=GOOGLE_REQUEST_TIMEOUT_MS)
+# 2. برومبتات الأغلفة الـ 3 (مخصصة لجذب الانتباه ومطابقة لمعايير يوتيوب الاحترافية)
+THUMBNAIL_CONFIG = {
+    "thumb_curiosity": (
+        "YouTube master thumbnail composition, high visual impact, rule of thirds. "
+        "Athletic orange humanoid character on the right side leaning forward with hand on chin, "
+        "staring with intense scientific curiosity and shock at a giant glowing holographic knee joint diagram floating on the left. "
+        "High contrast, cinematic clean 2D vector cel-shaded style, ample empty negative space on top for bold title text, "
+        "pure solid white background, vibrant saturated orange skin, strictly NO mouth, NO nose, solid black gym shorts."
+    ),
+    "thumb_pain_point": (
+        "High-CTR YouTube thumbnail composition, dramatic contrast. "
+        "Athletic orange humanoid character in sudden sports distress, kneeling and clasping its knees with expressive body language. "
+        "Dramatic red glowing warning aura and lightning energy radiating directly from the kneecap joint. "
+        "Clean minimal 2D vector cel-shaded art, bold thick outlines, pure seamless white background, "
+        "large empty negative space for headline text. Strictly NO mouth, NO nose, black shorts."
+    ),
+    "thumb_outcome_gain": (
+        "Heroic high-conversion YouTube thumbnail. "
+        "Athletic orange muscular character in an explosive, flawless deep squat stance, flexing both biceps in a triumphant victory pose. "
+        "Brilliant golden solar flare energy bursting behind, sparkling diamond-solid knee joints indicating invincible bulletproof joints. "
+        "Ultra-crisp 2D vector animation style, high saturation, pure white background, empty space for title overlay. Strictly NO mouth, NO nose."
     )
-    with state_lock:
-        key_status[key_name] = "alive"
+}
 
-    while True:
+CHAR_DNA = (
+    "2D modern cel-shaded animation style. Athletic orange humanoid figure, "
+    "vibrant orange skin, completely smooth round bald head, large expressive white oval eyes. "
+    "Strictly NO mouth, NO nose, NO facial hair. Defined muscular build, solid black athletic workout shorts. "
+    "Pure solid seamless white background (#FFFFFF), clean bold outlines, flat minimal studio lighting."
+)
+
+def is_valid_image(file_path):
+    if not file_path or not os.path.exists(file_path):
+        return False
+    if os.path.getsize(file_path) < 10240:
+        return False
+    try:
+        with Image.open(file_path) as img:
+            img.verify()
+        return True
+    except Exception:
+        return False
+
+def init_azure_client():
+    endpoint = os.getenv("AZURE_IMAGE_ENDPOINT")
+    api_key = os.getenv("AZURE_IMAGE_KEY")
+    deployment = os.getenv("AZURE_IMAGE_DEPLOYMENT", "gpt-image-2.5-flare")
+
+    if not endpoint or not api_key:
+        print("[ERROR] Missing AZURE_IMAGE_ENDPOINT or AZURE_IMAGE_KEY.")
+        sys.exit(1)
+
+    client = AzureOpenAI(
+        azure_endpoint=endpoint,
+        api_key=api_key,
+        api_version="2024-02-01"
+    )
+    return client, deployment
+
+def generate_with_retry(client, deployment, prompt, size="1024x1024", max_retries=3):
+    for attempt in range(1, max_retries + 1):
         try:
-            task = main_queue.get(timeout=2)
-        except queue.Empty:
-            if alive_keys_count() == 0:
-                return
-            continue
-
-        if task is None:
-            main_queue.put(None)
-            return
-
-        task.setdefault("tried_keys", set())
-
-        if key_name in task["tried_keys"]:
-            if len(task["tried_keys"]) >= alive_keys_count():
-                backup_queue.put(task)
-            else:
-                main_queue.put(task)
-                time.sleep(0.3)
-            continue
-
-        in_flight_inc()
-        try:
-            img_bytes = try_google_generate(client, task["prompt"])
-            save_processed_image(img_bytes, task["output_path"])
-            log.info(f"[{task['id']}] نجاح -> Google ({key_name})")
-            reset_backoff(key_name)
-            touch_progress()
-            time.sleep(GOOGLE_INTERVAL)
-
-        except PermanentFailure as e:
-            mark_key_dead(key_name, str(e))
-            main_queue.put(task)
-            if alive_keys_count() == 0:
-                while True:
-                    try:
-                        leftover = main_queue.get_nowait()
-                    except queue.Empty:
-                        break
-                    if leftover is not None:
-                        backup_queue.put(leftover)
-            return
-
-        except TemporaryFailure as e:
-            task["tried_keys"].add(key_name)
-            task["attempts"] = task.get("attempts", 0) + 1
-            log.warning(f"[{task['id']}] فشل مؤقت مع {key_name}: {e}")
-
-            backoff = register_failure_and_get_backoff(key_name)
-
-            if len(task["tried_keys"]) >= alive_keys_count() or task["attempts"] >= MAX_ATTEMPTS_PER_TASK:
-                log.warning(f"[{task['id']}] استنفاد مفاتيح جوجل -> تحويل للاحتياطي")
-                backup_queue.put(task)
-            else:
-                main_queue.put(task)
-
-            time.sleep(backoff)
-
-        finally:
-            in_flight_dec()
-
-
-def backup_worker():
-    last_sent_at = 0.0
-    while True:
-        task = backup_queue.get()
-        if task is None:
-            return
-
-        elapsed = time.time() - last_sent_at
-        if elapsed < BACKUP_INTERVAL:
-            time.sleep(BACKUP_INTERVAL - elapsed)
-
-        in_flight_inc()
-        try:
-            img_bytes = try_pollinations_generate(task["prompt"])
-            save_processed_image(img_bytes, task["output_path"])
-            log.info(f"[{task['id']}] نجاح -> الاحتياطي (Pollinations)")
-            touch_progress()
+            response = client.images.generate(
+                model=deployment,
+                prompt=prompt,
+                size=size,
+                quality="hd",
+                n=1
+            )
+            image_url = response.data[0].url
+            resp = requests.get(image_url, timeout=60)
+            if resp.status_code == 200:
+                return Image.open(BytesIO(resp.content)).convert("RGB")
         except Exception as e:
-            task["backup_attempts"] = task.get("backup_attempts", 0) + 1
-            log.warning(f"[{task['id']}] فشل الاحتياطي: {e}")
-            if task["backup_attempts"] >= MAX_BACKUP_RETRIES:
-                with failed_lock:
-                    failed_tasks.append(task["id"])
-                log.error(f"[{task['id']}] فشل نهائي بعد استنفاد كل المحاولات")
-                touch_progress()
-            else:
-                backup_queue.put(task)
-        finally:
-            last_sent_at = time.time()
-            in_flight_dec()
+            print(f"[WARN] API call attempt {attempt}/{max_retries} failed: {e}")
+            if attempt < max_retries:
+                backoff_time = attempt * 5
+                print(f"[SAFETY] Cooling down for {backoff_time}s...")
+                time.sleep(backoff_time)
+    return None
 
+def slice_2x2_sheet(sheet_img, start_idx, end_idx):
+    sheet_w, sheet_h = sheet_img.size
+    cols = 2
+    rows = 2
+    cell_w = sheet_w / cols
+    cell_h = sheet_h / rows
 
-def build_tasks(episode):
-    tasks = []
-    for item in episode.get("timeline", []):
-        out_path = f"images/timeline/{item['id']:03d}.png"
-        if os.path.exists(out_path):
+    pad_x = int(cell_w * 0.03)
+    pad_y = int(cell_h * 0.04)
+
+    current_idx = start_idx
+    for r in range(rows):
+        for c in range(cols):
+            if current_idx > end_idx:
+                break
+
+            left = int(c * cell_w) + pad_x
+            top = int(r * cell_h) + pad_y
+            right = int((c + 1) * cell_w) - pad_x
+            bottom = int((r + 1) * cell_h) - pad_y
+
+            cell = sheet_img.crop((left, top, right, bottom))
+            cell = cell.resize((1280, 720), Image.Resampling.LANCZOS)
+            
+            target_path = f"images/timeline/{current_idx:03d}.png"
+            cell.save(target_path, "PNG", quality=95)
+            print(f"[SLICED] Video Scene {current_idx:03d} -> {target_path}")
+            current_idx += 1
+
+def run_timeline_pipeline(client, deployment):
+    """توليد مشاهد الفيديو الـ 45 (11 لوحة مجمعة + مشهد 45 منفصل)"""
+    print("\n--- [STAGE 1] Generating Video Timeline Frames (001 to 045) ---")
+    
+    # 11 دفعة رباعية للمشاهد من 1 إلى 44
+    batches = [(i, i + 3) for i in range(1, 45, 4)]
+
+    for batch_num, (start_idx, end_idx) in enumerate(batches, 1):
+        already_done = all(is_valid_image(f"images/timeline/{i:03d}.png") for i in range(start_idx, end_idx + 1))
+        if already_done:
+            print(f"[SKIP] Video Batch {batch_num}/11 (Scenes {start_idx:02d}-{end_idx:02d}) complete.")
             continue
-        tasks.append({"id": item["id"], "prompt": item["image_prompt"], "output_path": out_path})
 
-    for idx, thumb in enumerate(episode.get("thumbnails", [])):
-        angle = thumb.get("angle", f"angle_{idx+1}")
-        out_path = f"images/thumbnails/thumb_{angle}.png"
-        if os.path.exists(out_path):
+        print(f"[REQUEST] Generating Video Grid {batch_num}/11 (Scenes {start_idx:02d} to {end_idx:02d})...")
+        panels_desc = " ".join([f"Panel {i:02d}: {TIMELINE_PROMPTS[i]}." for i in range(start_idx, end_idx + 1)])
+        
+        grid_prompt = (
+            f"A 2D animation storyboard contact sheet strictly containing exactly 4 equal rectangular panels in a clean 2x2 grid (2 rows, 2 columns). "
+            f"Solid seamless white background (#FFFFFF), thin dark borders between panels. {CHAR_DNA} Action Panels: {panels_desc}"
+        )
+
+        sheet_img = generate_with_retry(client, deployment, grid_prompt, size="1024x1024")
+        if sheet_img:
+            slice_2x2_sheet(sheet_img, start_idx, end_idx)
+        else:
+            print(f"[FAIL] Batch {batch_num} failed. Left for Fallback Worker.")
+
+        time.sleep(4)
+
+    # المشهد رقم 45 (يولد مفرداً بدقة 16:9 مباشرة)
+    path_45 = "images/timeline/045.png"
+    if not is_valid_image(path_45):
+        print("[REQUEST] Generating Final Video Frame (Scene 045) directly in 16:9...")
+        prompt_45 = f"{CHAR_DNA} Action pose: The character is {TIMELINE_PROMPTS[45]}. 16:9 widescreen composition."
+        img_45 = generate_with_retry(client, deployment, prompt_45, size="1024x1024")
+        if img_45:
+            img_45 = img_45.resize((1280, 720), Image.Resampling.LANCZOS)
+            img_45.save(path_45, "PNG", quality=95)
+            print(f"[SAVED] Scene 045 -> {path_45}")
+        time.sleep(4)
+
+def run_thumbnails_pipeline(client, deployment):
+    """توليد الأغلفة الـ 3 المستقلة بأعلى دقة واحترافية تسويقية"""
+    print("\n--- [STAGE 2] Generating Standalone 16:9 Master Thumbnails (3 Variants) ---")
+
+    for thumb_name, thumb_prompt in THUMBNAIL_CONFIG.items():
+        out_path = f"images/thumbnails/{thumb_name}.png"
+        if is_valid_image(out_path):
+            print(f"[SKIP] Thumbnail '{thumb_name}' already exists and valid.")
             continue
-        tasks.append({"id": f"thumb_{angle}", "prompt": thumb.get("prompt", ""), "output_path": out_path})
 
-    return tasks
+        print(f"[REQUEST] Generating High-Impact Master Thumbnail: {thumb_name}...")
+        thumb_img = generate_with_retry(client, deployment, thumb_prompt, size="1024x1024")
+        if thumb_img:
+            thumb_img = thumb_img.resize((1280, 720), Image.Resampling.LANCZOS)
+            thumb_img.save(out_path, "PNG", quality=95)
+            print(f"[SAVED] Thumbnail created -> {out_path}")
+        else:
+            print(f"[FAIL] Failed to generate thumbnail: {thumb_name}")
 
+        time.sleep(4)
 
-def dump_failed_tasks():
-    with failed_lock:
-        if failed_tasks:
-            with open("failed_tasks.json", "w", encoding="utf-8") as f:
-                json.dump(failed_tasks, f, ensure_ascii=False, indent=2)
-            log.error(f"تم حفظ {len(failed_tasks)} مهمة فاشلة في failed_tasks.json")
+def run_fallback_worker(client, deployment):
+    """المرحلة 3: فحص أمان صارم يعوض أي مشهد مفقود فردياً"""
+    print("\n--- [STAGE 3] Security Integrity Check & Fallback Worker ---")
+    
+    # فحص مشاهد التايم لاين
+    missing_timeline = [i for i in range(1, 46) if not is_valid_image(f"images/timeline/{i:03d}.png")]
+    if missing_timeline:
+        print(f"[FALLBACK] Recovering {len(missing_timeline)} missing timeline frames: {missing_timeline}")
+        for idx in missing_timeline:
+            path = f"images/timeline/{idx:03d}.png"
+            prompt = f"{CHAR_DNA} Action pose: The character is {TIMELINE_PROMPTS[idx]}. 16:9 widescreen composition."
+            img = generate_with_retry(client, deployment, prompt, size="1024x1024")
+            if img:
+                img = img.resize((1280, 720), Image.Resampling.LANCZOS)
+                img.save(path, "PNG", quality=95)
+                print(f"[RECOVERED] Scene {idx:03d} -> {path}")
+            time.sleep(5)
 
+    # فحص الأغلفة
+    for thumb_name, thumb_prompt in THUMBNAIL_CONFIG.items():
+        path = f"images/thumbnails/{thumb_name}.png"
+        if not is_valid_image(path):
+            print(f"[FALLBACK] Recovering missing thumbnail: {thumb_name}...")
+            img = generate_with_retry(client, deployment, thumb_prompt, size="1024x1024")
+            if img:
+                img = img.resize((1280, 720), Image.Resampling.LANCZOS)
+                img.save(path, "PNG", quality=95)
+            time.sleep(5)
 
 def main():
-    if not os.path.exists("current_episode.json"):
-        log.error("current_episode.json غير موجود")
-        sys.exit(1)
-
-    with open("current_episode.json", "r", encoding="utf-8") as f:
-        episode = json.load(f)
-
-    google_keys = init_google_clients()
-    if not google_keys:
-        log.error("لا يوجد أي مفتاح Google متاح")
-        sys.exit(1)
-
-    dead_from_before = load_dead_keys()
-    if dead_from_before:
-        log.info(f"مفاتيح معطوبة من تشغيل سابق اليوم: {dead_from_before}")
-
     os.makedirs("images/timeline", exist_ok=True)
     os.makedirs("images/thumbnails", exist_ok=True)
 
-    tasks = build_tasks(episode)
-    if not tasks:
-        log.info("لا توجد صور جديدة للإنتاج (جميع الملفات موجودة بالفعل)")
-        return
+    client, deployment = init_azure_client()
 
-    active_google_keys = [(n, v) for n, v in google_keys if n not in dead_from_before]
-    for n, _ in google_keys:
-        if n in dead_from_before:
-            with state_lock:
-                key_status[n] = "dead"
+    # 1. إنتاج مشاهد الفيديو الـ 45 بنظام 2x2
+    run_timeline_pipeline(client, deployment)
 
-    if not active_google_keys:
-        log.warning("كل مفاتيح Google معطوبة من قبل -> التحويل المباشر للاحتياطي")
-        for t in tasks:
-            backup_queue.put(t)
-    else:
-        for task in tasks:
-            main_queue.put(task)
+    # 2. إنتاج الأغلفة الـ 3 الاحترافية المنفصلة
+    run_thumbnails_pipeline(client, deployment)
 
-    log.info(
-        f"بدء الإنتاج: {len(tasks)} صورة | مفاتيح Google الحية: {len(active_google_keys)} "
-        f"| حد كل مفتاح: {GOOGLE_RPM_PER_KEY}/دقيقة | حد الاحتياطي: {BACKUP_RPM}/دقيقة"
-    )
+    # 3. التحقق الاحتياطي النهائي وضمان اكتمال كل ملف
+    run_fallback_worker(client, deployment)
 
-    threads = []
-    for key_name, key_val in active_google_keys:
-        t = threading.Thread(target=google_worker, args=(key_name, key_val), daemon=True)
-        t.start()
-        threads.append(t)
+    valid_timeline = sum(1 for i in range(1, 46) if is_valid_image(f"images/timeline/{i:03d}.png"))
+    valid_thumbs = sum(1 for t in THUMBNAIL_CONFIG if is_valid_image(f"images/thumbnails/{t}.png"))
 
-    backup_thread = threading.Thread(target=backup_worker, daemon=True)
-    backup_thread.start()
+    print(f"\n==========================================")
+    print(f"STATUS: Timeline Frames: {valid_timeline}/45 | Thumbnails: {valid_thumbs}/3")
+    print(f"Total Ready Assets: {valid_timeline + valid_thumbs}/48")
+    print(f"==========================================")
 
-    total_tasks = len(tasks)
-    start_time = time.time()
-    touch_progress()
-
-    try:
-        while True:
-            done_count = sum(1 for t in tasks if os.path.exists(t["output_path"]))
-            with failed_lock:
-                finished_count = done_count + len(failed_tasks)
-
-            if finished_count >= total_tasks:
-                break
-
-            if (alive_keys_count() == 0 and main_queue.empty()
-                    and backup_queue.empty() and get_in_flight() == 0):
-                break
-
-            if seconds_since_progress() > STALL_TIMEOUT_SECONDS:
-                log.error(f"توقف كامل لأكثر من {STALL_TIMEOUT_SECONDS} ثانية بدون أي تقدم -> إيقاف اضطراري")
-                break
-
-            time.sleep(3)
-    except KeyboardInterrupt:
-        log.warning("تم إيقاف السكربت يدويًا")
-
-    # إرسال إشارة التوقف لجميع ثريدز جوجل وعامل الاحتياطي
-    for _ in range(len(active_google_keys)):
-        main_queue.put(None)
-    backup_queue.put(None)
-
-    for t in threads:
-        t.join(timeout=THREAD_JOIN_TIMEOUT)
-        if t.is_alive():
-            log.warning(f"ثريد لم يتوقف خلال {THREAD_JOIN_TIMEOUT}s")
-            
-    backup_thread.join(timeout=THREAD_JOIN_TIMEOUT)
-    if backup_thread.is_alive():
-        log.warning(f"ثريد الاحتياطي لم يتوقف خلال {THREAD_JOIN_TIMEOUT}s")
-
-    elapsed = round(time.time() - start_time, 2)
-    done_count = sum(1 for t in tasks if os.path.exists(t["output_path"]))
-    dump_failed_tasks()
-
-    log.info("=======================================================")
-    log.info(f"انتهى التشغيل في {elapsed} ثانية | نجاح: {done_count}/{total_tasks} | فشل: {total_tasks - done_count}")
-    log.info("=======================================================")
-
-    if done_count < total_tasks:
+    if valid_timeline < 45 or valid_thumbs < 3:
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()
