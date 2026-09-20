@@ -6,7 +6,7 @@ from io import BytesIO
 from PIL import Image
 from openai import AzureOpenAI
 
-# 1. أوامر مشاهد الفيديو الـ 45
+# 1. أوامر مشاهد شريط الفيديو الـ 45 فقط (مأخوذة من حركات السكربت)
 TIMELINE_PROMPTS = {
     1: "pointing an accusing finger forward with a questioning posture",
     2: "arms folded tightly across chest, shaking head in firm disapproval",
@@ -55,36 +55,19 @@ TIMELINE_PROMPTS = {
     45: "bowing slightly in respectful gratitude with open arms"
 }
 
-# 2. برومبتات الأغلفة الـ 3 (مخصصة لجذب الانتباه ومطابقة لمعايير يوتيوب الاحترافية)
-THUMBNAIL_CONFIG = {
-    "thumb_curiosity": (
-        "YouTube master thumbnail composition, high visual impact, rule of thirds. "
-        "Athletic orange humanoid character on the right side leaning forward with hand on chin, "
-        "staring with intense scientific curiosity and shock at a giant glowing holographic knee joint diagram floating on the left. "
-        "High contrast, cinematic clean 2D vector cel-shaded style, ample empty negative space on top for bold title text, "
-        "pure solid white background, vibrant saturated orange skin, strictly NO mouth, NO nose, solid black gym shorts."
-    ),
-    "thumb_pain_point": (
-        "High-CTR YouTube thumbnail composition, dramatic contrast. "
-        "Athletic orange humanoid character in sudden sports distress, kneeling and clasping its knees with expressive body language. "
-        "Dramatic red glowing warning aura and lightning energy radiating directly from the kneecap joint. "
-        "Clean minimal 2D vector cel-shaded art, bold thick outlines, pure seamless white background, "
-        "large empty negative space for headline text. Strictly NO mouth, NO nose, black shorts."
-    ),
-    "thumb_outcome_gain": (
-        "Heroic high-conversion YouTube thumbnail. "
-        "Athletic orange muscular character in an explosive, flawless deep squat stance, flexing both biceps in a triumphant victory pose. "
-        "Brilliant golden solar flare energy bursting behind, sparkling diamond-solid knee joints indicating invincible bulletproof joints. "
-        "Ultra-crisp 2D vector animation style, high saturation, pure white background, empty space for title overlay. Strictly NO mouth, NO nose."
-    )
-}
-
-CHAR_DNA = (
-    "2D modern cel-shaded animation style. Athletic orange humanoid figure, "
-    "vibrant orange skin, completely smooth round bald head, large expressive white oval eyes. "
-    "Strictly NO mouth, NO nose, NO facial hair. Defined muscular build, solid black athletic workout shorts. "
-    "Pure solid seamless white background (#FFFFFF), clean bold outlines, flat minimal studio lighting."
+# 2. البرومبت الأساسي الحرفي طبقاً للدليل (يعدل اللون والحركة فقط)
+BASE_PROMPT_TEMPLATE = (
+    "Create a 2D muscular character illustration in the exact style of the provided example. "
+    "The figure should be orange, with a smooth head, large white oval eyes, no mouth, "
+    "and a defined muscular body wearing black shorts. "
+    "Maintain the same proportions and facial features as in the reference. "
+    "{pose} "
+    "Background must be plain white. Clean, cel-shaded, and expressive style. "
+    "Keep the style consistent across all generated images."
 )
+
+def get_target_path(index):
+    return f"images/timeline/{index:03d}.png"
 
 def is_valid_image(file_path):
     if not file_path or not os.path.exists(file_path):
@@ -129,7 +112,7 @@ def generate_with_retry(client, deployment, prompt, size="1024x1024", max_retrie
             if resp.status_code == 200:
                 return Image.open(BytesIO(resp.content)).convert("RGB")
         except Exception as e:
-            print(f"[WARN] API call attempt {attempt}/{max_retries} failed: {e}")
+            print(f"[WARN] API attempt {attempt}/{max_retries} failed: {e}")
             if attempt < max_retries:
                 backoff_time = attempt * 5
                 print(f"[SAFETY] Cooling down for {backoff_time}s...")
@@ -160,30 +143,32 @@ def slice_2x2_sheet(sheet_img, start_idx, end_idx):
             cell = sheet_img.crop((left, top, right, bottom))
             cell = cell.resize((1280, 720), Image.Resampling.LANCZOS)
             
-            target_path = f"images/timeline/{current_idx:03d}.png"
+            target_path = get_target_path(current_idx)
             cell.save(target_path, "PNG", quality=95)
-            print(f"[SLICED] Video Scene {current_idx:03d} -> {target_path}")
+            print(f"[SLICED] Scene {current_idx:03d} -> {target_path}")
             current_idx += 1
 
 def run_timeline_pipeline(client, deployment):
-    """توليد مشاهد الفيديو الـ 45 (11 لوحة مجمعة + مشهد 45 منفصل)"""
-    print("\n--- [STAGE 1] Generating Video Timeline Frames (001 to 045) ---")
+    """توليد 11 لوحة مجمعة (كل لوحة 4 مشاهد) بإجمالي 44 مشهداً + المشهد 45 منفرداً"""
+    print("\n--- [STAGE 1] Generating Timeline Grids (Scenes 001 to 044) ---")
     
-    # 11 دفعة رباعية للمشاهد من 1 إلى 44
+    # 11 دفعة رباعية
     batches = [(i, i + 3) for i in range(1, 45, 4)]
 
     for batch_num, (start_idx, end_idx) in enumerate(batches, 1):
-        already_done = all(is_valid_image(f"images/timeline/{i:03d}.png") for i in range(start_idx, end_idx + 1))
+        already_done = all(is_valid_image(get_target_path(i)) for i in range(start_idx, end_idx + 1))
         if already_done:
-            print(f"[SKIP] Video Batch {batch_num}/11 (Scenes {start_idx:02d}-{end_idx:02d}) complete.")
+            print(f"[SKIP] Batch {batch_num}/11 (Scenes {start_idx:02d}-{end_idx:02d}) complete.")
             continue
 
-        print(f"[REQUEST] Generating Video Grid {batch_num}/11 (Scenes {start_idx:02d} to {end_idx:02d})...")
+        print(f"[REQUEST] Generating Grid {batch_num}/11 (Scenes {start_idx:02d} to {end_idx:02d})...")
         panels_desc = " ".join([f"Panel {i:02d}: {TIMELINE_PROMPTS[i]}." for i in range(start_idx, end_idx + 1)])
         
         grid_prompt = (
-            f"A 2D animation storyboard contact sheet strictly containing exactly 4 equal rectangular panels in a clean 2x2 grid (2 rows, 2 columns). "
-            f"Solid seamless white background (#FFFFFF), thin dark borders between panels. {CHAR_DNA} Action Panels: {panels_desc}"
+            f"A 2D animation storyboard sheet strictly containing exactly 4 equal rectangular panels in a clean 2x2 grid. "
+            f"Solid white background (#FFFFFF), thin dark borders between panels. "
+            f"Orange muscular humanoid character, smooth bald head, white oval eyes, no mouth, wearing black shorts. "
+            f"Panels: {panels_desc}"
         )
 
         sheet_img = generate_with_retry(client, deployment, grid_prompt, size="1024x1024")
@@ -194,11 +179,11 @@ def run_timeline_pipeline(client, deployment):
 
         time.sleep(4)
 
-    # المشهد رقم 45 (يولد مفرداً بدقة 16:9 مباشرة)
-    path_45 = "images/timeline/045.png"
+    # المشهد رقم 45 يُولد منفرداً بالبرومبت الأساسي الحرفي
+    path_45 = get_target_path(45)
     if not is_valid_image(path_45):
-        print("[REQUEST] Generating Final Video Frame (Scene 045) directly in 16:9...")
-        prompt_45 = f"{CHAR_DNA} Action pose: The character is {TIMELINE_PROMPTS[45]}. 16:9 widescreen composition."
+        print("\n[REQUEST] Generating Final Scene 045 individually...")
+        prompt_45 = BASE_PROMPT_TEMPLATE.format(pose=f"{TIMELINE_PROMPTS[45]}.")
         img_45 = generate_with_retry(client, deployment, prompt_45, size="1024x1024")
         if img_45:
             img_45 = img_45.resize((1280, 720), Image.Resampling.LANCZOS)
@@ -206,80 +191,51 @@ def run_timeline_pipeline(client, deployment):
             print(f"[SAVED] Scene 045 -> {path_45}")
         time.sleep(4)
 
-def run_thumbnails_pipeline(client, deployment):
-    """توليد الأغلفة الـ 3 المستقلة بأعلى دقة واحترافية تسويقية"""
-    print("\n--- [STAGE 2] Generating Standalone 16:9 Master Thumbnails (3 Variants) ---")
-
-    for thumb_name, thumb_prompt in THUMBNAIL_CONFIG.items():
-        out_path = f"images/thumbnails/{thumb_name}.png"
-        if is_valid_image(out_path):
-            print(f"[SKIP] Thumbnail '{thumb_name}' already exists and valid.")
-            continue
-
-        print(f"[REQUEST] Generating High-Impact Master Thumbnail: {thumb_name}...")
-        thumb_img = generate_with_retry(client, deployment, thumb_prompt, size="1024x1024")
-        if thumb_img:
-            thumb_img = thumb_img.resize((1280, 720), Image.Resampling.LANCZOS)
-            thumb_img.save(out_path, "PNG", quality=95)
-            print(f"[SAVED] Thumbnail created -> {out_path}")
-        else:
-            print(f"[FAIL] Failed to generate thumbnail: {thumb_name}")
-
-        time.sleep(4)
-
 def run_fallback_worker(client, deployment):
-    """المرحلة 3: فحص أمان صارم يعوض أي مشهد مفقود فردياً"""
-    print("\n--- [STAGE 3] Security Integrity Check & Fallback Worker ---")
+    """المرحلة 2: الفحص الصارم وتوليد أي مشهد ناقص فردياً بالبرومبت الأساسي الحرفي"""
+    print("\n--- [STAGE 2] Timeline Integrity Check & Fallback Worker ---")
     
-    # فحص مشاهد التايم لاين
-    missing_timeline = [i for i in range(1, 46) if not is_valid_image(f"images/timeline/{i:03d}.png")]
-    if missing_timeline:
-        print(f"[FALLBACK] Recovering {len(missing_timeline)} missing timeline frames: {missing_timeline}")
-        for idx in missing_timeline:
-            path = f"images/timeline/{idx:03d}.png"
-            prompt = f"{CHAR_DNA} Action pose: The character is {TIMELINE_PROMPTS[idx]}. 16:9 widescreen composition."
-            img = generate_with_retry(client, deployment, prompt, size="1024x1024")
-            if img:
-                img = img.resize((1280, 720), Image.Resampling.LANCZOS)
-                img.save(path, "PNG", quality=95)
-                print(f"[RECOVERED] Scene {idx:03d} -> {path}")
-            time.sleep(5)
+    missing_timeline = [i for i in range(1, 46) if not is_valid_image(get_target_path(i))]
+    if not missing_timeline:
+        print("[SUCCESS] All 45 video timeline frames are complete and valid!")
+        return
 
-    # فحص الأغلفة
-    for thumb_name, thumb_prompt in THUMBNAIL_CONFIG.items():
-        path = f"images/thumbnails/{thumb_name}.png"
-        if not is_valid_image(path):
-            print(f"[FALLBACK] Recovering missing thumbnail: {thumb_name}...")
-            img = generate_with_retry(client, deployment, thumb_prompt, size="1024x1024")
-            if img:
-                img = img.resize((1280, 720), Image.Resampling.LANCZOS)
-                img.save(path, "PNG", quality=95)
-            time.sleep(5)
+    print(f"[FALLBACK] Recovering {len(missing_timeline)} missing frames individually: {missing_timeline}")
+    for count, idx in enumerate(missing_timeline, 1):
+        target_path = get_target_path(idx)
+        # استخدام البرومبت الأساسي الحرفي من الدليل
+        single_prompt = BASE_PROMPT_TEMPLATE.format(pose=f"{TIMELINE_PROMPTS[idx]}.")
+
+        print(f"[FALLBACK {count}/{len(missing_timeline)}] Generating Frame {idx:03d}...")
+        img = generate_with_retry(client, deployment, single_prompt, size="1024x1024")
+        if img:
+            img = img.resize((1280, 720), Image.Resampling.LANCZOS)
+            img.save(target_path, "PNG", quality=95)
+            print(f"[RECOVERED] Scene {idx:03d} -> {target_path}")
+        else:
+            print(f"[CRITICAL] Frame {idx:03d} failed after retries!")
+
+        time.sleep(5)
 
 def main():
+    # التأكد من وجود مجلد مشاهد الفيديو فقط
     os.makedirs("images/timeline", exist_ok=True)
-    os.makedirs("images/thumbnails", exist_ok=True)
 
     client, deployment = init_azure_client()
 
-    # 1. إنتاج مشاهد الفيديو الـ 45 بنظام 2x2
+    # 1. توليد المشاهد عبر الشبكات الرباعية
     run_timeline_pipeline(client, deployment)
 
-    # 2. إنتاج الأغلفة الـ 3 الاحترافية المنفصلة
-    run_thumbnails_pipeline(client, deployment)
-
-    # 3. التحقق الاحتياطي النهائي وضمان اكتمال كل ملف
+    # 2. خطة الأمان الفردية
     run_fallback_worker(client, deployment)
 
-    valid_timeline = sum(1 for i in range(1, 46) if is_valid_image(f"images/timeline/{i:03d}.png"))
-    valid_thumbs = sum(1 for t in THUMBNAIL_CONFIG if is_valid_image(f"images/thumbnails/{t}.png"))
-
+    # التحقق النهائي
+    total_valid = sum(1 for i in range(1, 46) if is_valid_image(get_target_path(i)))
     print(f"\n==========================================")
-    print(f"STATUS: Timeline Frames: {valid_timeline}/45 | Thumbnails: {valid_thumbs}/3")
-    print(f"Total Ready Assets: {valid_timeline + valid_thumbs}/48")
+    print(f"TIMELINE READY: {total_valid}/45 frames ready in images/timeline/")
     print(f"==========================================")
 
-    if valid_timeline < 45 or valid_thumbs < 3:
+    if total_valid < 45:
         sys.exit(1)
 
 if __name__ == "__main__":
