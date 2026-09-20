@@ -4,6 +4,7 @@ from pathlib import Path
 from config.settings import DATA_FILE, OUTPUT_DIR
 from stages.stage1_script import run_stage_1
 from stages.stage2_images import run_stage_2
+from stages.stage2_render_images import render_all_images
 from stages.stage3_audio import run_stage_3
 from stages.stage4_metadata import run_stage_4
 
@@ -24,20 +25,22 @@ def process_single_episode(episode: dict):
     print(f"   STARTING PIPELINE FOR EPISODE #{ep_id}: {episode.get('topic')}")
     print(f"==================================================")
 
-    # مجلد مخرجات مخصص للحلقة الحالية فقط
     episode_dir = OUTPUT_DIR / f"episode_{ep_id:03d}"
     episode_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. السكربت
+    # 1. إنتاج السكربت الإنجليزي
     script_text = run_stage_1(episode, episode_dir)
 
-    # 2. أوامر الصور
+    # 2. استخراج أوامر الصور لكل جملة
     image_prompts = run_stage_2(script_text, episode_dir)
 
-    # 3. الصوت والترميز
+    # 2.5 توليد وفحص الصور تسلسلياً (Azure + Pollinations Fallback)
+    render_all_images(image_prompts, episode_dir)
+
+    # 3. النص المرمز عاطفياً وتوليد الصوت البشري
     audio_data = run_stage_3(script_text, episode_dir)
 
-    # 4. الميتاداتا والنشر
+    # 4. الميتاداتا والثامبنيل والكلمات الدلالية
     metadata_text = run_stage_4(episode, script_text, episode_dir)
 
     print(f"\n==================================================")
@@ -47,30 +50,24 @@ def process_single_episode(episode: dict):
 
 def main():
     episodes = load_episodes()
-    
-    # جلب الحلقات المنتظرة
     pending_episodes = [ep for ep in episodes if ep.get("status") == "pending"]
 
     if not pending_episodes:
         print("All episodes are already completed! Nothing to run.")
         return
 
-    # استهداف الحلقة الأولى فقط والتنفيذ لمرة واحدة
-    current_episode = pending_episodes[0]
-    ep_id = current_episode.get("id")
-    
-    print(f"Targeting single episode: #{ep_id} ({current_episode.get('topic')})")
+    # استهداف حلقة واحدة فقط في كل تشغيل
+    target_episode = pending_episodes[0]
+    ep_id = target_episode.get("id")
+    print(f"Targeting single episode: #{ep_id} ({target_episode.get('topic')})")
 
     try:
-        process_single_episode(current_episode)
-        
-        # تحويل حالة الحلقة الحالية فقط إلى completed وحفظ الملف فوراً
-        current_episode["status"] = "completed"
+        process_single_episode(target_episode)
+        target_episode["status"] = "completed"
         save_episodes(episodes)
-        print(f"\nEpisode #{ep_id} marked as COMPLETED. Stopping execution now.")
-        
+        print(f"\nEpisode #{ep_id} marked as COMPLETED. Execution finished.")
     except Exception as e:
-        print(f"\n[ERROR] Failed during processing Episode #{ep_id}: {str(e)}")
+        print(f"\n[ERROR] Pipeline failed on Episode #{ep_id}: {str(e)}")
         sys.exit(1)
 
 if __name__ == "__main__":
