@@ -15,7 +15,7 @@ def run_stage_4(episode: dict, script_data: dict, episode_dir: Path) -> str:
     user_prompt = f"""
     Topic Details:
     {json.dumps(episode, indent=2, ensure_ascii=False)}
-    
+
     Spoken Script:
     {all_spoken}
     """

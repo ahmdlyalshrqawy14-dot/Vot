@@ -2,112 +2,50 @@ import json
 from pathlib import Path
 from config.settings import CHARACTER_COLOR
 
-def generate_13_telegram_messages(script_data: dict, metadata_text: str, episode_dir: Path) -> list:
-    """
-    تقسيم البرومبتات إلى 13 رسالة منفصلة:
-    - 5 رسائل لشيتات مجمعة (كل شيت 8 كادرات 4x2 مع ترقيم داخلي واضح).
-    - 5 رسائل لكادرات فردية (المشاهد 41 إلى 45 مع ترقيم داخلي).
-    - 3 رسائل للغلاف (Thumbnails) مطابقة تماماً لشروط الزوايا الثلاث.
-    """
+def generate_google_flow_files(script_data: dict, metadata_text: str, episode_dir: Path) -> list:
     beats = script_data.get("beats", [])
-    messages = []
+    files_dir = episode_dir / "prompts_txt"
+    files_dir.mkdir(parents=True, exist_ok=True)
 
-    # ==========================================
-    # 1. الشيتات الخمسة المجمعة (المشاهد 1 إلى 40)
-    # ==========================================
-    for sheet_idx in range(5):
-        start_beat = sheet_idx * 8 + 1
-        end_beat = start_beat + 7
-        sheet_beats = beats[start_beat - 1 : end_beat]
+    base_template = (
+        "Create a 2D muscular character illustration in the exact style of the provided example. "
+        f"The figure should be {CHARACTER_COLOR}, with a smooth head, large white oval eyes, no mouth, "
+        "and a defined muscular body wearing black shorts. Maintain the same proportions and facial features "
+        "as in the reference. {action} "
+        "In the bottom-right corner of the image, render a small, clean, unobtrusive badge text '#{b_id:02d}'. "
+        "Background must be plain white. Clean, cel-shaded, and expressive style. "
+        "Keep the style consistent across all generated images."
+    )
 
-        panels_text = []
-        for idx, b in enumerate(sheet_beats, start=start_beat):
-            panels_text.append(
-                f"- Panel #{idx:02d}: A distinct square showing the muscular {CHARACTER_COLOR} character in black shorts. "
-                f"Action: {b['visual_prompt']}. "
-                f"Crucial detail: Draw a bold, high-contrast corner badge with the clear number '#{idx:02d}'."
-            )
+    output_packages = []
 
-        panels_block = "\n".join(panels_text)
+    # دفعة 1 (01 إلى 20)
+    b1_lines = [base_template.format(action=b.get("visual_prompt", "athletic pose").replace("\n", " ").strip(), b_id=b["id"]) for b in beats[0:20]]
+    file_b1 = files_dir / "01_Batch_1_Beats_01_to_20.txt"
+    file_b1.write_text("\n".join(b1_lines), encoding="utf-8")
+    output_packages.append({"path": file_b1, "caption": "📄 <b>الدفعة الأولى: المشاهد (01 إلى 20)</b>\n20 سطراً لـ Google Flow."})
 
-        prompt_body = (
-            f"A professional 2K high-resolution 4x2 grid containing exactly 8 distinct comic panels with clean thin white borders. "
-            f"Consistent art style across all panels: 2D cel-shaded athletic character illustration, {CHARACTER_COLOR} smooth skin, "
-            f"large oval white eyes, no mouth, muscular build, plain white background, bold dynamic lighting.\n\n"
-            f"The 8 panels are arranged as follows:\n"
-            f"{panels_block}\n\n"
-            f"Every single panel must have its designated number badge clearly visible in its top corner."
-        )
+    # دفعة 2 (21 إلى 40)
+    b2_lines = [base_template.format(action=b.get("visual_prompt", "athletic pose").replace("\n", " ").strip(), b_id=b["id"]) for b in beats[20:40]]
+    file_b2 = files_dir / "02_Batch_2_Beats_21_to_40.txt"
+    file_b2.write_text("\n".join(b2_lines), encoding="utf-8")
+    output_packages.append({"path": file_b2, "caption": "📄 <b>الدفعة الثانية: المشاهد (21 إلى 40)</b>\n20 سطراً لـ Google Flow."})
 
-        msg = (
-            f"📋 <b>الشيت رقم {sheet_idx + 1}/5 (المشاهد من #{start_beat:02d} إلى #{end_beat:02d})</b>\n\n"
-            f"انسخ البرومبت التالي لتوليد شيت الـ 8 مربعات بدقة 2K:\n\n"
-            f"<code>{prompt_body}</code>"
-        )
-        messages.append({"type": "sheet", "sheet_id": sheet_idx + 1, "text": msg})
+    # دفعة 3 (41 إلى 45)
+    b3_lines = [base_template.format(action=b.get("visual_prompt", "athletic pose").replace("\n", " ").strip(), b_id=b["id"]) for b in beats[40:45]]
+    file_b3 = files_dir / "03_Batch_3_Beats_41_to_45.txt"
+    file_b3.write_text("\n".join(b3_lines), encoding="utf-8")
+    output_packages.append({"path": file_b3, "caption": "📄 <b>الدفعة الثالثة: المشاهد (41 إلى 45)</b>\n5 أسطر لـ Google Flow."})
 
-    # ==========================================
-    # 2. الكادرات الفردية الخمسة (المشاهد 41 إلى 45)
-    # ==========================================
-    for b_idx in range(40, len(beats)):
-        beat = beats[b_idx]
-        b_num = beat["id"]
-
-        single_prompt = (
-            f"Cinematic 2D athletic character illustration in clean cel-shaded style. "
-            f"The figure is {CHARACTER_COLOR} with a smooth head, large white oval eyes, no mouth, athletic muscular body wearing black shorts. "
-            f"Action and emotion: {beat['visual_prompt']}. "
-            f"Plain white background, high-contrast studio lighting, sharp 8k details. "
-            f"Important: In the top-left corner, render a bold modern badge showing the text '#{b_num:02d}'."
-        )
-
-        msg = (
-            f"🖼️ <b>المشهد الفردي رقم #{b_num:02d}</b>\n\n"
-            f"انسخ البرومبت التالي لإنتاج الصورة الفردية:\n\n"
-            f"<code>{single_prompt}</code>"
-        )
-        messages.append({"type": "single", "beat_id": b_num, "text": msg})
-
-    # ==========================================
-    # 3. برومبتات الغلاف الثلاثة (Thumbnails)
-    # ==========================================
-    thumb_angles = [
-        {
-            "num": 1,
-            "title": "زاوية الصدمة والفضول (Shocking Curiosity)",
-            "action": f"Extremely shocked and horrified, holding head with both hands, eyes wide open, muscular {CHARACTER_COLOR} body in black shorts leaning forward with dramatic perspective looking directly at the camera. Highly exaggerated expressive pose visible clearly at tiny sizes."
-        },
-        {
-            "num": 2,
-            "title": "زاوية نقطة الألم (Pain-Point Angle)",
-            "action": f"Intense agony and frustration, grabbing the hurting joint/muscle tightly, teeth-clenching tension (conveyed through aggressive posture), muscular {CHARACTER_COLOR} character in black shorts bent in pain. Urgent high-contrast drama."
-        },
-        {
-            "num": 3,
-            "title": "زاوية النتيجة والقوة (Ultimate Result / Gain)",
-            "action": f"Explosive celebration and absolute triumph, flexing both biceps victoriously with raw athletic dominance, glowing energetic aura, muscular {CHARACTER_COLOR} character in black shorts standing tall. Inspiring and powerful presence."
-        }
+    # الأغلفة
+    thumbs = [
+        ("Shocking Curiosity", f"Extremely shocked and horrified, hands on head, wide eyes, {CHARACTER_COLOR} muscular character leaning towards camera."),
+        ("Pain-Point Angle", f"Intense agony, tightly clutching knee joint, dynamic strain, {CHARACTER_COLOR} muscular character in black shorts."),
+        ("Ultimate Result", f"Triumphant victory pose flexing biceps, muscular dominance, {CHARACTER_COLOR} muscular character standing tall.")
     ]
+    t_lines = [f"[{title}]\nYouTube Clickable Thumbnail, 16:9, 2D style, {CHARACTER_COLOR} muscular character in black shorts. {act} Plain white background." for title, act in thumbs]
+    file_t = files_dir / "04_Thumbnails.txt"
+    file_t.write_text("\n\n".join(t_lines), encoding="utf-8")
+    output_packages.append({"path": file_t, "caption": "🖼️ <b>برومبتات الأغلفة الثلاثة (Thumbnails)</b>"})
 
-    for angle in thumb_angles:
-        t_prompt = (
-            f"Create a 2D muscular character illustration in the exact signature style. "
-            f"The figure must be {CHARACTER_COLOR}, with a smooth head, large white oval eyes, no mouth, and a defined muscular body wearing black shorts. "
-            f"{angle['action']} "
-            f"Background must be plain white. Clean, cel-shaded, and hyper-expressive style. "
-            f"Ultra-clear dynamic silhouette designed to be instantly recognizable on small mobile thumbnail screens."
-        )
-
-        msg = (
-            f"🎨 <b>برومبت الغلاف رقم {angle['num']}/3 - {angle['title']}</b>\n\n"
-            f"⚠️ <i>ملاحظة: هذه الصورة مخصصة للغلاف ولن تدخل في مونتاج الفيديو.</i>\n\n"
-            f"<code>{t_prompt}</code>"
-        )
-        messages.append({"type": "thumbnail", "thumb_id": angle['num'], "text": msg})
-
-    # حفظ الرسائل في ملف نصي للرجوع إليها في أي وقت
-    prompts_cache_file = episode_dir / "telegram_prompts.json"
-    with open(prompts_cache_file, "w", encoding="utf-8") as f:
-        json.dump(messages, f, indent=2, ensure_ascii=False)
-
-    return messages
+    return output_packages\n

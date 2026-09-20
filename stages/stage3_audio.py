@@ -33,14 +33,12 @@ def run_stage_3(script_data: dict, episode_dir: Path):
         b_id = beat["id"]
         audio_path = audio_dir / f"beat_{b_id:03d}.wav"
 
-        # Checkpoint
         if audio_path.exists() and audio_path.stat().st_size > 1024:
             continue
 
         safe_text = html.escape(beat["spoken_text"])
         azure_style = EMOTION_MAP.get(beat.get("emotion", "energetic"), "cheerful")
 
-        # SSML احترافي مع إعطاء المشاعر الرياضية الصريحة وتفادي أي أخطاء خاصة بالأحرف
         ssml = f"""
         <speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xmlns:mstts="https://www.w3.org/2001/mstts" xml:lang="en-US">
             <voice name="{AZURE_VOICE_NAME}">
@@ -58,7 +56,6 @@ def run_stage_3(script_data: dict, episode_dir: Path):
         res = synthesizer.speak_ssml_async(ssml).get()
 
         if res.reason != speechsdk.ResultReason.SynthesizingAudioCompleted:
-            # إعادة المحاولة بالنص العادي كبديل آمن
             fallback_ssml = f"""
             <speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="en-US">
                 <voice name="{AZURE_VOICE_NAME}">{safe_text}</voice>
@@ -66,4 +63,4 @@ def run_stage_3(script_data: dict, episode_dir: Path):
             """.strip()
             synthesizer.speak_ssml_async(fallback_ssml).get()
 
-    print(f"--- [Stage 3] Generated all audio beats with zero desync risk! ---")
+    print(f"--- [Stage 3] Generated all audio beats successfully! ---")
