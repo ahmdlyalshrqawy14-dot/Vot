@@ -15,5 +15,3 @@ STRICT CONSTRAINTS:
 
 Output the entire tagged voiceover script as a single continuous block of lines with no extra commentary or markdown bolding.
 ```[span_1](start_span)[span_1](end_span)
-
-أنشئ هذا الملف داخل `prompts/` باسم `03_audio.txt`، واكتب **«تم»** لننتقل للملف الأخير في الأوامر (`04_metadata.txt`).
