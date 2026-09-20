@@ -1,10 +1,10 @@
 name: Video Production Pipeline
 
 on:
-  workflow_dispatch: # يتيح لك تشغيل الأتمتة يدوياً بضغطة زر من تبويب Actions
+  workflow_dispatch:
 
 permissions:
-  contents: write # للسماح للبوت بحفظ الملفات الناتجة وتحديث episodes.json في المستودع
+  contents: write
 
 jobs:
   run-pipeline:
@@ -13,6 +13,8 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -44,4 +46,8 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add output/ episodes.json
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Auto: Completed episode pipeline run" && git push)
+          if [ -n "$(git status --porcelain)" ]; then
+            git commit -m "Auto: Completed episode pipeline run"
+            git pull --rebase origin main
+            git push origin main
+          fi
