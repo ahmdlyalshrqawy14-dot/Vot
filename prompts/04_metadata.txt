@@ -18,5 +18,3 @@ STRICT CONSTRAINTS & OUTPUT ORDER:
 4. Tags:
    - A single-line comma-separated list of English tags ranging from broad to highly specific niche tags.
 ```[span_1](start_span)[span_1](end_span)
-
-أنشئ هذا الملف داخل `prompts/` باسم `04_metadata.txt`، واكتب **«تم»** لنبدأ في الخطوة التي تليها: بناء أكواد المعالجة لكل مرحلة داخل مجلد `stages/`.
