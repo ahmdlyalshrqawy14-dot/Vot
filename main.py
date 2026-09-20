@@ -1,3 +1,4 @@
+import os
 import json
 import sys
 from pathlib import Path
@@ -8,6 +9,7 @@ from stages.stage2_render_images import render_all_images
 from stages.stage3_audio import run_stage_3
 from stages.stage4_metadata import run_stage_4
 from stages.stage5_video import run_stage_5
+from stages.telegram_notifier import send_telegram_results
 
 def load_episodes():
     if not DATA_FILE.exists():
@@ -44,8 +46,11 @@ def process_single_episode(episode: dict):
     # 4. الميتاداتا
     metadata_text = run_stage_4(episode, script_text, episode_dir)
 
-    # 5. المونتاج والفيديو النهائي المتزامن
+    # 5. المونتاج ورندرة الفيديو (1080p + نصوص تفاعلية)
     run_stage_5(episode_dir)
+
+    # 6. إرسال الفيديو والملخص على تيليجرام
+    send_telegram_results(episode, episode_dir)
 
     print(f"\n==================================================")
     print(f"   SUCCESSFULLY FINISHED EPISODE #{ep_id}")
@@ -54,21 +59,38 @@ def process_single_episode(episode: dict):
 
 def main():
     episodes = load_episodes()
-    pending_episodes = [ep for ep in episodes if ep.get("status") == "pending"]
+    target_id_env = os.getenv("TARGET_EPISODE_ID", "").strip()
 
-    if not pending_episodes:
-        print("All episodes are already completed!")
-        return
+    target_episode = None
 
-    target_episode = pending_episodes[0]
+    # التحقق إذا حدد المستخدم حلقة معينة
+    if target_id_env:
+        try:
+            target_id = int(target_id_env)
+            target_episode = next((ep for ep in episodes if ep.get("id") == target_id), None)
+            if not target_episode:
+                print(f"[ERROR] Episode #{target_id} not found in {DATA_FILE.name}!")
+                sys.exit(1)
+            print(f"Targeting requested Episode: #{target_id}")
+        except ValueError:
+            print(f"[ERROR] Invalid Episode ID format: '{target_id_env}'")
+            sys.exit(1)
+    else:
+        # السحب التلقائي لأول حلقة pending
+        pending_episodes = [ep for ep in episodes if ep.get("status") == "pending"]
+        if not pending_episodes:
+            print("All episodes are already completed!")
+            return
+        target_episode = pending_episodes[0]
+        print(f"Auto-selected next pending Episode: #{target_episode.get('id')}")
+
     ep_id = target_episode.get("id")
-    print(f"Targeting single episode: #{ep_id} ({target_episode.get('topic')})")
 
     try:
         process_single_episode(target_episode)
         target_episode["status"] = "completed"
         save_episodes(episodes)
-        print(f"\nEpisode #{ep_id} marked as COMPLETED. Pipeline finished successfully.")
+        print(f"\nEpisode #{ep_id} marked as COMPLETED. Execution finished.")
     except Exception as e:
         print(f"\n[ERROR] Pipeline failed on Episode #{ep_id}: {str(e)}")
         sys.exit(1)
