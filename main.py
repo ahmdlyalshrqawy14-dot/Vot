@@ -24,47 +24,54 @@ def process_single_episode(episode: dict):
     print(f"   STARTING PIPELINE FOR EPISODE #{ep_id}: {episode.get('topic')}")
     print(f"==================================================")
 
-    # إنشاء مجلد مخرجات خاص بالحلقة
+    # مجلد مخرجات مخصص للحلقة الحالية فقط
     episode_dir = OUTPUT_DIR / f"episode_{ep_id:03d}"
     episode_dir.mkdir(parents=True, exist_ok=True)
 
-    # المرحلة 1: إنتاج السكربت
+    # 1. السكربت
     script_text = run_stage_1(episode, episode_dir)
 
-    # المرحلة 2: توليد أوامر الصور لكل جملة
+    # 2. أوامر الصور
     image_prompts = run_stage_2(script_text, episode_dir)
 
-    # المرحلة 3: التعليق الصوتي والترميز العاطفي وتوليد الصوت
+    # 3. الصوت والترميز
     audio_data = run_stage_3(script_text, episode_dir)
 
-    # المرحلة 4: العناوين، الثامبنيل، الوصف، والكلمات الدلالية
+    # 4. الميتاداتا والنشر
     metadata_text = run_stage_4(episode, script_text, episode_dir)
 
     print(f"\n==================================================")
-    print(f"   SUCCESSFULLY COMPLETED EPISODE #{ep_id}")
-    print(f"   Outputs stored at: {episode_dir}")
+    print(f"   SUCCESSFULLY FINISHED EPISODE #{ep_id}")
+    print(f"   Outputs saved in: {episode_dir}")
     print(f"==================================================")
 
 def main():
     episodes = load_episodes()
+    
+    # جلب الحلقات المنتظرة
     pending_episodes = [ep for ep in episodes if ep.get("status") == "pending"]
 
     if not pending_episodes:
-        print("No pending episodes found to process.")
+        print("All episodes are already completed! Nothing to run.")
         return
 
-    print(f"Found {len(pending_episodes)} pending episode(s).")
+    # استهداف الحلقة الأولى فقط والتنفيذ لمرة واحدة
+    current_episode = pending_episodes[0]
+    ep_id = current_episode.get("id")
+    
+    print(f"Targeting single episode: #{ep_id} ({current_episode.get('topic')})")
 
-    for episode in pending_episodes:
-        try:
-            process_single_episode(episode)
-            # تحديث حالة الحلقة وحفظ الملف
-            episode["status"] = "completed"
-            save_episodes(episodes)
-        except Exception as e:
-            print(f"\n[ERROR] Pipeline failed on Episode #{episode.get('id')}: {str(e)}")
-            # التوقف عند حدوث خطأ لمراجعة السبب
-            break
+    try:
+        process_single_episode(current_episode)
+        
+        # تحويل حالة الحلقة الحالية فقط إلى completed وحفظ الملف فوراً
+        current_episode["status"] = "completed"
+        save_episodes(episodes)
+        print(f"\nEpisode #{ep_id} marked as COMPLETED. Stopping execution now.")
+        
+    except Exception as e:
+        print(f"\n[ERROR] Failed during processing Episode #{ep_id}: {str(e)}")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
