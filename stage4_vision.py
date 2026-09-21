@@ -178,9 +178,10 @@ def rename_images_with_detected_numbers(
 
                 if detected_index is not None and 1 <= detected_index <= expected_total:
                     if detected_index in indexed_images:
-                        # رقم متكرر - نحتفظ بالأولى ونضيف الثانية للـ conflicts
+                        # رقم متكرر - نحتفظ بالأولى ونضيف الثانية للـ conflicts + unindexed
                         conflicts.append((detected_index, indexed_images[detected_index], img_path))
-                        logger.warning(f"⚠️ رقم متكرر {detected_index}: {img_path.name}")
+                        unindexed_files.append(img_path)  # ← التعديل: الصورة المكررة تدخل الوضع اليدوي
+                        logger.warning(f"⚠️ رقم متكرر {detected_index}: {img_path.name} → أُرسلت للتعيين اليدوي")
                     else:
                         indexed_images[detected_index] = img_path
                         logger.info(f"✅ تم التعرف على {img_path.name} → رقم {detected_index}")
@@ -273,7 +274,9 @@ def process_and_verify_images(
     # frame_xxx.png وإلغاء ملف clean_raw_xxx.png الوسيط تماماً.
     first_available_idx = min(indexed_images.keys())
 
-    for idx, raw_p in indexed_images.items():
+    # كتابة الكادرات الحقيقية بترتيب ثابت
+    for idx in sorted(indexed_images.keys()):
+        raw_p = indexed_images[idx]
         final_frame_path = output_frames_dir / f"frame_{idx:03d}.png"
         apply_seamless_inpainting(raw_p, final_frame_path)
         logger.info(f"💾 تم توليد الكادر النهائي: {final_frame_path.name}")
@@ -287,6 +290,7 @@ def process_and_verify_images(
             source_idx = max(candidates_before) if candidates_before else first_available_idx
             source_path = output_frames_dir / f"frame_{source_idx:03d}.png"
             shutil.copyfile(source_path, final_frame_path)
+            logger.info(f"🔄 تم ملء الكادر {frame_idx:03d} من الكادر {source_idx:03d}")
 
         verified_frames.append(final_frame_path)
 
