@@ -1,0 +1,21 @@
+# Environment & Keys
+.env
+*.env
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+
+# Outputs
+outputs/
+logs/
+*.log
+
+# OS files
+Thumbs.db
+Desktop.ini
+.DS_Store
