@@ -49,25 +49,34 @@ def write_image_safe(path: Path, img: np.ndarray):
 
 
 def extract_index_using_gemini_vision(image_path: Path) -> Optional[int]:
-    """قص مؤقت في الرام للركن الأيمن وقراءة الرقم عبر Gemini Vision"""
+    """قص مؤقت في الرام للركن الأيمن وقراءة الرقم عبر Gemini Vision مع تحسينات"""
     try:
         img = read_image_safe(image_path)
         if img is None:
             return None
 
         h, w, _ = img.shape
-        crop_y = int(h * 0.80)
-        crop_x = int(w * 0.80)
+        
+        # قص أدق للركن الأيمن السفلي (آخر 15% من العرض والارتفاع)
+        crop_y = int(h * 0.85)
+        crop_x = int(w * 0.85)
         corner_crop = img[crop_y:h, crop_x:w]
-
-        _, buffer = cv2.imencode(".jpg", corner_crop, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        
+        # تكبير الصورة لتحسين OCR (3x)
+        corner_crop = cv2.resize(corner_crop, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+        
+        # تحسين التباين والإضاءة
+        gray = cv2.cvtColor(corner_crop, cv2.COLOR_BGR2GRAY)
+        enhanced = cv2.convertScaleAbs(gray, alpha=2.0, beta=10)
+        
+        _, buffer = cv2.imencode(".jpg", enhanced, [cv2.IMWRITE_JPEG_QUALITY, 95])
         crop_bytes = buffer.tobytes()
 
         prompt = (
-            "Look at this image crop of the bottom-right corner. "
-            "There is a small, faint, subtle number or digits. "
+            "Look at this image crop from the bottom-right corner. "
+            "There is a small, faint number printed there. "
             "What is this integer number? Return ONLY the integer digits (e.g. 1, 2, 45). "
-            "If there is absolutely no number, reply with NONE."
+            "If there is absolutely no number visible, reply with NONE."
         )
 
         response_text = call_gemini_vision_with_fallback(
@@ -78,7 +87,10 @@ def extract_index_using_gemini_vision(image_path: Path) -> Optional[int]:
 
         numbers = re.findall(r"\b\d+\b", response_text)
         if numbers:
-            return int(numbers[0])
+            detected = int(numbers[0])
+            # التحقق من أن الرقم في النطاق المنطقي (1-500)
+            if 1 <= detected <= 500:
+                return detected
         return None
 
     except Exception as e:
@@ -119,41 +131,126 @@ def _scan_single_image(img_path: Path) -> Tuple[Path, Optional[int]]:
     return img_path, num
 
 
-def process_and_verify_images(
+def rename_images_with_detected_numbers(
     uploaded_images_dir: Path,
-    output_frames_dir: Path,
-    expected_total: int,
-    allow_partial: bool = False
-) -> List[Path]:
-    if not uploaded_images_dir.exists():
-        raise FileNotFoundError(f"المجلد غير موجود: {uploaded_images_dir}")
-
+    output_dir: Path,
+    expected_total: int
+) -> Tuple[Dict[int, Path], List[Path], List[Tuple[int, Path, Path]]]:
+    """
+    يقرأ كل الصور، يكتشف الرقم من الركن الأيمن، ويعيد تسميتها بالرقم المكتشف.
+    
+    Returns:
+        - Dict[int, Path]: صور مرتبة بالأرقام المكتشفة (مُعاد تسميتها)
+        - List[Path]: صور لم يتم التعرف على رقمها
+        - List[Tuple[int, Path, Path]]: أرقام متكررة (الرقم، الصورة الأولى، الصورة الثانية)
+    """
     uploaded_files = [
         p for p in uploaded_images_dir.iterdir()
         if p.is_file() and p.suffix.lower() in VALID_EXTENSIONS
     ]
-
+    
     if not uploaded_files:
         raise FileNotFoundError("لم يتم العثور على أي صور في مجلد الرفع!")
-
+    
     indexed_images: Dict[int, Path] = {}
     unindexed_files: List[Path] = []
-
-    # فحص متوازي عبر 5 مسارات للاستفادة من المفاتيح الأربعة بسرعة
+    conflicts: List[Tuple[int, Path, Path]] = []
+    
+    logger.info(f"🔍 بدء فحص {len(uploaded_files)} صورة بالتوازي...")
+    
+    # OCR متوازي عبر 5 مسارات
     with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = [executor.submit(_scan_single_image, img_p) for img_p in uploaded_files]
+        futures = {executor.submit(_scan_single_image, p): p for p in uploaded_files}
+        
         for future in as_completed(futures):
-            img_path, detected_index = future.result()
-            if detected_index is not None and 1 <= detected_index <= expected_total:
-                indexed_images[detected_index] = img_path
-            else:
+            img_path = futures[future]
+            try:
+                _, detected_index = future.result()
+                
+                if detected_index is not None and 1 <= detected_index <= expected_total:
+                    if detected_index in indexed_images:
+                        # رقم متكرر - نحتفظ بالأولى ونضيف الثانية للـ conflicts
+                        conflicts.append((detected_index, indexed_images[detected_index], img_path))
+                        logger.warning(f"⚠️ رقم متكرر {detected_index}: {img_path.name}")
+                    else:
+                        indexed_images[detected_index] = img_path
+                        logger.info(f"✅ تم التعرف على {img_path.name} → رقم {detected_index}")
+                else:
+                    unindexed_files.append(img_path)
+                    logger.warning(f"❌ لم يتم التعرف على رقم: {img_path.name}")
+                    
+            except Exception as e:
+                logger.error(f"خطأ في معالجة {img_path.name}: {e}")
                 unindexed_files.append(img_path)
+    
+    # إعادة تسمية الصور المكتشفة وتحويلها لـ PNG موحد
+    renamed_dir = output_dir / "renamed_images"
+    renamed_dir.mkdir(parents=True, exist_ok=True)
+    
+    final_indexed: Dict[int, Path] = {}
+    for idx, original_path in indexed_images.items():
+        new_name = f"img_{idx:03d}.png"
+        new_path = renamed_dir / new_name
+        
+        # تحويل لـ PNG موحد
+        img = read_image_safe(original_path)
+        if img is not None:
+            write_image_safe(new_path, img)
+            final_indexed[idx] = new_path
+            logger.info(f"💾 تم حفظ {original_path.name} → {new_name}")
+    
+    logger.info(f"📊 النتائج: {len(final_indexed)} مكتشفة | {len(unindexed_files)} غير مكتشفة | {len(conflicts)} متكررة")
+    
+    return final_indexed, unindexed_files, conflicts
 
-    # تسكين الصور غير المقروءة في الأماكن الفارغة
-    if unindexed_files:
+
+def process_and_verify_images(
+    uploaded_images_dir: Path,
+    output_frames_dir: Path,
+    expected_total: int,
+    allow_partial: bool = False,
+    manual_assignments: Optional[Dict[int, Path]] = None
+) -> List[Path]:
+    """
+    المعالجة الرئيسية مع دعم الوضع اليدوي.
+    
+    Args:
+        manual_assignments: تخصيصات يدوية من المستخدم {رقم: مسار_الصورة}
+    """
+    if not uploaded_images_dir.exists():
+        raise FileNotFoundError(f"المجلد غير موجود: {uploaded_images_dir}")
+
+    # استخدام الدالة الجديدة لإعادة التسمية
+    indexed_images, unindexed_files, conflicts = rename_images_with_detected_numbers(
+        uploaded_images_dir, output_frames_dir.parent, expected_total
+    )
+    
+    # دمج التخصيصات اليدوية إن وجدت
+    if manual_assignments:
+        for idx, img_path in manual_assignments.items():
+            if 1 <= idx <= expected_total:
+                # نقل الصورة للمجلد المُعاد تسميته
+                new_path = output_frames_dir.parent / "renamed_images" / f"img_{idx:03d}.png"
+                img = read_image_safe(img_path)
+                if img is not None:
+                    write_image_safe(new_path, img)
+                    indexed_images[idx] = new_path
+                    logger.info(f"🔧 تم إضافة تخصيص يدوي: {img_path.name} → رقم {idx}")
+                    
+                    # إزالة من غير المكتشفة لو موجودة
+                    if img_path in unindexed_files:
+                        unindexed_files.remove(img_path)
+
+    # تسكين الصور غير المقروءة في الأماكن الفارغة (تلقائياً)
+    if unindexed_files and not manual_assignments:
         empty_slots = [i for i in range(1, expected_total + 1) if i not in indexed_images]
         for slot, fallback_img in zip(empty_slots, unindexed_files):
-            indexed_images[slot] = fallback_img
+            new_path = output_frames_dir.parent / "renamed_images" / f"img_{slot:03d}.png"
+            img = read_image_safe(fallback_img)
+            if img is not None:
+                write_image_safe(new_path, img)
+                indexed_images[slot] = new_path
+                logger.info(f"📥 تم تسكين {fallback_img.name} في المكان الفارغ {slot}")
 
     found_count = len(indexed_images)
     missing_numbers = [i for i in range(1, expected_total + 1) if i not in indexed_images]
