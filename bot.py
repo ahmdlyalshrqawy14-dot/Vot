@@ -37,6 +37,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger("VotStudioBot")
 
+# ── كتم سجلات httpx و getUpdates المزعجة (شاشة نظيفة للإنتاج فقط) ──
+for _noisy_logger in (
+    "httpx",
+    "httpcore",
+    "telegram",
+    "telegram.ext",
+    "telegram.request",
+    "telegram.ext.Updater",
+    "telegram.ext.Application",
+):
+    logging.getLogger(_noisy_logger).setLevel(logging.WARNING)
+
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 EPISODES_FILE = BASE_DIR / "episodes.json"
 OUTPUTS_DIR = BASE_DIR / "outputs"
@@ -269,9 +281,10 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         target_id = data.replace("confirm_ep_", "")
         ep = get_episode(target_id)
         if ep:
-            # ابدأ مرحلة 1+2 كـ Task قابل للإلغاء
-            _register_task(chat_id)
-            await run_stage1_and_2(query, context, ep)
+            # ابدأ مرحلة 1+2 كـ Task خلفي مستقل قابل للإلغاء الفوري
+            user_tasks[chat_id] = asyncio.create_task(
+                run_stage1_and_2(query, context, ep)
+            )
 
     # 5) اختيار محرك الصوت
     elif data == "engine_google":
@@ -318,13 +331,15 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     elif data.startswith("voice_"):
         selected_voice = data.replace("voice_", "")
         session["voice"] = selected_voice
-        _register_task(chat_id)
-        await run_stage3(query, context)
+        user_tasks[chat_id] = asyncio.create_task(
+            run_stage3(query, context)
+        )
 
     # 7) بدء الرندرة بعد رفع الصور
     elif data == "btn_start_render":
-        _register_task(chat_id)
-        await run_stage4_and_5(query.message, context)
+        user_tasks[chat_id] = asyncio.create_task(
+            run_stage4_and_5(query.message, context)
+        )
 
 
 async def show_episode_confirmation(query, ep):
@@ -843,7 +858,12 @@ def main():
     if not TOKEN:
         raise ValueError("TELEGRAM_BOT_TOKEN غير موجود في ملف .env!")
 
-    app = ApplicationBuilder().token(TOKEN).build()
+    app = (
+        ApplicationBuilder()
+        .token(TOKEN)
+        .concurrent_updates(True)   # ← معالجة /start فوراً دون انتظار الطابور
+        .build()
+    )
 
     # الأوامر والأزرار والرسائل
     app.add_handler(CommandHandler("start", start_command))
