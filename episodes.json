@@ -1,7 +1,7 @@
 [
   {
     "id": 1,
-    "status": "completed",
+    "status": "pending",
     "topic": "Squats and Knee Health",
     "the_myth": "Squats are bad for your knees and will cause arthritis.",
     "the_truth": "Properly performed squats strengthen the knees, increase cartilage thickness, and reduce injury risk by improving quadriceps and hamstring strength.",
@@ -21,7 +21,7 @@
   },
   {
     "id": 2,
-    "status": "completed",
+    "status": "pending",
     "topic": "Meal Frequency and Metabolism",
     "the_myth": "You need to eat every 2-3 hours to keep your metabolism burning hot.",
     "the_truth": "Meal frequency has no significant effect on metabolic rate; total daily calories and macronutrients drive fat loss and muscle gain.",
