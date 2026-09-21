@@ -852,7 +852,7 @@ async def show_next_manual_image(context, chat_id):
         buttons.append(row)
 
     buttons.append([
-        InlineKeyboardButton("⏭️ تخطي هذه الصورة", callback_data="manual_skip"),
+        InlineKeyboardButton("❌ صورة غلط / تجاهل", callback_data="manual_skip"),
         InlineKeyboardButton("❌ إلغاء الوضع اليدوي", callback_data="manual_cancel"),
     ])
 
@@ -864,7 +864,8 @@ async def show_next_manual_image(context, chat_id):
                 caption=(
                     f"🖼️ <b>تعيين يدوي — متبقٍ {len(queue)}</b>\n"
                     f"الملف: <code>{Path(current_path).name}</code>\n\n"
-                    f"👇 اختر رقم الكادر (Slot) الذي تنتمي إليه هذه الصورة:"
+                    f"👇 اختر رقم الكادر (من النواقص) الذي تنتمي إليه هذه الصورة:\n"
+                    f"أو اضغط <b>❌ صورة غلط</b> لو الصورة مش تبع الشغل أصلاً."
                 ),
                 reply_markup=InlineKeyboardMarkup(buttons),
                 parse_mode=ParseMode.HTML,
