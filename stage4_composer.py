@@ -119,7 +119,7 @@ def render_final_video(
     """
     بناء خط المونتاج الآلي وتصدير الفيديو النهائي عبر FFmpeg:
     - 1080p Full HD / 60fps
-    - مؤثرات Ken Burns و Vignette
+    - مؤثرات Ken Burns فقط (بدون Vignette)
     - انتقالات صوتية Soft Whoosh عند كل قطع
     - خلو تام بنسبة 100% من الموسيقى الخلفية
     """
@@ -132,14 +132,15 @@ def render_final_video(
     segment_files = []
     fps = 60
 
-    logger.info("🎬 جاري بناء المقاطع الحركية للقطات (Ken Burns & Vignette)...")
+    logger.info("🎬 جاري بناء المقاطع الحركية للقطات (Ken Burns)...")
 
     # 1. رندرة مقطع فيديو مستقل لكل لقطة بحسب مدتها وحركتها الخاصة
     #    [إصلاح 4]: حذف "-loop 1" لتفادي تقطيع zoompan واستهلاك الرام
     for idx, (frame_path, item) in enumerate(zip(frames, timeline)):
         duration = item["duration"]
         kb_filter = get_ken_burns_filter(idx, duration, fps=fps)
-        full_filter = f"{kb_filter},vignette=angle=PI/4:aspect=16/9:eval=init"
+        # ← تم إزالة الـ Vignette نهائياً — الصورة تظهر بطبيعتها
+        full_filter = kb_filter
 
         seg_output = temp_dir / f"seg_{idx:03d}.mp4"
         cmd = [
