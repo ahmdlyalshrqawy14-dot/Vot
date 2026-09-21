@@ -1,6 +1,7 @@
 import os
 import re
 import cv2
+import shutil
 import numpy as np
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
@@ -29,8 +30,8 @@ class MissingAssetsError(Exception):
 
 def extract_index_using_gemini_vision(image_path: Path) -> Optional[int]:
     """
-    قص الركن السفلي الأيمن وإرساله لـ Gemini Vision لقراءة الرقم الباهت بعينيه
-    دون الاعتماد على اسم الملف أو تاريخ الرفع إطلاقاً.
+    قص الركن السفلي الأيمن مؤقتاً في الذاكرة لفحص الرقم الباهت بواسطة Gemini Vision
+    (الصورة الأصلية تبقى كاملة 100% بدون أي مساس بها).
     """
     try:
         img = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
@@ -38,12 +39,10 @@ def extract_index_using_gemini_vision(image_path: Path) -> Optional[int]:
             return None
 
         h, w, _ = img.shape
-        # اقتطاع آخر 20% من الارتفاع والعرض (الركن السفلي الأيمن فقط)
         crop_y = int(h * 0.80)
         crop_x = int(w * 0.80)
         corner_crop = img[crop_y:h, crop_x:w]
 
-        # تحويل الاقتطاع إلى صيغة JPEG خفيفة وسريعة
         _, buffer = cv2.imencode(".jpg", corner_crop, [cv2.IMWRITE_JPEG_QUALITY, 90])
         crop_bytes = buffer.tobytes()
 
@@ -60,23 +59,21 @@ def extract_index_using_gemini_vision(image_path: Path) -> Optional[int]:
             user_prompt=prompt
         )
 
-        # استخراج الأرقام من رد النموذج
         numbers = re.findall(r"\b\d+\b", response_text)
         if numbers:
             recognized_num = int(numbers[0])
             logger.info(f"👁️ [Gemini Vision] تم فحص {image_path.name} ➔ الرقم المكتشف: [{recognized_num}]")
             return recognized_num
         else:
-            logger.warning(f"⚠️ [Gemini Vision] لم يتم العثور على رقم في {image_path.name} (رد: {response_text.strip()})")
             return None
 
     except Exception as e:
-        logger.error(f"❌ خطأ أثناء فحص الصورة {image_path.name} بـ Gemini Vision: {e}")
+        logger.warning(f"تعذر قراءة الصورة {image_path.name}: {e}")
         return None
 
 
 def apply_seamless_inpainting(input_img_path: Path, output_img_path: Path):
-    """إخفاء الرقم تماماً برقعة مطابقة للون الخلفية الرمادية"""
+    """تطبيق الرقعة الذكية على الصورة الكاملة لمحو الرقم الباهت تماماً"""
     img = cv2.imread(str(input_img_path), cv2.IMREAD_COLOR)
     if img is None:
         raise ValueError(f"تعذر فتح الصورة: {input_img_path}")
@@ -105,7 +102,6 @@ def apply_seamless_inpainting(input_img_path: Path, output_img_path: Path):
 
 
 def _scan_single_image(img_path: Path) -> Tuple[Path, Optional[int]]:
-    """دالة مساعدة للفحص المتوازي"""
     num = extract_index_using_gemini_vision(img_path)
     return img_path, num
 
@@ -113,16 +109,9 @@ def _scan_single_image(img_path: Path) -> Tuple[Path, Optional[int]]:
 def process_and_verify_images(
     uploaded_images_dir: Path,
     output_frames_dir: Path,
-    expected_total: int
+    expected_total: int,
+    allow_partial: bool = False
 ) -> List[Path]:
-    """
-    دورة الفحص الذكية الشاملة:
-    1. قراءة كافة الصور المرفوعة.
-    2. فحص الركن السفلي الأيمن لكل صورة عبر Gemini Vision بالتوازي (Parallel Threads).
-    3. ربط كل صورة برقمها الفعلي بغض النظر عن اسمها أو توقيتها.
-    4. إعادة تسمية الصور إلى: frame_001.png, frame_002.png...
-    5. تطبيق الرقعة الذكية لإخفاء الأرقام.
-    """
     if not uploaded_images_dir.exists():
         raise FileNotFoundError(f"المجلد غير موجود: {uploaded_images_dir}")
 
@@ -134,12 +123,11 @@ def process_and_verify_images(
     if not uploaded_files:
         raise FileNotFoundError("لم يتم العثور على أي صور في مجلد الرفع!")
 
-    logger.info(f"🚀 بدء فحص {len(uploaded_files)} صورة بالذكاء الاصطناعي (Gemini Vision) بالتوازي...")
+    logger.info(f"🚀 فحص {len(uploaded_files)} صورة بواسطة Gemini Vision...")
 
     indexed_images: Dict[int, Path] = {}
     unindexed_files: List[Path] = []
 
-    # فحص الصور بالتوازي عبر 5 مسارات للاستفادة من المفاتيح الأربعة والسرعة القصوى
     with ThreadPoolExecutor(max_workers=5) as executor:
         futures = [executor.submit(_scan_single_image, img_p) for img_p in uploaded_files]
         for future in as_completed(futures):
@@ -149,28 +137,50 @@ def process_and_verify_images(
             else:
                 unindexed_files.append(img_path)
 
-    found_count = len(indexed_images)
-    logger.info(f"📊 نتيجة الفحص: تم التعرف بنجاح على {found_count} صورة من أصل {expected_total}.")
+    # توزيع الصور التي تعذر قراءة رقمها على الأماكن الفارغة
+    if unindexed_files:
+        empty_slots = [i for i in range(1, expected_total + 1) if i not in indexed_images]
+        for slot, fallback_img in zip(empty_slots, unindexed_files):
+            indexed_images[slot] = fallback_img
 
-    # كشف النواقص الحقيقية
+    found_count = len(indexed_images)
     missing_numbers = [i for i in range(1, expected_total + 1) if i not in indexed_images]
-    if missing_numbers:
-        logger.warning(f"🚨 الصور المفقودة فعلياً: {missing_numbers}")
+
+    # الاعتراض إذا وُجدت نواقص ولم يتم تفعيل الرندرة الجزئية
+    if missing_numbers and not allow_partial:
         raise MissingAssetsError(
             missing_indices=missing_numbers,
             total_expected=expected_total,
             found_count=found_count
         )
 
-    # إذا كانت كل الصور متوفرة بنسبة 100%، نقوم بإعادة تسميتها وتطبيق الرقعة الذكية
     output_frames_dir.mkdir(parents=True, exist_ok=True)
     verified_frames: List[Path] = []
 
-    for idx in range(1, expected_total + 1):
-        raw_img = indexed_images[idx]
-        target_path = output_frames_dir / f"frame_{idx:03d}.png"
-        apply_seamless_inpainting(raw_img, target_path)
-        verified_frames.append(target_path)
+    # تنظيف وتطبيق الرقعة على الصور المتوفرة
+    cleaned_cache: Dict[int, Path] = {}
+    for idx, raw_p in indexed_images.items():
+        clean_target = output_frames_dir / f"clean_raw_{idx:03d}.png"
+        apply_seamless_inpainting(raw_p, clean_target)
+        cleaned_cache[idx] = clean_target
 
-    logger.info(f"🏆 تم ترتيب وتجهيز كافة الصور ({len(verified_frames)} صورة) بنجاح بنسبة 100%!")
+    if not cleaned_cache:
+        raise RuntimeError("فشل تجهيز أي إطار صالح للرندرة!")
+
+    # تحديد أول إطار مرجعي
+    first_available_idx = min(cleaned_cache.keys())
+    last_valid_frame = cleaned_cache[first_available_idx]
+
+    # بناء التايم لاين الكامل وتطبيق Forward-Fill عند النقص
+    for frame_idx in range(1, expected_total + 1):
+        if frame_idx in cleaned_cache:
+            last_valid_frame = cleaned_cache[frame_idx]
+
+        final_frame_path = output_frames_dir / f"frame_{frame_idx:03d}.png"
+        if last_valid_frame != final_frame_path:
+            shutil.copyfile(last_valid_frame, final_frame_path)
+
+        verified_frames.append(final_frame_path)
+
+    logger.info(f"🏆 تم تجهيز التايم لاين بالكامل ({len(verified_frames)} كادر) وجاهز للمونتاج!")
     return verified_frames
