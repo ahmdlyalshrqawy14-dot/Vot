@@ -1,8 +1,0 @@
-.env
-output/
-__pycache__/
-*.pyc
-*.zip
-*.wav
-*.mp4
-*.ts\n
