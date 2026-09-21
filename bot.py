@@ -159,6 +159,18 @@ def get_episode(target_id=None):
     return episodes[0]
 
 
+def _format_missing_indices(missing, limit=15):
+    """يقصّر عرض الأرقام المفقودة لتجنب تجاوز حد طول رسالة تليجرام."""
+    try:
+        items = list(missing)
+    except TypeError:
+        return str(missing)
+    if len(items) <= limit:
+        return ", ".join(str(x) for x in items)
+    shown = ", ".join(str(x) for x in items[:limit])
+    return f"{shown} ... (+{len(items) - limit} أخرى)"
+
+
 # =================================================================
 # 1. /start → إعادة تشغيل كاملة (Hard Reset)
 # =================================================================
@@ -335,10 +347,16 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             run_stage3(query, context)
         )
 
-    # 7) بدء الرندرة بعد رفع الصور
+    # 7) بدء الرندرة بعد رفع الصور (وضع صارم: يطلب كل الصور)
     elif data == "btn_start_render":
         user_tasks[chat_id] = asyncio.create_task(
-            run_stage4_and_5(query.message, context)
+            run_stage4_and_5(query.message, context, allow_partial=False)
+        )
+
+    # 8) الرندرة القسرية بالصور المتوفرة (Partial / Force Render)
+    elif data == "btn_force_render":
+        user_tasks[chat_id] = asyncio.create_task(
+            run_stage4_and_5(query.message, context, allow_partial=True)
         )
 
 
@@ -685,10 +703,10 @@ async def handle_media_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 # =================================================================
-# 7. المرحلتان 4 و 5 (المونتاج + الميتاداتا)
+# 7. المرحلتان 4 و 5 (المونتاج + الميتاداتا) — تدعم Partial/Force Render
 # =================================================================
 
-async def run_stage4_and_5(msg_obj, context):
+async def run_stage4_and_5(msg_obj, context, allow_partial: bool = False):
     chat_id = msg_obj.chat_id
     session = get_session(chat_id)
 
@@ -702,10 +720,14 @@ async def run_stage4_and_5(msg_obj, context):
     raw_dir = OUTPUTS_DIR / f"episode_{ep_id}_raw_images"
     clean_dir = OUTPUTS_DIR / f"episode_{ep_id}_clean_frames"
 
+    mode_tag = "⚡ رندرة قسرية بالصور المتوفرة" if allow_partial else "🔍 فحص كامل"
     try:
         progress_msg = await context.bot.send_message(
             chat_id=chat_id,
-            text="🔍 <b>جاري فحص الركن السفلي الأيمن للصور بالـ OCR ومطابقة الترتيب...</b>",
+            text=(
+                f"{mode_tag}\n"
+                f"<i>جاري فحص الركن السفلي الأيمن للصور بالـ OCR ومطابقة الترتيب...</i>"
+            ),
             parse_mode=ParseMode.HTML,
         )
     except Exception:
@@ -718,6 +740,7 @@ async def run_stage4_and_5(msg_obj, context):
             uploaded_images_dir=raw_dir,
             output_frames_dir=clean_dir,
             expected_total=total_expected,
+            allow_partial=allow_partial,
         )
         if _is_stale(chat_id, session):
             logger.info(f"⛔ تم إلغاء المرحلة 4 (فحص الصور) للحلقة {ep_id}")
@@ -725,16 +748,32 @@ async def run_stage4_and_5(msg_obj, context):
     except MissingAssetsError as m_err:
         if _is_stale(chat_id, session):
             return
+
+        missing_preview = _format_missing_indices(m_err.missing_indices)
+
         keyboard = [
-            [InlineKeyboardButton("🔄 إعادة الفحص بعد رفع النواقص", callback_data="btn_start_render")]
+            [
+                InlineKeyboardButton(
+                    f"⏩ متابعة ورندرة بالصور المتوفرة ({m_err.found_count} صورة)",
+                    callback_data="btn_force_render",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🔄 إعادة الفحص بعد رفع النواقص",
+                    callback_data="btn_start_render",
+                )
+            ],
         ]
         await progress_msg.edit_text(
             f"🚨 <b>تنبيه: أصول مفقودة (Missing Images)</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"تم التحقق بنجاح من <b>{m_err.found_count}</b> صورة من أصل <b>{m_err.total_expected}</b>.\n\n"
             f"⚠️ <b>الصور المفقودة المطلوب رفعها:</b>\n"
-            f"<code>{m_err.missing_indices}</code>\n\n"
-            f"قم بتوليد هذه الأرقام ورفعها هنا، ثم اضغط على زر إعادة الفحص.",
+            f"<code>{missing_preview}</code>\n\n"
+            f"👇 <b>خياران متاحان:</b>\n"
+            f"• <b>متابعة ورندرة</b> الفيديو بالصور المتوفرة فقط (سيتم توليد فيديو أقصر يتخطى الجمل المفقودة).\n"
+            f"• <b>إعادة الفحص</b> بعد رفع الصور الناقصة للحصول على الفيديو الكامل.",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode=ParseMode.HTML,
         )
@@ -751,9 +790,14 @@ async def run_stage4_and_5(msg_obj, context):
         return
 
     # ── 2) المزامنة + الرندرة ──
+    partial_note = (
+        "⚡ <b>الوضع القسري:</b> سيتم إنتاج فيديو بالصور المتوفرة فقط وتخطي الجمل المفقودة.\n"
+        if allow_partial else ""
+    )
     await progress_msg.edit_text(
         f"<b>🎬 بدء المونتاج والرندرة الآلية عبر FFmpeg (1080p 60fps)</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{partial_note}"
         f"✅ تم مطابقة {len(frames)} صورة وتطبيق الرقعة الذكية واختفاء الأرقام 100%.\n"
         f"⏳ جاري المزامنة الدقيقة بالمللي ثانية وتوليد الترجمة الحركية الصفراء (#FDE047)...\n"
         f"⏳ جاري تطبيق دورة حركات Ken Burns والانتقالات الهوائية (-18dB)...\n\n"
@@ -781,13 +825,14 @@ async def run_stage4_and_5(msg_obj, context):
             return
 
         file_size_mb = final_video.stat().st_size / (1024 * 1024)
+        render_badge = "⚡ (رندرة قسرية)" if allow_partial else "🏆"
         if file_size_mb < 49:
             with open(final_video, "rb") as fv:
                 await context.bot.send_video(
                     chat_id=chat_id,
                     video=fv,
                     caption=(
-                        f"🏆 <b>فيديو الحلقة #{ep_id} جاهز للنشر!</b>\n"
+                        f"{render_badge} <b>فيديو الحلقة #{ep_id} جاهز للنشر!</b>\n"
                         f"الدقة: 1080p Full HD @ 60fps | الحجم: {file_size_mb:.1f} MB"
                     ),
                     parse_mode=ParseMode.HTML,
@@ -796,7 +841,7 @@ async def run_stage4_and_5(msg_obj, context):
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=(
-                    f"🏆 <b>تم تصدير الفيديو النهائي بنجاح على السيرفر!</b>\n"
+                    f"{render_badge} <b>تم تصدير الفيديو النهائي بنجاح على السيرفر!</b>\n"
                     f"📊 الحجم: <code>{file_size_mb:.1f} MB</code> (أكبر من حد تيليجرام 50MB)\n"
                     f"📁 المسار المباشر على السيرفر:\n<code>{final_video}</code>"
                 ),
@@ -872,7 +917,7 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_media_upload))
 
     print("=" * 60)
-    print("🚀 محرك Vot Studio Pro يعمل الآن بنجاح — Hard Reset مفعّل")
+    print("🚀 محرك Vot Studio Pro يعمل الآن بنجاح — Hard Reset + Force Render مفعّلان")
     print("=" * 60)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
