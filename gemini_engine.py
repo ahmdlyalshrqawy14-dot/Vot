@@ -1,7 +1,7 @@
 import json
 import logging
 import requests
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from config import GEMINI_KEYS, GEMINI_MODELS, REQUEST_TIMEOUT
 
 logging.basicConfig(
@@ -18,12 +18,21 @@ def _format_model_name(model_name: str) -> str:
     return clean
 
 
-def call_gemini_with_fallback(system_instruction: str, user_prompt: str) -> str:
+def call_gemini_with_fallback(
+    system_instruction: str, 
+    user_prompt: str, 
+    response_mime_type: str = "application/json"
+) -> str:
     """
-    استدعاء Gemini عبر المفاتيح والنماذج المتعاقبة.
+    استدعاء واجهة Gemini بنظام التناوب الذكي (Keys x Models).
+    يدعم إخراج JSON أو Text عادي بحسب المرحلة.
     """
     if not GEMINI_KEYS:
         raise ValueError("خطأ: لم يتم العثور على أي مفتاح GEMINI في متغيرات البيئة!")
+
+    generation_config = {"temperature": 0.7}
+    if response_mime_type:
+        generation_config["responseMimeType"] = response_mime_type
 
     payload = {
         "contents": [
@@ -35,18 +44,15 @@ def call_gemini_with_fallback(system_instruction: str, user_prompt: str) -> str:
         "systemInstruction": {
             "parts": [{"text": system_instruction}]
         },
-        "generationConfig": {
-            "responseMimeType": "application/json",
-            "temperature": 0.7
-        }
+        "generationConfig": generation_config
     }
 
-    # حلقة المفاتيح (صمامات الأمان)
+    # حلقة المفاتيح الأربعة (صمامات الأمان)
     for key_index, api_key in enumerate(GEMINI_KEYS, start=1):
         masked_key = f"{api_key[:6]}...{api_key[-4:]}" if len(api_key) > 10 else "***"
         logger.info(f"🔑 تجربة المفتاح رقم [{key_index}] ({masked_key})")
 
-        # حلقة النماذج الستة بالترتيب
+        # حلقة النماذج الستة
         for model_index, raw_model in enumerate(GEMINI_MODELS, start=1):
             model_id = _format_model_name(raw_model)
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent?key={api_key}"
@@ -67,13 +73,13 @@ def call_gemini_with_fallback(system_instruction: str, user_prompt: str) -> str:
                     if candidates and "content" in candidates[0]:
                         parts = candidates[0]["content"].get("parts", [])
                         if parts and "text" in parts[0]:
-                            logger.info(f"   ✅ تم النجاح بالمفتاح [{key_index}] والنموذج '{raw_model}'!")
+                            logger.info(f"   ✅ نجاح الطلب عبر المفتاح [{key_index}] والنموذج '{raw_model}'!")
                             return parts[0]["text"]
 
                 logger.warning(f"   ⚠️ فشل الطلب (رمز {response.status_code}): {response.text[:160]}")
 
             except requests.exceptions.RequestException as exc:
-                logger.warning(f"   ⚠️ استثناء شبكة أثناء الاتصال بالنموذج '{raw_model}': {exc}")
+                logger.warning(f"   ⚠️ استثناء اتصال بالنموذج '{raw_model}': {exc}")
 
         logger.warning(f"🚨 استُنفدت جميع النماذج على المفتاح [{key_index}]. الانتقال التلقائي للمفتاح التالي...")
 
