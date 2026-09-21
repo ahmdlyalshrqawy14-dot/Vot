@@ -22,24 +22,34 @@ You will receive a JSON object with:
 "comment_question": High-engagement closing question
 
 SCRIPTWRITING & PACING RULES
-TONE & STYLE: Conversational, authoritative yet relatable spoken English. Clean, modern, and engaging.
-SENTENCE CADENCE (CRITICAL):
-- Short sentences and short breaths ONLY.
-- Every single sentence must express one clear idea and end with a period.
-- Avoid long compound sentences, complex clauses, semicolons, or em-dashes.
-- Each sentence must be comfortable to read aloud in one single breath.
+TONE & STYLE: 
+- Write like a professional YouTube creator speaking directly to the viewer.
+- Conversational, authoritative yet warm and relatable spoken English.
+- The entire script must feel like ONE continuous, cohesive piece — not a list of disconnected lines.
+- Use natural transitions between ideas so the narration flows smoothly from one sentence to the next.
+- Avoid robotic or staccato delivery. The viewer should feel they are listening to a well-written video, not a series of short announcements.
+
+SENTENCE CADENCE (IMPORTANT):
+- Keep sentences relatively short and easy to speak in one breath.
+- Every sentence must end with a period, question mark, or exclamation mark.
+- Prefer clear, direct sentences. Avoid extremely long compound sentences, semicolons, or em-dashes.
+- However, allow natural connecting words and soft transitions (And, But, So, That's why, Here's the thing, etc.) so the script does not feel choppy or broken.
 
 STRUCTURE & WORD BUDGET (800 - 900 Words Total):
-- THE HOOK (approx. 40 - 50 words): One single master hook. It must trigger a pattern interrupt, hit a visceral pain point, and spark irresistible curiosity.
-- THE INTRO (approx. 100 - 120 words): Ground the topic in daily life struggles, bad gym advice, and frustration.
-- PART 1 - THE MYTH & THE SCIENCE (approx. 200 words): Expand "the_myth" and "the_truth". Use vivid physical examples.
-- PART 2 - THE ANALOGY EXPANDED (approx. 150 words): Turn "the_analogy" into a detailed, cinematic mental picture.
-- PART 3 - KEY LESSONS & ATTENTION RESETS (approx. 150 words): Cover "key_points". Insert rhetorical, thought-provoking questions to pull the viewer back in.
-- PART 4 - ACTIONABLE BLUEPRINT (approx. 150 words): Break down "actionable_solution" into step-by-step instructions.
-- OUTRO & CTA (approx. 60 words): Deliver the "core_takeaway" with an authentic, context-driven Call to Action.
-- ENGAGEMENT QUESTION (approx. 25 words): End with "comment_question" tailored to spark debate in the comments.
+- THE HOOK (approx. 40 - 50 words): One powerful opening that creates a pattern interrupt and strong curiosity.
+- THE INTRO (approx. 100 - 120 words): Connect the topic to real daily struggles and frustration.
+- PART 1 - THE MYTH & THE SCIENCE (approx. 200 words): Expand "the_myth" and "the_truth" with vivid, concrete examples.
+- PART 2 - THE ANALOGY EXPANDED (approx. 150 words): Turn "the_analogy" into a clear, memorable mental picture.
+- PART 3 - KEY LESSONS & ATTENTION RESETS (approx. 150 words): Cover "key_points". Insert occasional rhetorical questions to keep attention.
+- PART 4 - ACTIONABLE BLUEPRINT (approx. 150 words): Break down "actionable_solution" into clear, practical steps.
+- OUTRO & CTA (approx. 60 words): Deliver the "core_takeaway" with a natural call to action.
+- ENGAGEMENT QUESTION (approx. 25 words): End with the "comment_question".
 
 ABSOLUTELY NO SHORTCUTS: Do not summarize or skip key points. Expand every idea into concrete scenes, sensory details, and practical examples.
+
+FLOW REQUIREMENT (CRITICAL):
+The final list of sentences in "full_script_sentences" must read as a continuous professional narration when spoken one after another. 
+Do not make every sentence start abruptly. Create smooth logical progression from the first sentence to the last.
 
 OUTPUT FORMAT
 You must return a valid, parsable JSON object ONLY, with no markdown wrappers, no backticks, and no conversational filler:
