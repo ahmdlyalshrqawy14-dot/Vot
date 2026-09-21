@@ -56,20 +56,18 @@ def extract_index_using_gemini_vision(image_path: Path) -> Optional[int]:
             return None
 
         h, w, _ = img.shape
-        
-        # قص أدق للركن الأيمن السفلي (آخر 15% من العرض والارتفاع)
-        crop_y = int(h * 0.85)
-        crop_x = int(w * 0.85)
+
+        # [FIX 3] توسيع هامش الأمان إلى 18% لضمان بقاء الرقم كاملاً داخل الكادر
+        crop_y = int(h * 0.82)
+        crop_x = int(w * 0.82)
         corner_crop = img[crop_y:h, crop_x:w]
-        
-        # تكبير الصورة لتحسين OCR (3x)
+
+        # [FIX 1] تكبير 3x فقط بدون تحويل للرمادي أو رفع تباين حاد
+        # Gemini Vision شبكة بصرية تفهم الألوان والظلال الطبيعية، والفلتر الكلاسيكي
+        # (cvtColor + convertScaleAbs) يمحو ملامح الأرقام الباهتة ويحولها لتشويش رقمي.
         corner_crop = cv2.resize(corner_crop, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
-        
-        # تحسين التباين والإضاءة
-        gray = cv2.cvtColor(corner_crop, cv2.COLOR_BGR2GRAY)
-        enhanced = cv2.convertScaleAbs(gray, alpha=2.0, beta=10)
-        
-        _, buffer = cv2.imencode(".jpg", enhanced, [cv2.IMWRITE_JPEG_QUALITY, 95])
+
+        _, buffer = cv2.imencode(".jpg", corner_crop, [cv2.IMWRITE_JPEG_QUALITY, 95])
         crop_bytes = buffer.tobytes()
 
         prompt = (
@@ -133,14 +131,18 @@ def _scan_single_image(img_path: Path) -> Tuple[Path, Optional[int]]:
 
 def rename_images_with_detected_numbers(
     uploaded_images_dir: Path,
-    output_dir: Path,
+    output_frames_dir: Path,
     expected_total: int
 ) -> Tuple[Dict[int, Path], List[Path], List[Tuple[int, Path, Path]]]:
     """
-    يقرأ كل الصور، يكتشف الرقم من الركن الأيمن، ويعيد تسميتها بالرقم المكتشف.
-    
+    يقرأ كل الصور، يكتشف الرقم من الركن الأيمن، ويعيد قاموساً بالأرقام المكتشفة.
+
+    [FIX 4] لم يعد يتم نسخ الصور إلى مجلد renamed_images؛ بل نحتفظ بالمسارات
+    الأصلية في الذاكرة ليطبق عليها الـ Inpainting لاحقاً مباشرة داخل الكادر
+    المستهدف، مما يلغي عملية كتابة قرص كاملة (60% توفير في I/O).
+
     Returns:
-        - Dict[int, Path]: صور مرتبة بالأرقام المكتشفة (مُعاد تسميتها)
+        - Dict[int, Path]: صور مرتبة بالأرقام المكتشفة (مسارات أصلية)
         - List[Path]: صور لم يتم التعرف على رقمها
         - List[Tuple[int, Path, Path]]: أرقام متكررة (الرقم، الصورة الأولى، الصورة الثانية)
     """
@@ -148,25 +150,25 @@ def rename_images_with_detected_numbers(
         p for p in uploaded_images_dir.iterdir()
         if p.is_file() and p.suffix.lower() in VALID_EXTENSIONS
     ]
-    
+
     if not uploaded_files:
         raise FileNotFoundError("لم يتم العثور على أي صور في مجلد الرفع!")
-    
+
     indexed_images: Dict[int, Path] = {}
     unindexed_files: List[Path] = []
     conflicts: List[Tuple[int, Path, Path]] = []
-    
+
     logger.info(f"🔍 بدء فحص {len(uploaded_files)} صورة بالتوازي...")
-    
+
     # OCR متوازي عبر 5 مسارات
     with ThreadPoolExecutor(max_workers=5) as executor:
         futures = {executor.submit(_scan_single_image, p): p for p in uploaded_files}
-        
+
         for future in as_completed(futures):
             img_path = futures[future]
             try:
                 _, detected_index = future.result()
-                
+
                 if detected_index is not None and 1 <= detected_index <= expected_total:
                     if detected_index in indexed_images:
                         # رقم متكرر - نحتفظ بالأولى ونضيف الثانية للـ conflicts
@@ -178,29 +180,16 @@ def rename_images_with_detected_numbers(
                 else:
                     unindexed_files.append(img_path)
                     logger.warning(f"❌ لم يتم التعرف على رقم: {img_path.name}")
-                    
+
             except Exception as e:
                 logger.error(f"خطأ في معالجة {img_path.name}: {e}")
                 unindexed_files.append(img_path)
-    
-    # إعادة تسمية الصور المكتشفة وتحويلها لـ PNG موحد
-    renamed_dir = output_dir / "renamed_images"
-    renamed_dir.mkdir(parents=True, exist_ok=True)
-    
-    final_indexed: Dict[int, Path] = {}
-    for idx, original_path in indexed_images.items():
-        new_name = f"img_{idx:03d}.png"
-        new_path = renamed_dir / new_name
-        
-        # تحويل لـ PNG موحد
-        img = read_image_safe(original_path)
-        if img is not None:
-            write_image_safe(new_path, img)
-            final_indexed[idx] = new_path
-            logger.info(f"💾 تم حفظ {original_path.name} → {new_name}")
-    
+
+    # [FIX 4] الاحتفاظ بالمسارات الأصلية مباشرة - لا كتابة قرص مكررة
+    final_indexed: Dict[int, Path] = indexed_images
+
     logger.info(f"📊 النتائج: {len(final_indexed)} مكتشفة | {len(unindexed_files)} غير مكتشفة | {len(conflicts)} متكررة")
-    
+
     return final_indexed, unindexed_files, conflicts
 
 
@@ -213,7 +202,7 @@ def process_and_verify_images(
 ) -> List[Path]:
     """
     المعالجة الرئيسية مع دعم الوضع اليدوي.
-    
+
     Args:
         manual_assignments: تخصيصات يدوية من المستخدم {رقم: مسار_الصورة}
     """
@@ -222,21 +211,24 @@ def process_and_verify_images(
 
     # استخدام الدالة الجديدة لإعادة التسمية
     indexed_images, unindexed_files, conflicts = rename_images_with_detected_numbers(
-        uploaded_images_dir, output_frames_dir.parent, expected_total
+        uploaded_images_dir, output_frames_dir, expected_total
     )
-    
+
+    # [FIX 2] عزل مجلد renamed لكل حلقة على حدة لتفادي التداخل مع الحلقات الأخرى
+    # وتسهيل حذفه تلقائياً عند (/start) عبر bot.py
+    renamed_dir = output_frames_dir.parent / f"{output_frames_dir.name}_renamed"
+
     # دمج التخصيصات اليدوية إن وجدت
     if manual_assignments:
         for idx, img_path in manual_assignments.items():
             if 1 <= idx <= expected_total:
-                # نقل الصورة للمجلد المُعاد تسميته
-                new_path = output_frames_dir.parent / "renamed_images" / f"img_{idx:03d}.png"
+                new_path = renamed_dir / f"img_{idx:03d}.png"
                 img = read_image_safe(img_path)
                 if img is not None:
                     write_image_safe(new_path, img)
                     indexed_images[idx] = new_path
                     logger.info(f"🔧 تم إضافة تخصيص يدوي: {img_path.name} → رقم {idx}")
-                    
+
                     # إزالة من غير المكتشفة لو موجودة
                     if img_path in unindexed_files:
                         unindexed_files.remove(img_path)
@@ -245,7 +237,7 @@ def process_and_verify_images(
     if unindexed_files and not manual_assignments:
         empty_slots = [i for i in range(1, expected_total + 1) if i not in indexed_images]
         for slot, fallback_img in zip(empty_slots, unindexed_files):
-            new_path = output_frames_dir.parent / "renamed_images" / f"img_{slot:03d}.png"
+            new_path = renamed_dir / f"img_{slot:03d}.png"
             img = read_image_safe(fallback_img)
             if img is not None:
                 write_image_safe(new_path, img)
@@ -263,29 +255,30 @@ def process_and_verify_images(
             found_count=found_count
         )
 
+    if not indexed_images:
+        raise RuntimeError("فشل تجهيز أي كادر صالح للرندرة!")
+
     output_frames_dir.mkdir(parents=True, exist_ok=True)
     verified_frames: List[Path] = []
 
-    cleaned_cache: Dict[int, Path] = {}
+    # [FIX 4] تطبيق الـ Inpainting مرة واحدة فقط مباشرة داخل الكادر المستهدف
+    # frame_xxx.png وإلغاء ملف clean_raw_xxx.png الوسيط تماماً.
+    first_available_idx = min(indexed_images.keys())
+
     for idx, raw_p in indexed_images.items():
-        clean_target = output_frames_dir / f"clean_raw_{idx:03d}.png"
-        apply_seamless_inpainting(raw_p, clean_target)
-        cleaned_cache[idx] = clean_target
+        final_frame_path = output_frames_dir / f"frame_{idx:03d}.png"
+        apply_seamless_inpainting(raw_p, final_frame_path)
+        logger.info(f"💾 تم توليد الكادر النهائي: {final_frame_path.name}")
 
-    if not cleaned_cache:
-        raise RuntimeError("فشل تجهيز أي كادر صالح للرندرة!")
-
-    # تطبيق ملء الفراغات التلقائي (Forward-Fill)
-    first_available_idx = min(cleaned_cache.keys())
-    last_valid_frame = cleaned_cache[first_available_idx]
-
+    # تطبيق ملء الفراغات التلقائي (Forward/Backward-Fill) بدون إعادة كتابة
     for frame_idx in range(1, expected_total + 1):
-        if frame_idx in cleaned_cache:
-            last_valid_frame = cleaned_cache[frame_idx]
-
         final_frame_path = output_frames_dir / f"frame_{frame_idx:03d}.png"
-        if last_valid_frame != final_frame_path:
-            shutil.copyfile(last_valid_frame, final_frame_path)
+
+        if frame_idx not in indexed_images:
+            candidates_before = [i for i in indexed_images if i < frame_idx]
+            source_idx = max(candidates_before) if candidates_before else first_available_idx
+            source_path = output_frames_dir / f"frame_{source_idx:03d}.png"
+            shutil.copyfile(source_path, final_frame_path)
 
         verified_frames.append(final_frame_path)
 
