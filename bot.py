@@ -17,12 +17,11 @@ from telegram.ext import (
 
 from config import (
     AZURE_MALE_VOICES,
-    GOOGLE_MALE_VOICES,
     BASE_DIR,
 )
 from stage1_generator import generate_stage1_script
 from stage2_generator import generate_stage2_prompts_batches
-from stage3_audio import generate_stage3_audio
+from stage3_audio import generate_stage3_audio, generate_voice_preview
 from stage4_vision import process_and_verify_images, MissingAssetsError
 from stage4_subtitles import align_audio_and_generate_ass
 from stage4_composer import render_final_video
@@ -58,6 +57,9 @@ OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 # -----------------------------------------------------------------
 user_sessions = {}
 user_tasks = {}
+
+# جملة العينة الثابتة لمعاينة الأصوات
+VOICE_PREVIEW_TEXT = "Hello, this is a sample of my voice. How do I sound to you?"
 
 
 def _fresh_session():
@@ -291,51 +293,40 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 run_stage1_and_2(query, context, ep)
             )
 
-    # ── 5) اختيار محرك الصوت ──
-    elif data == "engine_google":
-        session["engine"] = "google"
-        buttons = []
-        descriptions = {
-            "en-US-Journey-D": "أداء حواري ديناميكي معبّر 🔥",
-            "en-US-Studio-Q": "صوت استوديو عميق ورخيم 🎙️",
-            "en-US-Neural2-D": "إلقاء إخباري ورسمي واضح 📢",
-        }
-        for v in GOOGLE_MALE_VOICES:
-            label = descriptions.get(v, v)
-            buttons.append([InlineKeyboardButton(f"🗣️ {label}", callback_data=f"voice_{v}")])
-        buttons.append([InlineKeyboardButton("🔙 رجوع لمحركات الصوت", callback_data="btn_reselect_engine")])
-        await query.edit_message_text(
-            "🌐 <b>محرك Google Cloud TTS | اختر الصوت الرجالي:</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-            reply_markup=InlineKeyboardMarkup(buttons),
-            parse_mode=ParseMode.HTML,
-        )
+    # ── 5) معاينة صوت (Voice Preview) — لا تغيّر حالة الجلسة ──
+    elif data.startswith("preview_voice_"):
+        preview_voice = data.replace("preview_voice_", "")
+        try:
+            preview_path = await asyncio.to_thread(
+                generate_voice_preview,
+                voice=preview_voice,
+                text=VOICE_PREVIEW_TEXT,
+                output_dir=OUTPUTS_DIR,
+            )
+            with open(preview_path, "rb") as audio_file:
+                await context.bot.send_audio(
+                    chat_id=chat_id,
+                    audio=audio_file,
+                    title=f"Voice Preview — {preview_voice}",
+                    caption=(
+                        f"🎧 <b>عينة صوت Azure:</b> <code>{preview_voice}</code>\n"
+                        f"<i>{VOICE_PREVIEW_TEXT}</i>"
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+        except Exception as e:
+            logger.error(f"فشل توليد معاينة الصوت {preview_voice}: {e}")
+            try:
+                await query.answer(f"❌ فشل توليد العينة: {e}", show_alert=True)
+            except Exception:
+                pass
+        return
 
-    elif data == "engine_azure":
-        session["engine"] = "azure"
-        buttons = []
-        descriptions = {
-            "en-US-GuyNeural": "تلوين انفعالي كامل وشامل 🌟",
-            "en-US-DavisNeural": "سرد ناضج وهادئ وقوي 📖",
-            "en-US-TonyNeural": "صوت حماسي وواثق وعالي الطاقة ⚡",
-            "en-US-JasonNeural": "نبرة شبابية وسريعة وخفيفة 🚀",
-        }
-        for v in AZURE_MALE_VOICES:
-            label = descriptions.get(v, v)
-            buttons.append([InlineKeyboardButton(f"🗣️ {label}", callback_data=f"voice_{v}")])
-        buttons.append([InlineKeyboardButton("🔙 رجوع لمحركات الصوت", callback_data="btn_reselect_engine")])
-        await query.edit_message_text(
-            "⚡ <b>محرك Microsoft Azure Speech | اختر الصوت الرجالي:</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-            reply_markup=InlineKeyboardMarkup(buttons),
-            parse_mode=ParseMode.HTML,
-        )
-
-    elif data == "btn_reselect_engine":
-        await present_audio_engine_choice(query)
-
-    # ── 6) اختيار الصوت وبدء المرحلة الثالثة ──
+    # ── 6) اختيار الصوت النهائي وبدء المرحلة الثالثة (Azure فقط) ──
     elif data.startswith("voice_"):
         selected_voice = data.replace("voice_", "")
         session["voice"] = selected_voice
+        session["engine"] = "azure"
         user_tasks[chat_id] = asyncio.create_task(
             run_stage3(query, context)
         )
@@ -600,7 +591,7 @@ async def run_stage1_and_2(query, context, episode):
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"📝 <b>إجمالي الجمل المولدة:</b> <code>{len(sentences)}</code> جملة.\n"
             f"📦 <b>الملفات النصية:</b> تم إرسال <code>{len(batches)}</code> ملفات (.txt).\n"
-            f"🎯 <b>الخطوة التالية:</b> تحديد محرك وهندسة الصوت التعبيري."
+            f"🎯 <b>الخطوة التالية:</b> تحديد الصوت الصوتي التعبيري."
         )
         await context.bot.send_message(chat_id=chat_id, text=status_card, parse_mode=ParseMode.HTML)
         await present_audio_engine_choice(context.bot, chat_id=chat_id)
@@ -619,18 +610,33 @@ async def run_stage1_and_2(query, context, episode):
 
 
 async def present_audio_engine_choice(bot_or_query, chat_id=None):
+    """
+    ✅ [معدّل]: لم يعد هناك سؤال عن المحرك — نعرض قائمة أصوات Azure مباشرة.
+    """
     text = (
-        "🎙️ <b>المرحلة 3: اختيار محرك وهندسة الصوت التعبيري</b>\n"
+        "🎙️ <b>المرحلة 3: اختيار الصوت التعبيري (Microsoft Azure)</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "يرجى تحديد المحرك الصوتي المعتمد لهذه الحلقة:\n\n"
-        "• <b>Microsoft Azure:</b> يدعم معيار SSML وتلوين نبرة الصوت بين الغضب، الحماس، والهمس.\n"
-        "• <b>Google Cloud TTS:</b> يدعم وسوم الانفعالات الديناميكية والإيموجي السياقي داخل الجمل."
+        "يمكنك الاستماع لعينة فورية لأي صوت قبل الاختيار عبر زر <b>🎧 استمع للعينة</b>،\n"
+        "ثم اضغط على اسم الصوت لاعتماده وبدء توليد التعليق الصوتي.\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     )
-    keyboard = [
-        [InlineKeyboardButton("⚡ Microsoft Azure Speech (SSML)", callback_data="engine_azure")],
-        [InlineKeyboardButton("🌐 Google Cloud TTS (Expressive)", callback_data="engine_google")],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    descriptions = {
+        "en-US-GuyNeural": "تلوين انفعالي كامل وشامل 🌟",
+        "en-US-DavisNeural": "سرد ناضج وهادئ وقوي 📖",
+        "en-US-TonyNeural": "صوت حماسي وواثق وعالي الطاقة ⚡",
+        "en-US-JasonNeural": "نبرة شبابية وسريعة وخفيفة 🚀",
+    }
+
+    buttons = []
+    for v in AZURE_MALE_VOICES:
+        label = descriptions.get(v, v)
+        buttons.append([
+            InlineKeyboardButton(f"🗣️ {label}", callback_data=f"voice_{v}"),
+            InlineKeyboardButton("🎧 استمع للعينة", callback_data=f"preview_voice_{v}"),
+        ])
+
+    reply_markup = InlineKeyboardMarkup(buttons)
 
     if chat_id:
         await bot_or_query.send_message(
@@ -651,7 +657,7 @@ async def run_stage3(query, context):
     session = get_session(chat_id)
     ep_id = session.get("episode_id")
     sentences = session.get("sentences", [])
-    engine = session.get("engine", "azure")
+    engine = "azure"
     voice = session.get("voice", "en-US-GuyNeural")
 
     if _is_stale(chat_id, session):
