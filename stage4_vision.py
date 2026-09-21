@@ -16,25 +16,42 @@ VALID_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".jfif", ".bmp"}
 
 
 class MissingAssetsError(Exception):
-    """استثناء عند وجود صور مفقودة لإخطار المستخدم بأرقامها الحقيقية بدقة"""
     def __init__(self, missing_indices: List[int], total_expected: int, found_count: int):
         self.missing_indices = missing_indices
         self.total_expected = total_expected
         self.found_count = found_count
-        msg = (
-            f"⚠️ تم التحقق من {found_count} صورة من أصل {total_expected}.\n"
-            f"الصور المفقودة المطلوب رفعها: {missing_indices}"
-        )
+        msg = f"⚠️ تم التحقق من {found_count} صورة من أصل {total_expected}."
         super().__init__(msg)
 
 
-def extract_index_using_gemini_vision(image_path: Path) -> Optional[int]:
-    """
-    قص الركن السفلي الأيمن مؤقتاً في الذاكرة لفحص الرقم الباهت بواسطة Gemini Vision
-    (الصورة الأصلية تبقى كاملة 100% بدون أي مساس بها).
-    """
+def read_image_safe(path: Path) -> Optional[np.ndarray]:
+    """قراءة الصورة بأمان من الذاكرة لتفادي مشاكل رموز ويندوز مثل النقاط …"""
     try:
-        img = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+        with open(path, "rb") as f:
+            file_bytes = np.frombuffer(f.read(), dtype=np.uint8)
+            img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+            return img
+    except Exception as e:
+        logger.error(f"تعذر فتح الملف {path.name}: {e}")
+        return None
+
+
+def write_image_safe(path: Path, img: np.ndarray):
+    """حفظ الصورة بأمان تام متوافق مع كافة الرموز والامتدادات"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ext = path.suffix if path.suffix else ".png"
+    success, encoded_img = cv2.imencode(ext, img)
+    if success:
+        with open(path, "wb") as f:
+            f.write(encoded_img)
+    else:
+        raise IOError(f"فشل تشفير وحفظ الصورة: {path}")
+
+
+def extract_index_using_gemini_vision(image_path: Path) -> Optional[int]:
+    """قص مؤقت في الرام للركن الأيمن وقراءة الرقم عبر Gemini Vision"""
+    try:
+        img = read_image_safe(image_path)
         if img is None:
             return None
 
@@ -61,11 +78,8 @@ def extract_index_using_gemini_vision(image_path: Path) -> Optional[int]:
 
         numbers = re.findall(r"\b\d+\b", response_text)
         if numbers:
-            recognized_num = int(numbers[0])
-            logger.info(f"👁️ [Gemini Vision] تم فحص {image_path.name} ➔ الرقم المكتشف: [{recognized_num}]")
-            return recognized_num
-        else:
-            return None
+            return int(numbers[0])
+        return None
 
     except Exception as e:
         logger.warning(f"تعذر قراءة الصورة {image_path.name}: {e}")
@@ -73,8 +87,8 @@ def extract_index_using_gemini_vision(image_path: Path) -> Optional[int]:
 
 
 def apply_seamless_inpainting(input_img_path: Path, output_img_path: Path):
-    """تطبيق الرقعة الذكية على الصورة الكاملة لمحو الرقم الباهت تماماً"""
-    img = cv2.imread(str(input_img_path), cv2.IMREAD_COLOR)
+    """إخفاء الرقم الباهت بالرقعة الذكية من الصورة الكاملة الأصلية"""
+    img = read_image_safe(input_img_path)
     if img is None:
         raise ValueError(f"تعذر فتح الصورة: {input_img_path}")
 
@@ -97,8 +111,7 @@ def apply_seamless_inpainting(input_img_path: Path, output_img_path: Path):
     blended = (feathered_mask * solid_bg + (1.0 - feathered_mask) * img).astype(np.uint8)
     refined = cv2.inpaint(blended, mask, inpaintRadius=5, flags=cv2.INPAINT_TELEA)
 
-    output_img_path.parent.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(output_img_path), refined)
+    write_image_safe(output_img_path, refined)
 
 
 def _scan_single_image(img_path: Path) -> Tuple[Path, Optional[int]]:
@@ -123,11 +136,10 @@ def process_and_verify_images(
     if not uploaded_files:
         raise FileNotFoundError("لم يتم العثور على أي صور في مجلد الرفع!")
 
-    logger.info(f"🚀 فحص {len(uploaded_files)} صورة بواسطة Gemini Vision...")
-
     indexed_images: Dict[int, Path] = {}
     unindexed_files: List[Path] = []
 
+    # فحص متوازي عبر 5 مسارات للاستفادة من المفاتيح الأربعة بسرعة
     with ThreadPoolExecutor(max_workers=5) as executor:
         futures = [executor.submit(_scan_single_image, img_p) for img_p in uploaded_files]
         for future in as_completed(futures):
@@ -137,7 +149,7 @@ def process_and_verify_images(
             else:
                 unindexed_files.append(img_path)
 
-    # توزيع الصور التي تعذر قراءة رقمها على الأماكن الفارغة
+    # تسكين الصور غير المقروءة في الأماكن الفارغة
     if unindexed_files:
         empty_slots = [i for i in range(1, expected_total + 1) if i not in indexed_images]
         for slot, fallback_img in zip(empty_slots, unindexed_files):
@@ -146,7 +158,7 @@ def process_and_verify_images(
     found_count = len(indexed_images)
     missing_numbers = [i for i in range(1, expected_total + 1) if i not in indexed_images]
 
-    # الاعتراض إذا وُجدت نواقص ولم يتم تفعيل الرندرة الجزئية
+    # لو في صور ناقصة ولم يُطلب التجاوز
     if missing_numbers and not allow_partial:
         raise MissingAssetsError(
             missing_indices=missing_numbers,
@@ -157,7 +169,6 @@ def process_and_verify_images(
     output_frames_dir.mkdir(parents=True, exist_ok=True)
     verified_frames: List[Path] = []
 
-    # تنظيف وتطبيق الرقعة على الصور المتوفرة
     cleaned_cache: Dict[int, Path] = {}
     for idx, raw_p in indexed_images.items():
         clean_target = output_frames_dir / f"clean_raw_{idx:03d}.png"
@@ -165,13 +176,12 @@ def process_and_verify_images(
         cleaned_cache[idx] = clean_target
 
     if not cleaned_cache:
-        raise RuntimeError("فشل تجهيز أي إطار صالح للرندرة!")
+        raise RuntimeError("فشل تجهيز أي كادر صالح للرندرة!")
 
-    # تحديد أول إطار مرجعي
+    # تطبيق ملء الفراغات التلقائي (Forward-Fill)
     first_available_idx = min(cleaned_cache.keys())
     last_valid_frame = cleaned_cache[first_available_idx]
 
-    # بناء التايم لاين الكامل وتطبيق Forward-Fill عند النقص
     for frame_idx in range(1, expected_total + 1):
         if frame_idx in cleaned_cache:
             last_valid_frame = cleaned_cache[frame_idx]
@@ -182,5 +192,4 @@ def process_and_verify_images(
 
         verified_frames.append(final_frame_path)
 
-    logger.info(f"🏆 تم تجهيز التايم لاين بالكامل ({len(verified_frames)} كادر) وجاهز للمونتاج!")
     return verified_frames
