@@ -16,10 +16,17 @@ VALID_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".jfif", ".bmp"}
 
 
 class MissingAssetsError(Exception):
-    def __init__(self, missing_indices: List[int], total_expected: int, found_count: int):
+    def __init__(
+        self,
+        missing_indices: List[int],
+        total_expected: int,
+        found_count: int,
+        unindexed_files: Optional[List[Path]] = None
+    ):
         self.missing_indices = missing_indices
         self.total_expected = total_expected
         self.found_count = found_count
+        self.unindexed_files = unindexed_files or []
         msg = f"⚠️ تم التحقق من {found_count} صورة من أصل {total_expected}."
         super().__init__(msg)
 
@@ -252,7 +259,8 @@ def process_and_verify_images(
         raise MissingAssetsError(
             missing_indices=missing_numbers,
             total_expected=expected_total,
-            found_count=found_count
+            found_count=found_count,
+            unindexed_files=unindexed_files  # 👈 تمرير الصور غير المقروءة للوضع اليدوي في البوت
         )
 
     if not indexed_images:
