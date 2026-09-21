@@ -1,5 +1,7 @@
 import os
 import json
+import shutil
+import asyncio
 import logging
 from pathlib import Path
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -16,7 +18,7 @@ from telegram.ext import (
 from config import (
     AZURE_MALE_VOICES,
     GOOGLE_MALE_VOICES,
-    BASE_DIR
+    BASE_DIR,
 )
 from stage1_generator import generate_stage1_script
 from stage2_generator import generate_stage2_prompts_batches
@@ -26,10 +28,12 @@ from stage4_subtitles import align_audio_and_generate_ass
 from stage4_composer import render_final_video
 from stage5_metadata import generate_stage5_metadata
 
+# -----------------------------------------------------------------
 # إعداد السجلات
+# -----------------------------------------------------------------
 logging.basicConfig(
     format="%(asctime)s - [%(levelname)s] - %(message)s",
-    level=logging.INFO
+    level=logging.INFO,
 )
 logger = logging.getLogger("VotStudioBot")
 
@@ -38,8 +42,86 @@ EPISODES_FILE = BASE_DIR / "episodes.json"
 OUTPUTS_DIR = BASE_DIR / "outputs"
 OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 
-# إدارة الجلسات {chat_id: {...}}
-user_sessions = {}
+# -----------------------------------------------------------------
+# إدارة الجلسات والمهام
+# -----------------------------------------------------------------
+user_sessions = {}   # {chat_id: session_dict}
+user_tasks = {}      # {chat_id: asyncio.Task} ← لمتابعة العملية الجارية
+
+
+def _fresh_session():
+    """ينشئ جلسة نظيفة تماماً برمز تعريف فريد (token)."""
+    return {
+        "state": "IDLE",
+        "episode_id": None,
+        "episode_data": None,
+        "sentences": [],
+        "audio_path": None,
+        "uploaded_count": 0,
+        "engine": None,
+        "voice": None,
+        "cancelled": False,
+        "token": object(),   # علامة فريدة تميز هذه الجلسة عن أي جلسة قديمة
+    }
+
+
+def get_session(chat_id):
+    if chat_id not in user_sessions:
+        user_sessions[chat_id] = _fresh_session()
+    return user_sessions[chat_id]
+
+
+def _is_stale(chat_id, session):
+    """
+    ترجع True لو الجلسة دي بقت قديمة (تم استبدالها بـ /start أو تم إلغاؤها).
+    تُستخدم كـ checkpoint بين المراحل لإيقاف أي عملية جارية فوراً.
+    """
+    current = user_sessions.get(chat_id)
+    return current is not session or session.get("cancelled", False)
+
+
+def _register_task(chat_id):
+    """يسجّل الـ Task الحالي في user_tasks ليتمكن /start من إلغائه."""
+    try:
+        task = asyncio.current_task()
+        if task:
+            user_tasks[chat_id] = task
+    except RuntimeError:
+        pass
+
+
+def _cancel_user_task(chat_id):
+    """يلغي أي Task جاري للمستخدم (Soft cancel + إهمال النتيجة)."""
+    task = user_tasks.get(chat_id)
+    if task and not task.done():
+        try:
+            task.cancel()
+            logger.info(f"🛑 تم إرسال Cancel للـ Task الجاري في {chat_id}")
+            return True
+        except Exception as e:
+            logger.warning(f"فشل إلغاء الـ Task: {e}")
+    return False
+
+
+def _cleanup_episode_temp_files(ep_id):
+    """يحذف كل المجلدات المؤقتة للحلقة (temp_segments + صور خام + إطارات)."""
+    if not ep_id:
+        return
+    targets = [
+        OUTPUTS_DIR / f"episode_{ep_id}_prompts",
+        OUTPUTS_DIR / f"episode_{ep_id}_raw_images",
+        OUTPUTS_DIR / f"episode_{ep_id}_clean_frames",
+        OUTPUTS_DIR / f"episode_{ep_id}_temp_segments",
+        OUTPUTS_DIR / f"episode_{ep_id}_temp_segments_audio",
+        OUTPUTS_DIR / "temp_segments",
+    ]
+    for t in targets:
+        try:
+            if t.exists() and t.is_dir():
+                shutil.rmtree(t, ignore_errors=True)
+                logger.info(f"🧹 تم حذف المجلد المؤقت: {t.name}")
+        except Exception as e:
+            logger.warning(f"تعذّر حذف {t}: {e}")
 
 
 def load_all_episodes():
@@ -59,62 +141,77 @@ def get_episode(target_id=None):
             if str(ep.get("id")) == str(target_id):
                 return ep
         return None
-    # التلقائي: أول حلقة pending
     for ep in episodes:
         if ep.get("status") == "pending":
             return ep
     return episodes[0]
 
 
-def get_session(chat_id):
-    if chat_id not in user_sessions:
-        user_sessions[chat_id] = {
-            "state": "IDLE",
-            "episode_id": None,
-            "episode_data": None,
-            "sentences": [],
-            "audio_path": None,
-            "uploaded_count": 0,
-        }
-    return user_sessions[chat_id]
-
-
-# -------------------------------------------------------------
-# 1. شاشة البداية والترحيب التفاعلية
-# -------------------------------------------------------------
+# =================================================================
+# 1. /start → إعادة تشغيل كاملة (Hard Reset)
+# =================================================================
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    session = get_session(update.effective_chat.id)
-    session["state"] = "IDLE"
+    chat_id = update.effective_chat.id
+
+    # ── (1) إلغاء أي Task شغّال حالياً ────────────────────────────
+    cancelled = _cancel_user_task(chat_id)
+
+    # ── (2) التقاط ep_id القديم قبل المسح لتنظيف ملفاته ──────────
+    old_session = user_sessions.get(chat_id)
+    old_ep_id = old_session.get("episode_id") if old_session else None
+
+    # ── (3) علامة cancelled على الجلسة القديمة ─────────────────
+    if old_session:
+        old_session["cancelled"] = True
+
+    # ── (4) Purge كامل + جلسة جديدة نظيفة ───────────────────────
+    user_sessions[chat_id] = _fresh_session()
+
+    # ── (5) تنظيف المجلدات المؤقتة ──────────────────────────────
+    _cleanup_episode_temp_files(old_ep_id)
+
+    # ── (6) عزل حالة الأزرار القديمة ─────────────────────────────
+    #   (PTB لا يحتاج تدخلاً — الجلسة الجديدة كافية)
+
+    logger.info(
+        f"♻️ Hard Reset للمستخدم {chat_id} | cancelled_task={cancelled} | cleaned_ep={old_ep_id}"
+    )
+
+    reset_badge = (
+        "♻️ <b>تم تنفيذ إعادة التشغيل الكاملة بنجاح</b>\n"
+        "├ تم إيقاف أي عملية جارية فوراً\n"
+        "├ تم مسح الذاكرة المؤقتة (Session Purge)\n"
+        "└ تم حذف الملفات المؤقتة من السيرفر\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    )
 
     welcome_text = (
         "<b>🎬 مرحباً بك في Vot Studio | المحرك الآلي لصناعة المحتوى</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{reset_badge}"
         "النظام السحابي المتكامل لتحويل أفكار الحلقات إلى فيديوهات يوتيوب احترافية "
         "بجودة <b>1080p 60fps</b> مع هندسة التعليق الصوتي والترجمة الحركية.\n\n"
         "<b>👇 كيف تود أن نبدأ اليوم؟</b>"
     )
 
     keyboard = [
-        [
-            InlineKeyboardButton("▶️ بدء الحلقة التالية المجدولة", callback_data="btn_start_next")
-        ],
+        [InlineKeyboardButton("▶️ بدء الحلقة التالية المجدولة", callback_data="btn_start_next")],
         [
             InlineKeyboardButton("🔢 إدخال رقم حلقة معينة (ID)", callback_data="btn_choose_id"),
-            InlineKeyboardButton("📋 استعراض الحلقات المتاحة", callback_data="btn_list_episodes")
-        ]
+            InlineKeyboardButton("📋 استعراض الحلقات المتاحة", callback_data="btn_list_episodes"),
+        ],
     ]
 
     await update.message.reply_text(
         welcome_text,
         reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode=ParseMode.HTML
+        parse_mode=ParseMode.HTML,
     )
 
 
-# -------------------------------------------------------------
+# =================================================================
 # 2. معالجة اختيارات القائمة الرئيسية
-# -------------------------------------------------------------
+# =================================================================
 
 async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -123,7 +220,11 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     chat_id = update.effective_chat.id
     session = get_session(chat_id)
 
-    # 1. خيار بدء الحلقة المجدولة التالية
+    # تجاهل أي ضغط على أزرار قديمة من جلسة ملغاة
+    if session.get("cancelled"):
+        return
+
+    # 1) بدء الحلقة المجدولة التالية
     if data == "btn_start_next":
         ep = get_episode(target_id=None)
         if not ep:
@@ -131,16 +232,16 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             return
         await show_episode_confirmation(query, ep)
 
-    # 2. خيار إدخال رقم ID مخصص
+    # 2) إدخال رقم ID مخصص
     elif data == "btn_choose_id":
         session["state"] = "WAITING_EPISODE_ID"
         await query.edit_message_text(
             "🔢 <b>يرجى كتابة رقم الحلقة (ID) الآن في الشات:</b>\n"
             "<i>(مثال: أرسل الرقم 201 أو 101)</i>",
-            parse_mode=ParseMode.HTML
+            parse_mode=ParseMode.HTML,
         )
 
-    # 3. استعراض قائمة الحلقات
+    # 3) استعراض قائمة الحلقات
     elif data == "btn_list_episodes":
         episodes = load_all_episodes()
         if not episodes:
@@ -154,38 +255,41 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
         buttons = [
             [InlineKeyboardButton("▶️ بدء الحلقة التالية المجدولة", callback_data="btn_start_next")],
-            [InlineKeyboardButton("🔙 رجوع للقائمة الرئيسية", callback_data="btn_back_main")]
+            [InlineKeyboardButton("🔙 رجوع للقائمة الرئيسية", callback_data="btn_back_main")],
         ]
-        await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(buttons), parse_mode=ParseMode.HTML)
+        await query.edit_message_text(
+            msg, reply_markup=InlineKeyboardMarkup(buttons), parse_mode=ParseMode.HTML
+        )
 
     elif data == "btn_back_main":
         await start_command(query, context)
 
-    # 4. تأكيد بدء إنتاج حلقة معينة
+    # 4) تأكيد بدء إنتاج حلقة معينة
     elif data.startswith("confirm_ep_"):
         target_id = data.replace("confirm_ep_", "")
         ep = get_episode(target_id)
         if ep:
+            # ابدأ مرحلة 1+2 كـ Task قابل للإلغاء
+            _register_task(chat_id)
             await run_stage1_and_2(query, context, ep)
 
-    # 5. اختيار محرك الصوت
+    # 5) اختيار محرك الصوت
     elif data == "engine_google":
         session["engine"] = "google"
         buttons = []
         descriptions = {
             "en-US-Journey-D": "أداء حواري ديناميكي معبّر 🔥",
             "en-US-Studio-Q": "صوت استوديو عميق ورخيم 🎙️",
-            "en-US-Neural2-D": "إلقاء إخباري ورسمي واضح 📢"
+            "en-US-Neural2-D": "إلقاء إخباري ورسمي واضح 📢",
         }
         for v in GOOGLE_MALE_VOICES:
             label = descriptions.get(v, v)
             buttons.append([InlineKeyboardButton(f"🗣️ {label}", callback_data=f"voice_{v}")])
         buttons.append([InlineKeyboardButton("🔙 رجوع لمحركات الصوت", callback_data="btn_reselect_engine")])
-
         await query.edit_message_text(
             "🌐 <b>محرك Google Cloud TTS | اختر الصوت الرجالي:</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
             reply_markup=InlineKeyboardMarkup(buttons),
-            parse_mode=ParseMode.HTML
+            parse_mode=ParseMode.HTML,
         )
 
     elif data == "engine_azure":
@@ -195,30 +299,31 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             "en-US-GuyNeural": "تلوين انفعالي كامل وشامل 🌟",
             "en-US-DavisNeural": "سرد ناضج وهادئ وقوي 📖",
             "en-US-TonyNeural": "صوت حماسي وواثق وعالي الطاقة ⚡",
-            "en-US-JasonNeural": "نبرة شبابية وسريعة وخفيفة 🚀"
+            "en-US-JasonNeural": "نبرة شبابية وسريعة وخفيفة 🚀",
         }
         for v in AZURE_MALE_VOICES:
             label = descriptions.get(v, v)
             buttons.append([InlineKeyboardButton(f"🗣️ {label}", callback_data=f"voice_{v}")])
         buttons.append([InlineKeyboardButton("🔙 رجوع لمحركات الصوت", callback_data="btn_reselect_engine")])
-
         await query.edit_message_text(
             "⚡ <b>محرك Microsoft Azure Speech | اختر الصوت الرجالي:</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
             reply_markup=InlineKeyboardMarkup(buttons),
-            parse_mode=ParseMode.HTML
+            parse_mode=ParseMode.HTML,
         )
 
     elif data == "btn_reselect_engine":
         await present_audio_engine_choice(query)
 
-    # 6. اختيار الصوت وبدء إنتاج الملف الصوتي (المرحلة الثالثة)
+    # 6) اختيار الصوت وبدء المرحلة الثالثة
     elif data.startswith("voice_"):
         selected_voice = data.replace("voice_", "")
         session["voice"] = selected_voice
+        _register_task(chat_id)
         await run_stage3(query, context)
 
-    # 7. الضغط على زر بدء الرندرة بعد رفع الصور
+    # 7) بدء الرندرة بعد رفع الصور
     elif data == "btn_start_render":
+        _register_task(chat_id)
         await run_stage4_and_5(query.message, context)
 
 
@@ -242,25 +347,31 @@ async def show_episode_confirmation(query, ep):
 
     keyboard = [
         [InlineKeyboardButton("🚀 تأكيد وبدء الإنتاج الآن", callback_data=f"confirm_ep_{ep_id}")],
-        [InlineKeyboardButton("❌ إلغاء والعودة للقائمة", callback_data="btn_back_main")]
+        [InlineKeyboardButton("❌ إلغاء والعودة للقائمة", callback_data="btn_back_main")],
     ]
-    await query.edit_message_text(card_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML)
+    await query.edit_message_text(
+        card_text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode=ParseMode.HTML,
+    )
 
 
-# -------------------------------------------------------------
-# 3. معالجة الرسائل النصية (إدخال الـ ID يدوياً)
-# -------------------------------------------------------------
+# =================================================================
+# 3. الرسائل النصية (إدخال الـ ID يدوياً)
+# =================================================================
 
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     session = get_session(chat_id)
+
+    if session.get("cancelled"):
+        return
 
     if session.get("state") == "WAITING_EPISODE_ID":
         entered_text = update.message.text.strip()
         ep = get_episode(target_id=entered_text)
         if ep:
             session["state"] = "IDLE"
-            # إرسال بطاقة التأكيد كرسالة جديدة
             ep_id = ep.get("id")
             card_text = (
                 f"<b>🎯 تم العثور على الحلقة بنجاح!</b>\n"
@@ -273,20 +384,24 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
             keyboard = [
                 [InlineKeyboardButton("🚀 تأكيد وبدء الإنتاج الآن", callback_data=f"confirm_ep_{ep_id}")],
-                [InlineKeyboardButton("❌ إلغاء والعودة", callback_data="btn_back_main")]
+                [InlineKeyboardButton("❌ إلغاء والعودة", callback_data="btn_back_main")],
             ]
-            await update.message.reply_text(card_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML)
+            await update.message.reply_text(
+                card_text,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode=ParseMode.HTML,
+            )
         else:
             await update.message.reply_text(
                 f"❌ لم يتم العثور على حلقة برقم ID <code>{entered_text}</code>.\n"
                 f"تأكد من الرقم وحاول مجدداً، أو اضغط /start للعودة للقائمة.",
-                parse_mode=ParseMode.HTML
+                parse_mode=ParseMode.HTML,
             )
 
 
-# -------------------------------------------------------------
-# 4. تنفيذ المراحل 1 و 2 (توليد السكربت وأوامر الصور)
-# -------------------------------------------------------------
+# =================================================================
+# 4. المراحل 1 + 2 (السكربت + أوامر الصور)
+# =================================================================
 
 async def run_stage1_and_2(query, context, episode):
     chat_id = query.message.chat_id
@@ -296,6 +411,9 @@ async def run_stage1_and_2(query, context, episode):
     session["episode_id"] = ep_id
     session["episode_data"] = episode
     session["uploaded_count"] = 0
+
+    if _is_stale(chat_id, session):
+        return
 
     status_card = (
         f"<b>⚙️ جاري معالجة الحلقة #{ep_id}</b>\n"
@@ -307,11 +425,19 @@ async def run_stage1_and_2(query, context, episode):
         f"⚪ <b>[ 5/5 ]</b> التغليف والنشر الرقمي\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     )
-    status_msg = await query.edit_message_text(status_card, parse_mode=ParseMode.HTML)
-
-    # 1. المرحلة الأولى
     try:
-        stage1_res = generate_stage1_script(episode)
+        status_msg = await query.edit_message_text(status_card, parse_mode=ParseMode.HTML)
+    except Exception:
+        return
+
+    # ───── المرحلة 1 ─────
+    try:
+        stage1_res = await asyncio.to_thread(generate_stage1_script, episode)
+
+        if _is_stale(chat_id, session):
+            logger.info(f"⛔ تم إيقاف المرحلة 1 للحلقة {ep_id} بسبب /start")
+            return
+
         s1_file = OUTPUTS_DIR / f"stage1_episode_{ep_id}.json"
         with open(s1_file, "w", encoding="utf-8") as f:
             json.dump(stage1_res, f, ensure_ascii=False, indent=2)
@@ -332,27 +458,50 @@ async def run_stage1_and_2(query, context, episode):
         )
         await status_msg.edit_text(status_card, parse_mode=ParseMode.HTML)
 
+    except asyncio.CancelledError:
+        logger.info(f"🛑 تم إلغاء المرحلة 1 للحلقة {ep_id}")
+        raise
     except Exception as e:
-        await status_msg.edit_text(f"❌ <b>خطأ أثناء توليد السكربت:</b>\n<code>{str(e)}</code>", parse_mode=ParseMode.HTML)
+        if _is_stale(chat_id, session):
+            return
+        await status_msg.edit_text(
+            f"❌ <b>خطأ أثناء توليد السكربت:</b>\n<code>{str(e)}</code>",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
-    # 2. المرحلة الثانية: تجزئة ملفات البرومبتات
+    # ───── المرحلة 2 ─────
     try:
         prompts_dir = OUTPUTS_DIR / f"episode_{ep_id}_prompts"
         prompts_dir.mkdir(parents=True, exist_ok=True)
 
-        batches = generate_stage2_prompts_batches(sentences)
+        batches = await asyncio.to_thread(generate_stage2_prompts_batches, sentences)
+
+        if _is_stale(chat_id, session):
+            logger.info(f"⛔ تم إيقاف المرحلة 2 للحلقة {ep_id} بسبب /start")
+            return
+
         for idx, batch in enumerate(batches, start=1):
+            if _is_stale(chat_id, session):
+                return
+
             p_file = prompts_dir / f"prompts_part_{idx:02d}.txt"
             with open(p_file, "w", encoding="utf-8") as f:
                 f.write("\n\n".join(batch))
 
-            await context.bot.send_document(
-                chat_id=chat_id,
-                document=open(p_file, "rb"),
-                caption=f"📦 <b>حزمة أوامر الصور: الجزء [{idx:02d}]</b>\n└ يحتوي على <b>{len(batch)}</b> برومبت جاهز للنسخ المباشر.",
-                parse_mode=ParseMode.HTML
-            )
+            with open(p_file, "rb") as fp:
+                await context.bot.send_document(
+                    chat_id=chat_id,
+                    document=fp,
+                    caption=(
+                        f"📦 <b>حزمة أوامر الصور: الجزء [{idx:02d}]</b>\n"
+                        f"└ يحتوي على <b>{len(batch)}</b> برومبت جاهز للنسخ المباشر."
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+
+        if _is_stale(chat_id, session):
+            return
 
         status_card = (
             f"<b>✅ اكتملت المرحلتان (1 و 2) بنجاح!</b>\n"
@@ -364,8 +513,17 @@ async def run_stage1_and_2(query, context, episode):
         await context.bot.send_message(chat_id=chat_id, text=status_card, parse_mode=ParseMode.HTML)
         await present_audio_engine_choice(context.bot, chat_id=chat_id)
 
+    except asyncio.CancelledError:
+        logger.info(f"🛑 تم إلغاء المرحلة 2 للحلقة {ep_id}")
+        raise
     except Exception as e:
-        await context.bot.send_message(chat_id=chat_id, text=f"❌ <b>خطأ في المرحلة الثانية:</b>\n<code>{str(e)}</code>", parse_mode=ParseMode.HTML)
+        if _is_stale(chat_id, session):
+            return
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"❌ <b>خطأ في المرحلة الثانية:</b>\n<code>{str(e)}</code>",
+            parse_mode=ParseMode.HTML,
+        )
 
 
 async def present_audio_engine_choice(bot_or_query, chat_id=None):
@@ -377,24 +535,24 @@ async def present_audio_engine_choice(bot_or_query, chat_id=None):
         "• <b>Google Cloud TTS:</b> يدعم وسوم الانفعالات الديناميكية والإيموجي السياقي داخل الجمل."
     )
     keyboard = [
-        [
-            InlineKeyboardButton("⚡ Microsoft Azure Speech (SSML)", callback_data="engine_azure"),
-        ],
-        [
-            InlineKeyboardButton("🌐 Google Cloud TTS (Expressive)", callback_data="engine_google")
-        ]
+        [InlineKeyboardButton("⚡ Microsoft Azure Speech (SSML)", callback_data="engine_azure")],
+        [InlineKeyboardButton("🌐 Google Cloud TTS (Expressive)", callback_data="engine_google")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     if chat_id:
-        await bot_or_query.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
+        await bot_or_query.send_message(
+            chat_id=chat_id, text=text, reply_markup=reply_markup, parse_mode=ParseMode.HTML
+        )
     else:
-        await bot_or_query.edit_message_text(text=text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
+        await bot_or_query.edit_message_text(
+            text=text, reply_markup=reply_markup, parse_mode=ParseMode.HTML
+        )
 
 
-# -------------------------------------------------------------
-# 5. تنفيذ المرحلة 3 (توليد الصوت الموحد)
-# -------------------------------------------------------------
+# =================================================================
+# 5. المرحلة 3 (توليد الصوت)
+# =================================================================
 
 async def run_stage3(query, context):
     chat_id = query.message.chat_id
@@ -404,21 +562,33 @@ async def run_stage3(query, context):
     engine = session.get("engine", "azure")
     voice = session.get("voice", "en-US-GuyNeural")
 
-    wait_msg = await query.edit_message_text(
-        f"⏳ <b>جاري توليد ملف الصوت الموحد عبر {engine.upper()}...</b>\n"
-        f"🗣️ الصوت المختار: <code>{voice}</code>\n"
-        f"<i>يتم الآن فحص وتطبيق القواعد الصوتية والانفعالات الصارمة...</i>",
-        parse_mode=ParseMode.HTML
-    )
+    if _is_stale(chat_id, session):
+        return
 
     try:
-        audio_path = generate_stage3_audio(
+        wait_msg = await query.edit_message_text(
+            f"⏳ <b>جاري توليد ملف الصوت الموحد عبر {engine.upper()}...</b>\n"
+            f"🗣️ الصوت المختار: <code>{voice}</code>\n"
+            f"<i>يتم الآن فحص وتطبيق القواعد الصوتية والانفعالات الصارمة...</i>",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        return
+
+    try:
+        audio_path = await asyncio.to_thread(
+            generate_stage3_audio,
             episode_id=ep_id,
             sentences=sentences,
             engine=engine,
             voice=voice,
-            output_dir=OUTPUTS_DIR
+            output_dir=OUTPUTS_DIR,
         )
+
+        if _is_stale(chat_id, session):
+            logger.info(f"⛔ تم إلغاء المرحلة 3 للحلقة {ep_id} بسبب /start")
+            return
+
         session["audio_path"] = audio_path
 
         ready_card = (
@@ -433,20 +603,36 @@ async def run_stage3(query, context):
             f"3️⃣ سيتعرف السيرفر تلقائياً على ترتيب كل صورة بالـ OCR.\n\n"
             f"👇 <b>عند الانتهاء من رفع كافة الصور ({len(sentences)} صورة)، اضغط الزر أدناه:</b>"
         )
-        keyboard = [[InlineKeyboardButton("🎬 فحص الصور وبدء الرندرة الآلية", callback_data="btn_start_render")]]
-        await wait_msg.edit_text(ready_card, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML)
+        keyboard = [
+            [InlineKeyboardButton("🎬 فحص الصور وبدء الرندرة الآلية", callback_data="btn_start_render")]
+        ]
+        await wait_msg.edit_text(
+            ready_card, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML
+        )
 
+    except asyncio.CancelledError:
+        logger.info(f"🛑 تم إلغاء المرحلة 3 للحلقة {ep_id}")
+        raise
     except Exception as e:
-        await wait_msg.edit_text(f"❌ <b>خطأ أثناء توليد الصوت:</b>\n<code>{str(e)}</code>", parse_mode=ParseMode.HTML)
+        if _is_stale(chat_id, session):
+            return
+        await wait_msg.edit_text(
+            f"❌ <b>خطأ أثناء توليد الصوت:</b>\n<code>{str(e)}</code>",
+            parse_mode=ParseMode.HTML,
+        )
 
 
-# -------------------------------------------------------------
-# 6. استقبال وتجميع الصور مع عداد فوري
-# -------------------------------------------------------------
+# =================================================================
+# 6. استقبال الصور مع عداد فوري
+# =================================================================
 
 async def handle_media_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     session = get_session(chat_id)
+
+    if _is_stale(chat_id, session) or not session.get("episode_id"):
+        return
+
     ep_id = session.get("episode_id", "201")
     total_expected = len(session.get("sentences", []))
 
@@ -469,26 +655,31 @@ async def handle_media_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
         await file_obj.download_to_drive(save_path)
         session["uploaded_count"] += 1
 
-        # إشعار سريع للمستخدم بالتقدم كل 5 صور أو عند الاكتمال
         current = session["uploaded_count"]
         if current % 5 == 0 or (total_expected > 0 and current == total_expected):
             pct = int((current / total_expected * 100)) if total_expected > 0 else 0
-            keyboard = [[InlineKeyboardButton("🎬 فحص الصور وبدء الرندرة الآلية", callback_data="btn_start_render")]]
+            keyboard = [
+                [InlineKeyboardButton("🎬 فحص الصور وبدء الرندرة الآلية", callback_data="btn_start_render")]
+            ]
             await update.message.reply_text(
                 f"📥 <b>تم استلام وحفظ:</b> <code>{current} / {total_expected}</code> صورة ({pct}%)\n"
                 f"إذا انتهيت من رفع الحزمة كاملة، اضغط على الزر أدناه لبدء المونتاج.",
                 reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode=ParseMode.HTML
+                parse_mode=ParseMode.HTML,
             )
 
 
-# -------------------------------------------------------------
-# 7. تنفيذ المرحلتين 4 و 5 (المونتاج الآلي ورسائل النشر الأربعة)
-# -------------------------------------------------------------
+# =================================================================
+# 7. المرحلتان 4 و 5 (المونتاج + الميتاداتا)
+# =================================================================
 
 async def run_stage4_and_5(msg_obj, context):
     chat_id = msg_obj.chat_id
     session = get_session(chat_id)
+
+    if _is_stale(chat_id, session):
+        return
+
     ep_id = session.get("episode_id", "201")
     sentences = session.get("sentences", [])
     total_expected = len(sentences)
@@ -496,21 +687,32 @@ async def run_stage4_and_5(msg_obj, context):
     raw_dir = OUTPUTS_DIR / f"episode_{ep_id}_raw_images"
     clean_dir = OUTPUTS_DIR / f"episode_{ep_id}_clean_frames"
 
-    progress_msg = await context.bot.send_message(
-        chat_id=chat_id,
-        text="🔍 <b>جاري فحص الركن السفلي الأيمن للصور بالـ OCR ومطابقة الترتيب...</b>",
-        parse_mode=ParseMode.HTML
-    )
-
-    # 1. كشف النواقص وتطبيق الرقعة الذكية
     try:
-        frames = process_and_verify_images(
+        progress_msg = await context.bot.send_message(
+            chat_id=chat_id,
+            text="🔍 <b>جاري فحص الركن السفلي الأيمن للصور بالـ OCR ومطابقة الترتيب...</b>",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        return
+
+    # ── 1) فحص الصور ──
+    try:
+        frames = await asyncio.to_thread(
+            process_and_verify_images,
             uploaded_images_dir=raw_dir,
             output_frames_dir=clean_dir,
-            expected_total=total_expected
+            expected_total=total_expected,
         )
+        if _is_stale(chat_id, session):
+            logger.info(f"⛔ تم إلغاء المرحلة 4 (فحص الصور) للحلقة {ep_id}")
+            return
     except MissingAssetsError as m_err:
-        keyboard = [[InlineKeyboardButton("🔄 إعادة الفحص بعد رفع النواقص", callback_data="btn_start_render")]]
+        if _is_stale(chat_id, session):
+            return
+        keyboard = [
+            [InlineKeyboardButton("🔄 إعادة الفحص بعد رفع النواقص", callback_data="btn_start_render")]
+        ]
         await progress_msg.edit_text(
             f"🚨 <b>تنبيه: أصول مفقودة (Missing Images)</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -519,14 +721,21 @@ async def run_stage4_and_5(msg_obj, context):
             f"<code>{m_err.missing_indices}</code>\n\n"
             f"قم بتوليد هذه الأرقام ورفعها هنا، ثم اضغط على زر إعادة الفحص.",
             reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode=ParseMode.HTML
+            parse_mode=ParseMode.HTML,
         )
         return
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
-        await progress_msg.edit_text(f"❌ <b>خطأ أثناء معالجة الصور:</b>\n<code>{str(e)}</code>", parse_mode=ParseMode.HTML)
+        if _is_stale(chat_id, session):
+            return
+        await progress_msg.edit_text(
+            f"❌ <b>خطأ أثناء معالجة الصور:</b>\n<code>{str(e)}</code>",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
-    # 2. المزامنة والرندرة عبر FFmpeg
+    # ── 2) المزامنة + الرندرة ──
     await progress_msg.edit_text(
         f"<b>🎬 بدء المونتاج والرندرة الآلية عبر FFmpeg (1080p 60fps)</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -534,7 +743,7 @@ async def run_stage4_and_5(msg_obj, context):
         f"⏳ جاري المزامنة الدقيقة بالمللي ثانية وتوليد الترجمة الحركية الصفراء (#FDE047)...\n"
         f"⏳ جاري تطبيق دورة حركات Ken Burns والانتقالات الهوائية (-18dB)...\n\n"
         f"<i>قد تستغرق الرندرة من دقيقتين إلى 4 دقائق حسب سرعة المعالج...</i>",
-        parse_mode=ParseMode.HTML
+        parse_mode=ParseMode.HTML,
     )
 
     try:
@@ -542,62 +751,93 @@ async def run_stage4_and_5(msg_obj, context):
         subtitles_ass = OUTPUTS_DIR / f"episode_{ep_id}_subtitles.ass"
         final_video = OUTPUTS_DIR / f"episode_{ep_id}_final_1080p.mp4"
 
-        timeline = align_audio_and_generate_ass(audio_file, sentences, subtitles_ass)
-        render_final_video(frames, timeline, audio_file, subtitles_ass, final_video)
+        timeline = await asyncio.to_thread(
+            align_audio_and_generate_ass, audio_file, sentences, subtitles_ass
+        )
+        if _is_stale(chat_id, session):
+            logger.info(f"⛔ تم إلغاء المزامنة للحلقة {ep_id}")
+            return
+
+        await asyncio.to_thread(
+            render_final_video, frames, timeline, audio_file, subtitles_ass, final_video
+        )
+        if _is_stale(chat_id, session):
+            logger.info(f"⛔ تم إلغاء الرندرة للحلقة {ep_id} قبل النشر")
+            return
 
         file_size_mb = final_video.stat().st_size / (1024 * 1024)
         if file_size_mb < 49:
-            await context.bot.send_video(
-                chat_id=chat_id,
-                video=open(final_video, "rb"),
-                caption=f"🏆 <b>فيديو الحلقة #{ep_id} جاهز للنشر!</b>\nالدقة: 1080p Full HD @ 60fps | الحجم: {file_size_mb:.1f} MB",
-                parse_mode=ParseMode.HTML
-            )
+            with open(final_video, "rb") as fv:
+                await context.bot.send_video(
+                    chat_id=chat_id,
+                    video=fv,
+                    caption=(
+                        f"🏆 <b>فيديو الحلقة #{ep_id} جاهز للنشر!</b>\n"
+                        f"الدقة: 1080p Full HD @ 60fps | الحجم: {file_size_mb:.1f} MB"
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
         else:
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=f"🏆 <b>تم تصدير الفيديو النهائي بنجاح على السيرفر!</b>\n"
-                     f"📊 الحجم: <code>{file_size_mb:.1f} MB</code> (أكبر من حد تيليجرام 50MB)\n"
-                     f"📁 المسار المباشر على السيرفر:\n<code>{final_video}</code>",
-                parse_mode=ParseMode.HTML
+                text=(
+                    f"🏆 <b>تم تصدير الفيديو النهائي بنجاح على السيرفر!</b>\n"
+                    f"📊 الحجم: <code>{file_size_mb:.1f} MB</code> (أكبر من حد تيليجرام 50MB)\n"
+                    f"📁 المسار المباشر على السيرفر:\n<code>{final_video}</code>"
+                ),
+                parse_mode=ParseMode.HTML,
             )
 
+    except asyncio.CancelledError:
+        logger.info(f"🛑 تم إلغاء الرندرة للحلقة {ep_id}")
+        raise
     except Exception as e:
-        await progress_msg.edit_text(f"❌ <b>حدث خطأ أثناء الرندرة:</b>\n<code>{str(e)}</code>", parse_mode=ParseMode.HTML)
+        if _is_stale(chat_id, session):
+            return
+        await progress_msg.edit_text(
+            f"❌ <b>حدث خطأ أثناء الرندرة:</b>\n<code>{str(e)}</code>",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
-    # 3. إرسال حزمة النشر الرقمي (المرحلة الخامسة: 4 رسائل منفصلة)
+    # ── 3) حزمة النشر الرقمي (4 رسائل) ──
     await context.bot.send_message(
         chat_id=chat_id,
         text="📦 <b>جاري إرسال حزمة النشر الرقمي (العناوين، الغلاف، الوصف، والتاجز)...</b>",
-        parse_mode=ParseMode.HTML
+        parse_mode=ParseMode.HTML,
     )
 
     try:
-        meta = generate_stage5_metadata(session["episode_data"], sentences)
+        meta = await asyncio.to_thread(
+            generate_stage5_metadata, session["episode_data"], sentences
+        )
+        if _is_stale(chat_id, session):
+            return
 
-        # الرسالة الأولى: العناوين
         await context.bot.send_message(chat_id=chat_id, text=meta.get("titles_message"))
-        # الرسالة الثانية: أوامر الغلاف
         await context.bot.send_message(chat_id=chat_id, text=meta.get("thumbnails_message"))
-        # الرسالة الثالثة: الوصف
         await context.bot.send_message(chat_id=chat_id, text=meta.get("description_message"))
-        # الرسالة الرابعة: التاجز
         await context.bot.send_message(chat_id=chat_id, text=meta.get("tags_message"))
 
         await context.bot.send_message(
             chat_id=chat_id,
             text="🎉 <b>ألف مبروك! اكتملت دورة إنتاج الحلقة بنسبة 100% وأصبحت جاهزة لليوتيوب فوراً.</b>",
-            parse_mode=ParseMode.HTML
+            parse_mode=ParseMode.HTML,
         )
 
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
-        await context.bot.send_message(chat_id=chat_id, text=f"⚠️ تعذر استخراج ميتاداتا النشر: {str(e)}")
+        if _is_stale(chat_id, session):
+            return
+        await context.bot.send_message(
+            chat_id=chat_id, text=f"⚠️ تعذر استخراج ميتاداتا النشر: {str(e)}"
+        )
 
 
-# -------------------------------------------------------------
-# الدالة الأساسية لتشغيل البوت
-# -------------------------------------------------------------
+# =================================================================
+# 8. نقطة التشغيل
+# =================================================================
 
 def main():
     if not TOKEN:
@@ -605,16 +845,16 @@ def main():
 
     app = ApplicationBuilder().token(TOKEN).build()
 
-    # الأوامر والأزرار
+    # الأوامر والأزرار والرسائل
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CallbackQueryHandler(handle_callback_query))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_media_upload))
 
     print("=" * 60)
-    print("🚀 محرك Vot Studio Pro يعمل الآن بنجاح على سيرفر الويندوز...")
+    print("🚀 محرك Vot Studio Pro يعمل الآن بنجاح — Hard Reset مفعّل")
     print("=" * 60)
-    app.run_polling()
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
