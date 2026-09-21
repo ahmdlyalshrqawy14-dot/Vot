@@ -180,7 +180,7 @@ def rename_images_with_detected_numbers(
                     if detected_index in indexed_images:
                         # رقم متكرر - نحتفظ بالأولى ونضيف الثانية للـ conflicts + unindexed
                         conflicts.append((detected_index, indexed_images[detected_index], img_path))
-                        unindexed_files.append(img_path)  # ← التعديل: الصورة المكررة تدخل الوضع اليدوي
+                        unindexed_files.append(img_path)
                         logger.warning(f"⚠️ رقم متكرر {detected_index}: {img_path.name} → أُرسلت للتعيين اليدوي")
                     else:
                         indexed_images[detected_index] = img_path
@@ -261,7 +261,7 @@ def process_and_verify_images(
             missing_indices=missing_numbers,
             total_expected=expected_total,
             found_count=found_count,
-            unindexed_files=unindexed_files  # 👈 تمرير الصور غير المقروءة للوضع اليدوي في البوت
+            unindexed_files=unindexed_files
         )
 
     if not indexed_images:
@@ -270,18 +270,23 @@ def process_and_verify_images(
     output_frames_dir.mkdir(parents=True, exist_ok=True)
     verified_frames: List[Path] = []
 
-    # [FIX 4] تطبيق الـ Inpainting مرة واحدة فقط مباشرة داخل الكادر المستهدف
-    # frame_xxx.png وإلغاء ملف clean_raw_xxx.png الوسيط تماماً.
     first_available_idx = min(indexed_images.keys())
 
-    # كتابة الكادرات الحقيقية بترتيب ثابت
+    # كتابة الكادرات الحقيقية بترتيب ثابت (بدون رقعة)
     for idx in sorted(indexed_images.keys()):
         raw_p = indexed_images[idx]
         final_frame_path = output_frames_dir / f"frame_{idx:03d}.png"
-        apply_seamless_inpainting(raw_p, final_frame_path)
-        logger.info(f"💾 تم توليد الكادر النهائي: {final_frame_path.name}")
 
-    # تطبيق ملء الفراغات التلقائي (Forward/Backward-Fill) بدون إعادة كتابة
+        # ← إزالة الرقعة تماماً: نسخ الصورة كما هي
+        img = read_image_safe(raw_p)
+        if img is not None:
+            write_image_safe(final_frame_path, img)
+        else:
+            shutil.copyfile(raw_p, final_frame_path)
+
+        logger.info(f"💾 تم توليد الكادر النهائي (بدون رقعة): {final_frame_path.name}")
+
+    # تطبيق ملء الفراغات التلقائي (Forward/Backward-Fill)
     for frame_idx in range(1, expected_total + 1):
         final_frame_path = output_frames_dir / f"frame_{frame_idx:03d}.png"
 
