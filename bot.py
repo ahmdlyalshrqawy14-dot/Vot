@@ -37,7 +37,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("VotStudioBot")
 
-# ── كتم سجلات httpx و getUpdates المزعجة (شاشة نظيفة للإنتاج فقط) ──
 for _noisy_logger in (
     "httpx",
     "httpcore",
@@ -57,8 +56,8 @@ OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 # -----------------------------------------------------------------
 # إدارة الجلسات والمهام
 # -----------------------------------------------------------------
-user_sessions = {}   # {chat_id: session_dict}
-user_tasks = {}      # {chat_id: asyncio.Task} ← لمتابعة العملية الجارية
+user_sessions = {}
+user_tasks = {}
 
 
 def _fresh_session():
@@ -73,7 +72,14 @@ def _fresh_session():
         "engine": None,
         "voice": None,
         "cancelled": False,
-        "token": object(),   # علامة فريدة تميز هذه الجلسة عن أي جلسة قديمة
+        "token": object(),
+        # ── حالة التعيين اليدوي (Manual Assignment) ──
+        "manual_map": {},                 # {int(slot): Path}
+        "manual_queue": [],               # [Path, ...]
+        "manual_missing": [],             # [int, ...]
+        "manual_current": None,           # Path الحالية
+        "manual_unindexed_files": [],     # [Path, ...]
+        "manual_missing_indices": [],     # [int, ...]
     }
 
 
@@ -84,16 +90,11 @@ def get_session(chat_id):
 
 
 def _is_stale(chat_id, session):
-    """
-    ترجع True لو الجلسة دي بقت قديمة (تم استبدالها بـ /start أو تم إلغاؤها).
-    تُستخدم كـ checkpoint بين المراحل لإيقاف أي عملية جارية فوراً.
-    """
     current = user_sessions.get(chat_id)
     return current is not session or session.get("cancelled", False)
 
 
 def _register_task(chat_id):
-    """يسجّل الـ Task الحالي في user_tasks ليتمكن /start من إلغائه."""
     try:
         task = asyncio.current_task()
         if task:
@@ -103,7 +104,6 @@ def _register_task(chat_id):
 
 
 def _cancel_user_task(chat_id):
-    """يلغي أي Task جاري للمستخدم (Soft cancel + إهمال النتيجة)."""
     task = user_tasks.get(chat_id)
     if task and not task.done():
         try:
@@ -115,17 +115,23 @@ def _cancel_user_task(chat_id):
     return False
 
 
+# =================================================================
+# ✅ [FIX #4] تنظيف شامل يشمل مجلد _clean_frames_renamed
+# =================================================================
 def _cleanup_episode_temp_files(ep_id):
-    """يحذف كل المجلدات المؤقتة للحلقة (temp_segments + صور خام + إطارات)."""
+    """يحذف كل المجلدات المؤقتة للحلقة (يشمل renamed لتفادي تسريب السيرفر)."""
     if not ep_id:
         return
     targets = [
         OUTPUTS_DIR / f"episode_{ep_id}_prompts",
         OUTPUTS_DIR / f"episode_{ep_id}_raw_images",
         OUTPUTS_DIR / f"episode_{ep_id}_clean_frames",
+        OUTPUTS_DIR / f"episode_{ep_id}_clean_frames_renamed",   # 👈 إلزامي
         OUTPUTS_DIR / f"episode_{ep_id}_temp_segments",
         OUTPUTS_DIR / f"episode_{ep_id}_temp_segments_audio",
         OUTPUTS_DIR / "temp_segments",
+        # ✅ [FIX-Q4] تنظيف أي مجلدات temp خاصة بالحلقات (نمط _temp_segments_ep)
+        *OUTPUTS_DIR.glob("episode_*_temp_segments_ep*"),
     ]
     for t in targets:
         try:
@@ -160,7 +166,6 @@ def get_episode(target_id=None):
 
 
 def _format_missing_indices(missing, limit=15):
-    """يقصّر عرض الأرقام المفقودة لتجنب تجاوز حد طول رسالة تليجرام."""
     try:
         items = list(missing)
     except TypeError:
@@ -177,26 +182,16 @@ def _format_missing_indices(missing, limit=15):
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-
-    # ── (1) إلغاء أي Task شغّال حالياً ────────────────────────────
     cancelled = _cancel_user_task(chat_id)
 
-    # ── (2) التقاط ep_id القديم قبل المسح لتنظيف ملفاته ──────────
     old_session = user_sessions.get(chat_id)
     old_ep_id = old_session.get("episode_id") if old_session else None
 
-    # ── (3) علامة cancelled على الجلسة القديمة ─────────────────
     if old_session:
         old_session["cancelled"] = True
 
-    # ── (4) Purge كامل + جلسة جديدة نظيفة ───────────────────────
     user_sessions[chat_id] = _fresh_session()
-
-    # ── (5) تنظيف المجلدات المؤقتة ──────────────────────────────
     _cleanup_episode_temp_files(old_ep_id)
-
-    # ── (6) عزل حالة الأزرار القديمة ─────────────────────────────
-    #   (PTB لا يحتاج تدخلاً — الجلسة الجديدة كافية)
 
     logger.info(
         f"♻️ Hard Reset للمستخدم {chat_id} | cancelled_task={cancelled} | cleaned_ep={old_ep_id}"
@@ -244,11 +239,10 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     chat_id = update.effective_chat.id
     session = get_session(chat_id)
 
-    # تجاهل أي ضغط على أزرار قديمة من جلسة ملغاة
     if session.get("cancelled"):
         return
 
-    # 1) بدء الحلقة المجدولة التالية
+    # ── 1) بدء الحلقة المجدولة التالية ──
     if data == "btn_start_next":
         ep = get_episode(target_id=None)
         if not ep:
@@ -256,7 +250,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             return
         await show_episode_confirmation(query, ep)
 
-    # 2) إدخال رقم ID مخصص
+    # ── 2) إدخال رقم ID مخصص ──
     elif data == "btn_choose_id":
         session["state"] = "WAITING_EPISODE_ID"
         await query.edit_message_text(
@@ -265,7 +259,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             parse_mode=ParseMode.HTML,
         )
 
-    # 3) استعراض قائمة الحلقات
+    # ── 3) استعراض قائمة الحلقات ──
     elif data == "btn_list_episodes":
         episodes = load_all_episodes()
         if not episodes:
@@ -288,17 +282,16 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     elif data == "btn_back_main":
         await start_command(query, context)
 
-    # 4) تأكيد بدء إنتاج حلقة معينة
+    # ── 4) تأكيد بدء إنتاج حلقة معينة ──
     elif data.startswith("confirm_ep_"):
         target_id = data.replace("confirm_ep_", "")
         ep = get_episode(target_id)
         if ep:
-            # ابدأ مرحلة 1+2 كـ Task خلفي مستقل قابل للإلغاء الفوري
             user_tasks[chat_id] = asyncio.create_task(
                 run_stage1_and_2(query, context, ep)
             )
 
-    # 5) اختيار محرك الصوت
+    # ── 5) اختيار محرك الصوت ──
     elif data == "engine_google":
         session["engine"] = "google"
         buttons = []
@@ -339,7 +332,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     elif data == "btn_reselect_engine":
         await present_audio_engine_choice(query)
 
-    # 6) اختيار الصوت وبدء المرحلة الثالثة
+    # ── 6) اختيار الصوت وبدء المرحلة الثالثة ──
     elif data.startswith("voice_"):
         selected_voice = data.replace("voice_", "")
         session["voice"] = selected_voice
@@ -347,17 +340,85 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             run_stage3(query, context)
         )
 
-    # 7) بدء الرندرة بعد رفع الصور (وضع صارم: يطلب كل الصور)
+    # ── 7) بدء الرندرة بعد رفع الصور ──
     elif data == "btn_start_render":
         user_tasks[chat_id] = asyncio.create_task(
             run_stage4_and_5(query.message, context, allow_partial=False)
         )
 
-    # 8) الرندرة القسرية بالصور المتوفرة (Partial / Force Render)
+    # ── 8) الرندرة القسرية بالصور المتوفرة ──
     elif data == "btn_force_render":
         user_tasks[chat_id] = asyncio.create_task(
             run_stage4_and_5(query.message, context, allow_partial=True)
         )
+
+    # ══════════════════════════════════════════════════════════════
+    # ✅ [FIX #2]  زر إلغاء الوضع اليدوي — عبر edit_message_caption
+    # ══════════════════════════════════════════════════════════════
+    elif data == "manual_cancel":
+        session["state"] = "IDLE"
+        session["manual_map"] = {}
+        session["manual_queue"] = []
+        session["manual_missing"] = []
+        session["manual_current"] = None
+        try:
+            await query.edit_message_caption(
+                caption=(
+                    "❌ <b>تم إلغاء الوضع اليدوي.</b>\n"
+                    "يمكنك رفع الصور الناقصة أو المتابعة بالصور المتوفرة."
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="❌ <b>تم إلغاء الوضع اليدوي.</b>",
+                parse_mode=ParseMode.HTML,
+            )
+        return
+
+    # ── زر بدء الوضع اليدوي ──
+    elif data == "btn_manual_assign":
+        unindexed = session.get("manual_unindexed_files", []) or []
+        missing_idx = session.get("manual_missing_indices", []) or []
+        if not unindexed:
+            await query.answer("لا توجد صور بحاجة لتعيين يدوي.", show_alert=True)
+            return
+
+        session["manual_map"] = {}
+        session["manual_queue"] = list(unindexed)
+        session["manual_missing"] = list(missing_idx)
+        session["manual_current"] = None
+        session["state"] = "MANUAL_ASSIGN"
+
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+        await show_next_manual_image(context, chat_id)
+
+    # ── زر تعيين الصورة إلى Slot معيّن ──
+    elif data.startswith("manual_assign_"):
+        slot = data.replace("manual_assign_", "")
+        await handle_manual_assign(query, context, slot)
+
+    # ── زر تخطي الصورة الحالية ──
+    elif data == "manual_skip":
+        session["manual_current"] = None
+        try:
+            await query.answer("⏭️ تم تخطي هذه الصورة")
+        except Exception:
+            pass
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await show_next_manual_image(context, chat_id)
 
 
 async def show_episode_confirmation(query, ep):
@@ -390,7 +451,7 @@ async def show_episode_confirmation(query, ep):
 
 
 # =================================================================
-# 3. الرسائل النصية (إدخال الـ ID يدوياً)
+# 3. الرسائل النصية
 # =================================================================
 
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -433,7 +494,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 # =================================================================
-# 4. المراحل 1 + 2 (السكربت + أوامر الصور)
+# 4. المراحل 1 + 2
 # =================================================================
 
 async def run_stage1_and_2(query, context, episode):
@@ -463,7 +524,6 @@ async def run_stage1_and_2(query, context, episode):
     except Exception:
         return
 
-    # ───── المرحلة 1 ─────
     try:
         stage1_res = await asyncio.to_thread(generate_stage1_script, episode)
 
@@ -503,7 +563,6 @@ async def run_stage1_and_2(query, context, episode):
         )
         return
 
-    # ───── المرحلة 2 ─────
     try:
         prompts_dir = OUTPUTS_DIR / f"episode_{ep_id}_prompts"
         prompts_dir.mkdir(parents=True, exist_ok=True)
@@ -584,7 +643,7 @@ async def present_audio_engine_choice(bot_or_query, chat_id=None):
 
 
 # =================================================================
-# 5. المرحلة 3 (توليد الصوت)
+# 5. المرحلة 3
 # =================================================================
 
 async def run_stage3(query, context):
@@ -656,7 +715,7 @@ async def run_stage3(query, context):
 
 
 # =================================================================
-# 6. استقبال الصور مع عداد فوري
+# 6. استقبال الصور
 # =================================================================
 
 async def handle_media_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -703,7 +762,120 @@ async def handle_media_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 # =================================================================
-# 7. المرحلتان 4 و 5 (المونتاج + الميتاداتا) — تدعم Partial/Force Render
+# ✅ [FIX #3 + #6]  دالة المعالجة اليدوية + حماية Anti-Spam + توحيد نوع المفتاح
+# =================================================================
+async def handle_manual_assign(query, context, slot):
+    chat_id = query.message.chat_id
+    session = get_session(chat_id)
+    current = session.get("manual_current")
+    if not current:
+        return
+
+    # ══════════════════════════════════════════════════════════════
+    # ✅ [FIX #6]  تخزين المفتاح كـ int لتوافقه مع stage4_vision.py
+    # ══════════════════════════════════════════════════════════════
+    try:
+        slot_int = int(slot)
+    except (ValueError, TypeError):
+        logger.warning(f"⚠️ slot غير صالح: {slot}")
+        return
+
+    session["manual_map"][slot_int] = current
+    session["manual_current"] = None
+
+    try:
+        await query.answer(f"✅ تم تعيين الصورة للرقم {slot_int}")
+    except Exception:
+        pass
+
+    # 👈 سحب لوحة الأزرار فوراً لمنع التكرار (Anti-Spam Guard)
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    logger.info(f"✅ تعيين يدوي: {Path(current).name} → slot {slot_int}")
+    await show_next_manual_image(context, chat_id)
+
+
+async def show_next_manual_image(context, chat_id):
+    session = get_session(chat_id)
+    if _is_stale(chat_id, session):
+        return
+
+    queue = session.get("manual_queue", []) or []
+
+    if not queue:
+        session["manual_current"] = None
+        session["state"] = "IDLE"
+        keyboard = [
+            [InlineKeyboardButton(
+                "🎬 بدء الرندرة بعد التعيين اليدوي",
+                callback_data="btn_start_render"
+            )],
+        ]
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "✅ <b>اكتمل التعيين اليدوي بنجاح!</b>\n"
+                f"عدد الصور المعيَّنة: <code>{len(session.get('manual_map', {}))}</code>\n"
+                "اضغط الزر أدناه لبدء الرندرة."
+            ),
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    current_path = queue.pop(0)
+    session["manual_queue"] = queue
+    session["manual_current"] = current_path
+
+    # ══════════════════════════════════════════════════════════════
+    # ✅ [FIX #7]  التصفية بمفاتيح int متوافقة مع manual_map الجديد
+    # ══════════════════════════════════════════════════════════════
+    assigned_keys = set(session.get("manual_map", {}).keys())
+    remaining_slots = sorted([
+        s for s in session.get("manual_missing", [])
+        if int(s) not in assigned_keys
+    ])
+
+    buttons = []
+    row = []
+    for s in remaining_slots:
+        row.append(InlineKeyboardButton(
+            f"#{s}", callback_data=f"manual_assign_{s}"
+        ))
+        if len(row) == 5:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+
+    buttons.append([
+        InlineKeyboardButton("⏭️ تخطي هذه الصورة", callback_data="manual_skip"),
+        InlineKeyboardButton("❌ إلغاء الوضع اليدوي", callback_data="manual_cancel"),
+    ])
+
+    try:
+        with open(current_path, "rb") as img:
+            await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=img,
+                caption=(
+                    f"🖼️ <b>تعيين يدوي — متبقٍ {len(queue)}</b>\n"
+                    f"الملف: <code>{Path(current_path).name}</code>\n\n"
+                    f"👇 اختر رقم الكادر (Slot) الذي تنتمي إليه هذه الصورة:"
+                ),
+                reply_markup=InlineKeyboardMarkup(buttons),
+                parse_mode=ParseMode.HTML,
+            )
+    except Exception as e:
+        logger.error(f"فشل إرسال الصورة للتعيين اليدوي: {e}")
+        await show_next_manual_image(context, chat_id)
+
+
+# =================================================================
+# 7. المرحلتان 4 و 5 — مع دعم Partial/Force Render + Manual Assignment
 # =================================================================
 
 async def run_stage4_and_5(msg_obj, context, allow_partial: bool = False):
@@ -735,12 +907,15 @@ async def run_stage4_and_5(msg_obj, context, allow_partial: bool = False):
 
     # ── 1) فحص الصور ──
     try:
+        # ✅ [FIX #1]  اسم المعامل موحّد: manual_assignments
+        # ✅ [FIX #6]  المفاتيح الآن int → متوافقة مع stage4_vision
         frames = await asyncio.to_thread(
             process_and_verify_images,
             uploaded_images_dir=raw_dir,
             output_frames_dir=clean_dir,
             expected_total=total_expected,
             allow_partial=allow_partial,
+            manual_assignments=session.get("manual_map", {}),
         )
         if _is_stale(chat_id, session):
             logger.info(f"⛔ تم إلغاء المرحلة 4 (فحص الصور) للحلقة {ep_id}")
@@ -751,29 +926,47 @@ async def run_stage4_and_5(msg_obj, context, allow_partial: bool = False):
 
         missing_preview = _format_missing_indices(m_err.missing_indices)
 
-        keyboard = [
-            [
+        # defensive: بعض الإصدارات قد لا تُرجع unindexed_files
+        unindexed_files = list(getattr(m_err, "unindexed_files", []) or [])
+        session["manual_unindexed_files"] = unindexed_files
+        session["manual_missing_indices"] = list(m_err.missing_indices)
+
+        keyboard = []
+        if unindexed_files:
+            keyboard.append([
                 InlineKeyboardButton(
-                    f"⏩ متابعة ورندرة بالصور المتوفرة ({m_err.found_count} صورة)",
-                    callback_data="btn_force_render",
+                    f"🧩 تعيين يدوي لـ {len(unindexed_files)} صورة غير مُفهرسة",
+                    callback_data="btn_manual_assign",
                 )
-            ],
-            [
-                InlineKeyboardButton(
-                    "🔄 إعادة الفحص بعد رفع النواقص",
-                    callback_data="btn_start_render",
-                )
-            ],
-        ]
+            ])
+        keyboard.append([
+            InlineKeyboardButton(
+                f"⏩ متابعة ورندرة بالصور المتوفرة ({m_err.found_count} صورة)",
+                callback_data="btn_force_render",
+            )
+        ])
+        keyboard.append([
+            InlineKeyboardButton(
+                "🔄 إعادة الفحص بعد رفع النواقص",
+                callback_data="btn_start_render",
+            )
+        ])
+
+        extra_note = (
+            f"\n🧩 <b>صور غير مُفهرسة (فشل قراءة الـ OCR):</b> <code>{len(unindexed_files)}</code>"
+            if unindexed_files else ""
+        )
+
         await progress_msg.edit_text(
             f"🚨 <b>تنبيه: أصول مفقودة (Missing Images)</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"تم التحقق بنجاح من <b>{m_err.found_count}</b> صورة من أصل <b>{m_err.total_expected}</b>.\n\n"
+            f"تم التحقق بنجاح من <b>{m_err.found_count}</b> صورة من أصل <b>{m_err.total_expected}</b>.{extra_note}\n\n"
             f"⚠️ <b>الصور المفقودة المطلوب رفعها:</b>\n"
             f"<code>{missing_preview}</code>\n\n"
-            f"👇 <b>خياران متاحان:</b>\n"
-            f"• <b>متابعة ورندرة</b> الفيديو بالصور المتوفرة فقط (سيتم توليد فيديو أقصر يتخطى الجمل المفقودة).\n"
-            f"• <b>إعادة الفحص</b> بعد رفع الصور الناقصة للحصول على الفيديو الكامل.",
+            f"👇 <b>الخيارات المتاحة:</b>\n"
+            f"• <b>تعيين يدوي</b>: اربط الصور التي فشل قراءة رقمها بكادراتها يدوياً.\n"
+            f"• <b>متابعة ورندرة</b>: فيديو أقصر بالصور المتوفرة فقط.\n"
+            f"• <b>إعادة الفحص</b>: بعد رفع النواقص للحصول على الفيديو الكامل.",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode=ParseMode.HTML,
         )
@@ -860,7 +1053,7 @@ async def run_stage4_and_5(msg_obj, context, allow_partial: bool = False):
         )
         return
 
-    # ── 3) حزمة النشر الرقمي (4 رسائل) ──
+    # ── 3) حزمة النشر الرقمي ──
     await context.bot.send_message(
         chat_id=chat_id,
         text="📦 <b>جاري إرسال حزمة النشر الرقمي (العناوين، الغلاف، الوصف، والتاجز)...</b>",
@@ -906,18 +1099,17 @@ def main():
     app = (
         ApplicationBuilder()
         .token(TOKEN)
-        .concurrent_updates(True)   # ← معالجة /start فوراً دون انتظار الطابور
+        .concurrent_updates(True)
         .build()
     )
 
-    # الأوامر والأزرار والرسائل
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CallbackQueryHandler(handle_callback_query))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_media_upload))
 
     print("=" * 60)
-    print("🚀 محرك Vot Studio Pro يعمل الآن بنجاح — Hard Reset + Force Render مفعّلان")
+    print("🚀 محرك Vot Studio Pro يعمل الآن — Hard Reset + Force Render + Manual Assignment")
     print("=" * 60)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
