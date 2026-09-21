@@ -83,12 +83,13 @@ def render_final_video(
     بناء خط المونتاج الآلي وتصدير الفيديو النهائي عبر FFmpeg:
     - 1080p Full HD / 60fps
     - مؤثرات Ken Burns و Vignette
-    - انتقالات صوتية Soft Whoosh
+    - انتقالات صوتية Soft Whoosh عند كل قطع
     - خلو تام بنسبة 100% من الموسيقى الخلفية
     """
     temp_dir = output_video_path.parent / "temp_segments"
     temp_dir.mkdir(parents=True, exist_ok=True)
 
+    # إنشاء ملف الـ whoosh الأساسي
     sfx_whoosh = output_video_path.parent / "whoosh_soft.wav"
     create_synthetic_whoosh(sfx_whoosh)
 
@@ -139,20 +140,71 @@ def render_final_video(
     subprocess.run(cmd_concat, check=True)
 
     # 4. إضافة مؤثرات الـ Whooshes عند كل نقطة انتقال وحرق الترجمة الصفراء الباهتة
-    logger.info("✨ حرق الترجمة الحركية الصفراء الباهتة وتصدير الفيديو النهائي...")
+    logger.info("✨ حرق الترجمة الحركية الصفراء الباهتة وتطبيق مؤثرات الانتقال الصوتية...")
 
     # تجهيز مسار ملف الترجمة المتوافق مع ويندوز
     ass_escaped = subtitles_ass.resolve().as_posix().replace(":", "\\:")
     subtitle_filter = f"ass='{ass_escaped}'"
 
-    cmd_final = [
-        "ffmpeg", "-y", "-v", "info",
-        "-i", str(unsubbed_video),
-        "-vf", subtitle_filter,
-        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-        "-c:a", "copy",
-        str(output_video_path)
-    ]
+    # بناء فلتر دمج الـ whooshes مع الصوت الأصلي
+    # نضيف الـ whoosh عند بداية كل مقطع (ما عدا الأول)
+    total_segments = len(segment_files)
+    
+    # حساب أوقات الانتقالات من الـ timeline
+    transition_times = []
+    current_time = 0.0
+    for item in timeline[:-1]:  # ما عندن آخر مقطع
+        current_time += item["duration"]
+        transition_times.append(current_time)
+    
+    # بناء فلتر معقد لدمج الـ whooshes
+    # نستخدم adelay لتأخير كل whoosh لوقته المناسب
+    audio_inputs = []
+    filter_parts = []
+    
+    for idx, trans_time in enumerate(transition_times):
+        delay_ms = int(trans_time * 1000)
+        # كل whoosh يتأخر لوقت الانتقال
+        filter_parts.append(
+            f"[{idx+2}:a]adelay={delay_ms}|{delay_ms},volume=0.4[whoosh_{idx}]"
+        )
+    
+    # دمج كل الـ whooshes مع الصوت الأصلي
+    if filter_parts:
+        # [0:a] هو الصوت الأصلي من unsubbed_video
+        mix_inputs = "[0:a]"
+        for idx in range(len(transition_times)):
+            mix_inputs += f"[whoosh_{idx}]"
+        
+        filter_parts.append(
+            f"{mix_inputs}amix=inputs={len(transition_times)+1}:duration=first:dropout_transition=0[aout]"
+        )
+        
+        filter_complex = ";".join(filter_parts)
+        
+        cmd_final = [
+            "ffmpeg", "-y", "-v", "info",
+            "-i", str(unsubbed_video),
+            "-i", str(sfx_whoosh),  # whoosh أساسي (سيتم تكراره بالتأخير)
+            "-vf", subtitle_filter,
+            "-filter_complex", filter_complex,
+            "-map", "0:v",  # الفيديو من الملف الأول
+            "-map", "[aout]",  # الصوت المدمج
+            "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+            "-c:a", "aac", "-b:a", "192k",
+            str(output_video_path)
+        ]
+    else:
+        # لو مفيش انتقالات (مقطع واحد بس)
+        cmd_final = [
+            "ffmpeg", "-y", "-v", "info",
+            "-i", str(unsubbed_video),
+            "-vf", subtitle_filter,
+            "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+            "-c:a", "copy",
+            str(output_video_path)
+        ]
+
     subprocess.run(cmd_final, check=True)
 
     logger.info(f"🏆 تم تصدير الفيديو النهائي بنجاح بأعلى دقة: {output_video_path}")
