@@ -8,6 +8,26 @@ from gemini_engine import call_gemini_with_fallback
 logger = logging.getLogger("Stage2Generator")
 
 
+# =========================================================
+# STRICT VALIDATION CONSTANTS
+# =========================================================
+MANDATORY_PREFIX = "Create a 2D cel-shaded illustration showing"
+
+REQUIRED_CHARACTER_DNA_TOKENS = [
+    "orange",
+    "muscular",
+    "smooth head",
+    "large white oval eyes",
+    "no mouth",
+    "black shorts",
+]
+
+REQUIRED_BACKGROUND_PHRASE = "plain grey background"
+REQUIRED_CORNER_PHRASE = "bottom-right corner"
+REQUIRED_SUBTLE_TOKENS = ("faint", "subtle")
+REQUIRED_ANTI_TEXT_TOKENS = ("no written text", "no text")
+
+
 STAGE_2_SYSTEM_PROMPT = """You are an expert AI Art Director and Visual Storyboard Artist. Your task is to generate explicit IMAGE GENERATION COMMANDS for an educational YouTube video based on a sequential list of script sentences.
 
 =========================================
@@ -36,6 +56,13 @@ Literal (FORBIDDEN): Character just holding their knee.
 REQUIRED symbolic approach:
 A bridge that grows more stable as the character walks across it step by step, symbolizing progressive loading strengthening the knee.
 
+FORBIDDEN literal example:
+Narration: "Distraction makes it hard to move forward."
+Literal (FORBIDDEN): a brain, a confused person holding their head, or a question mark.
+
+REQUIRED conceptual approach:
+The orange character standing between a nearby easy door leading to a dead end and a distant difficult door leading toward the real goal, with hesitant body language showing the conflict of choice.
+
 =========================================
 CHARACTER DNA (NEVER CHANGE)
 =========================================
@@ -53,46 +80,78 @@ NEVER invent a new character. NEVER change clothing, head shape, or eyes. Keep t
 =========================================
 ABSOLUTE VISUAL CONSTRAINTS (PRESERVE ALL)
 =========================================
-- Plain grey background (dominant). If symbolic environment or objects are needed, add them while keeping the grey backdrop dominant.
-- Very small, subtle, faint image index number in the bottom-right corner.
+- Plain grey background (dominant). If symbolic environment or objects are needed, add them ON/OVER the grey backdrop without replacing it.
+- Very small, subtle, faint image index number placed INSIDE the image in the bottom-right corner.
 - Numbering follows the sentence order, sequential, no gaps.
 - Clean, cel-shaded style.
 - Consistent proportions.
 - No mouth.
 - Black shorts.
-- No text inside the image except the required small index number.
+- No written text inside the image except the required faint index number.
 
 =========================================
-EVERY PROMPT MUST BE AN EXPLICIT IMAGE GENERATION COMMAND
+EVERY PROMPT MUST BE AN EXPLICIT, SELF-CONTAINED IMAGE GENERATION COMMAND
 =========================================
-Each prompt MUST start EXACTLY with:
+Each prompt MUST start EXACTLY with the literal text:
 "Create a 2D cel-shaded illustration showing ..."
 
-It must read as a direct instruction to an image generation model, not a descriptive paragraph.
-No prompt is allowed to begin with any other wording.
+Every prompt will be COPIED INDEPENDENTLY into Google Flow. Therefore, each prompt MUST be COMPLETE ON ITS OWN and MUST literally spell out every required element below — even if some are repeated in these instructions.
 
+=========================================
+MANDATORY LITERAL CONTENT INSIDE EVERY PROMPT
+=========================================
+Every single prompt MUST include, verbatim:
+
+1. Start with EXACTLY:
+   Create a 2D cel-shaded illustration showing
+
+2. The full character DNA spelled out literally:
+   consistent orange muscular character, smooth head, two large white oval eyes, no mouth, black shorts, consistent proportions, clean 2D cel-shaded illustration style
+
+3. The literal background phrase:
+   plain grey background as the dominant background
+   (symbolic environment/objects must be described as placed ON/OVER it, not replacing it)
+
+4. A clear in-image number instruction, using the correct sequential index for that prompt, in this exact style:
+   include the very small, subtle, faint number "N" inside the image, placed in the bottom-right corner
+   where N is replaced by the correct image index for that prompt.
+
+5. The anti-text clause (verbatim or clearly equivalent):
+   no written text, labels, captions, symbols containing letters, or extra numbers inside the image; only the required faint image index is allowed
+
+6. The prompt MUST NOT end with a bare standalone number.
+   FORBIDDEN ending: "..., plain grey background, 1"
+   REQUIRED ending: "... plain grey background as the dominant background. Include the very small, subtle, faint number "1" inside the image, placed in the bottom-right corner. No written text, labels, captions, symbols containing letters, or extra numbers inside the image; only the required faint image index is allowed."
+
+7. When a visual symbol like an X is needed, describe it NON-TEXTUALLY, e.g.:
+   a red cross-shaped visual symbol with no written text
+   NEVER write red "X" text.
+
+=========================================
 EACH PROMPT MUST CONTAIN
-1. An explicit image creation command beginning EXACTLY with "Create a 2D cel-shaded illustration showing ...".
-2. Fixed character DNA (orange, muscular, smooth head, large white oval eyes, no mouth, black shorts, consistent proportions, 2D cel-shaded).
+=========================================
+1. The explicit command beginning EXACTLY with "Create a 2D cel-shaded illustration showing ...".
+2. Full character DNA (listed above) written literally.
 3. The NON-LITERAL visual idea (conceptual / symbolic / story-driven).
 4. Character action / dynamic pose.
-5. Environment or symbolic visual element.
+5. Environment or symbolic visual element, placed ON/OVER the grey background.
 6. Emotional state.
 7. Camera angle.
 8. Composition.
 9. Lighting / colors if relevant.
 10. Continuity with previous and upcoming scenes.
-11. Plain grey dominant background.
-12. Very small subtle faint image index in the bottom-right corner.
-13. No text inside the image except the required index.
+11. Literal phrase "plain grey background as the dominant background".
+12. Anti-text clause.
+13. Instruction to place the correct faint index number inside the image in the bottom-right corner.
 
 =========================================
 STRICT GENERATION RULES
 =========================================
 - ONE COMMAND PER SENTENCE: exactly one image prompt per sentence, in chronological order.
-- INDEXING: replace [INDEX] with the sequential image number provided in the instructions.
+- INDEXING: use the correct sequential image number for each prompt, and place it inside the in-image number instruction — never as a bare trailing number.
 - POSE CUSTOMIZATION: give a clear action, posture, or physical gesture matching the emotional and physical context of that sentence. NEVER alter character physical traits or the plain grey background.
 - NO forbidden content: no literal restatement of the sentence, no extra numbers beyond the image index, no headers, no markdown, no quotes around the prompt, no explanation outside the prompts, no combining sentences, no skipping, no adding extra prompts.
+- EVERY PROMPT MUST BE SELF-CONTAINED: it must include all required literal phrases above even if that means repetition across prompts.
 
 =========================================
 OUTPUT FORMAT
@@ -132,6 +191,13 @@ Literal (FORBIDDEN): Character just holding their knee.
 Required approach:
 A symbolic scene showing progressive loading strengthening the knee — e.g., a bridge that grows more stable as the character walks across it step by step.
 
+Forbidden example:
+Narration: "Distraction makes it hard to move forward."
+Literal (FORBIDDEN): a brain, a confused person holding their head, or a question mark.
+
+Required approach:
+The orange character standing between a nearby easy door leading to a dead end and a distant difficult door leading toward the real goal, with hesitant body language showing the conflict of choice.
+
 =========================================
 CHARACTER DNA (NEVER CHANGE)
 =========================================
@@ -149,39 +215,70 @@ NEVER invent a new character. NEVER change clothing, head shape, or eyes. The ch
 =========================================
 FIXED VISUAL CONSTRAINTS (PRESERVE ALL)
 =========================================
-- Plain grey background (dominant). If symbolic environment/objects are needed, add them while keeping the grey backdrop dominant.
-- Very small, subtle, faint number "[INDEX]" in the bottom-right corner.
+- Plain grey background (dominant). If symbolic environment/objects are needed, add them ON/OVER the grey backdrop without replacing it.
+- Very small, subtle, faint image index number placed INSIDE the image in the bottom-right corner.
 - Numbering follows the sentence order.
 - Clean, cel-shaded style.
 - Consistent proportions.
 - No mouth.
 - Black shorts.
 - ONE prompt per sentence.
-- No text inside the image except the required index.
+- No written text inside the image except the required faint index number.
 
 =========================================
-EVERY PROMPT MUST BE AN EXPLICIT IMAGE GENERATION COMMAND
+EVERY PROMPT MUST BE AN EXPLICIT, SELF-CONTAINED IMAGE GENERATION COMMAND
 =========================================
-Each prompt MUST start EXACTLY with:
+Each prompt MUST start EXACTLY with the literal text:
 "Create a 2D cel-shaded illustration showing ..."
 
-The wording must read as a direct instruction to an image generation model, not a passive description.
-No prompt is allowed to begin with any other wording.
+Every prompt will be COPIED INDEPENDENTLY into Google Flow. Therefore, each prompt MUST be COMPLETE ON ITS OWN and MUST literally spell out every required element below — even if some are repeated in these instructions.
 
+=========================================
+MANDATORY LITERAL CONTENT INSIDE EVERY PROMPT
+=========================================
+Every single prompt MUST include, verbatim:
+
+1. Start with EXACTLY:
+   Create a 2D cel-shaded illustration showing
+
+2. The full character DNA spelled out literally:
+   consistent orange muscular character, smooth head, two large white oval eyes, no mouth, black shorts, consistent proportions, clean 2D cel-shaded illustration style
+
+3. The literal background phrase:
+   plain grey background as the dominant background
+   (symbolic environment/objects must be described as placed ON/OVER it, not replacing it)
+
+4. A clear in-image number instruction, using the correct sequential index for that prompt, in this exact style:
+   include the very small, subtle, faint number "N" inside the image, placed in the bottom-right corner
+   where N is replaced by the correct image index for that prompt.
+
+5. The anti-text clause (verbatim or clearly equivalent):
+   no written text, labels, captions, symbols containing letters, or extra numbers inside the image; only the required faint image index is allowed
+
+6. The prompt MUST NOT end with a bare standalone number.
+   FORBIDDEN ending: "..., plain grey background, 1"
+   REQUIRED ending: "... plain grey background as the dominant background. Include the very small, subtle, faint number "1" inside the image, placed in the bottom-right corner. No written text, labels, captions, symbols containing letters, or extra numbers inside the image; only the required faint image index is allowed."
+
+7. When a visual symbol like an X is needed, describe it NON-TEXTUALLY, e.g.:
+   a red cross-shaped visual symbol with no written text
+   NEVER write red "X" text.
+
+=========================================
 EACH PROMPT MUST INCLUDE
-1. An explicit image creation command starting EXACTLY with "Create a 2D cel-shaded illustration showing ...".
-2. Character constants (orange, muscular, smooth head, large white oval eyes, no mouth, black shorts, consistent proportions, 2D cel-shaded).
+=========================================
+1. The explicit command starting EXACTLY with "Create a 2D cel-shaded illustration showing ...".
+2. Full character DNA (listed above) written literally.
 3. The non-literal visual idea (conceptual / symbolic / story-driven).
 4. Character action / dynamic pose.
-5. Environment or symbolic visual element.
+5. Environment or symbolic visual element, placed ON/OVER the grey background.
 6. Emotional state.
 7. Camera angle.
 8. Composition.
 9. Lighting / colors if relevant.
 10. Continuity with previous and upcoming scenes.
-11. Correct sequential index in the bottom-right.
-12. Plain grey dominant background.
-13. No text inside the image except the index number.
+11. Literal phrase "plain grey background as the dominant background".
+12. Anti-text clause.
+13. Instruction to place the correct faint index number inside the image in the bottom-right corner.
 
 =========================================
 FORBIDDEN IN OUTPUT
@@ -197,6 +294,8 @@ FORBIDDEN IN OUTPUT
 - Adding an extra prompt.
 - Literal restatement of the narration.
 - Any prompt that does NOT begin with "Create a 2D cel-shaded illustration showing ...".
+- Any prompt that does NOT spell out the full character DNA, the plain grey background phrase, the anti-text clause, and the in-image number instruction.
+- Any prompt that ends with a bare standalone number instead of an in-image number instruction.
 
 =========================================
 SCENE HANDLING
@@ -391,6 +490,118 @@ def _format_creative_brief(creative_brief: Optional[Any]) -> str:
     return str(creative_brief)
 
 
+# =========================================================
+# STRICT PER-PROMPT VALIDATION
+# =========================================================
+def _validate_single_prompt(
+    prompt: str,
+    expected_index: int,
+    position_in_batch: int,
+    batch_num: int,
+) -> None:
+    """
+    يتحقق من أن الـPrompt:
+    - يبدأ بالبادئة الإلزامية حرفيًا.
+    - يحتوي على كل عناصر Character DNA صراحةً.
+    - يحتوي على عبارة الخلفية الرمادية.
+    - يحتوي على إشارة الركن السفلي الأيمن.
+    - يحتوي على faint أو subtle.
+    - يحتوي على رقم الصورة الصحيح داخل تعليمات الرقم.
+    - لا ينتهي برقم مجرد منفصل.
+    - يحتوي على شرط منع النصوص الأخرى.
+    يرفع ValueError واضحًا عند أول فشل، ويرفض الدفعة كاملة.
+    """
+    issues: List[str] = []
+    lower = prompt.lower()
+
+    # 1) البادئة الإلزامية حرفيًا
+    if not prompt.startswith(MANDATORY_PREFIX):
+        issues.append(
+            f"does not start with the mandatory literal prefix '{MANDATORY_PREFIX}'"
+        )
+
+    # 2) عناصر Character DNA
+    for token in REQUIRED_CHARACTER_DNA_TOKENS:
+        if token.lower() not in lower:
+            issues.append(f"missing required character DNA token '{token}'")
+
+    # 3) عبارة الخلفية الرمادية
+    if REQUIRED_BACKGROUND_PHRASE.lower() not in lower:
+        issues.append(
+            f"missing required background phrase '{REQUIRED_BACKGROUND_PHRASE}'"
+        )
+
+    # 4) عبارة الركن السفلي الأيمن
+    if REQUIRED_CORNER_PHRASE.lower() not in lower:
+        issues.append(
+            f"missing required corner phrase '{REQUIRED_CORNER_PHRASE}'"
+        )
+
+    # 5) faint أو subtle لوصف الرقم
+    if not any(tok in lower for tok in REQUIRED_SUBTLE_TOKENS):
+        issues.append(
+            "missing 'faint' or 'subtle' descriptor for the in-image index number"
+        )
+
+    # 6) رقم الصورة الصحيح داخل تعليمات الرقم
+    if f'"{expected_index}"' not in prompt:
+        issues.append(
+            f"does not contain the correct image index '\"{expected_index}\"' "
+            "inside the in-image number instruction"
+        )
+
+    # 7) ممنوع الانتهاء برقم مجرد منفصل
+    if re.search(r"[\s,;]\d+\s*[.!]?\s*$", prompt):
+        issues.append(
+            "ends with a bare standalone number instead of an in-image number instruction"
+        )
+
+    # 8) شرط منع النصوص الأخرى
+    if not any(tok in lower for tok in REQUIRED_ANTI_TEXT_TOKENS):
+        issues.append(
+            "missing explicit anti-text clause "
+            "('no written text, labels, captions, symbols containing letters, or extra numbers inside the image; "
+            "only the required faint image index is allowed')"
+        )
+
+    if issues:
+        raise ValueError(
+            f"Batch [{batch_num}] prompt #{position_in_batch} "
+            f"(expected image index {expected_index}) failed strict validation: "
+            + "; ".join(issues)
+            + "\n--- INVALID PROMPT ---\n"
+            + prompt
+            + "\n----------------------"
+        )
+
+
+def _validate_batch_prompts(
+    batch_num: int,
+    start_idx: int,
+    prompts: List[str],
+) -> None:
+    """
+    تحقق كامل لكل prompt داخل دفعة واحدة مع تمرير رقم الصورة الصحيح لكل موضع.
+    """
+    for offset, prompt in enumerate(prompts):
+        expected_index = start_idx + offset
+        position_in_batch = offset + 1
+        _validate_single_prompt(
+            prompt=prompt,
+            expected_index=expected_index,
+            position_in_batch=position_in_batch,
+            batch_num=batch_num,
+        )
+
+
+def _validate_batch(batch_idx: int, expected_count: int, prompts: List[str]) -> None:
+    if len(prompts) != expected_count:
+        raise ValueError(
+            f"Batch [{batch_idx}] returned {len(prompts)} prompts, "
+            f"expected exactly {expected_count}. Refusing partial/inflated batch."
+        )
+
+
 def _process_single_batch(batch_tuple: tuple) -> tuple:
     """
     معالجة دفعة واحدة في مسار مستقل (Thread) لتأخذ مفتاحاً مستقلاً.
@@ -423,12 +634,23 @@ Every single command MUST start EXACTLY with the literal text:
 "Create a 2D cel-shaded illustration showing ..."
 No command is allowed to begin with any other wording. This prefix is non-negotiable.
 
+MANDATORY LITERAL CONTENT INSIDE EVERY COMMAND:
+Each command MUST literally contain ALL of the following (do NOT omit any, even if it means repeating across commands):
+- The full character DNA: consistent orange muscular character, smooth head, two large white oval eyes, no mouth, black shorts, consistent proportions, clean 2D cel-shaded illustration style.
+- The literal background phrase: plain grey background as the dominant background (symbolic elements must be placed ON/OVER it, not replacing it).
+- A clear in-image number instruction using the CORRECT sequential image index for that command, in this style:
+  include the very small, subtle, faint number "N" inside the image, placed in the bottom-right corner
+  (replace N with the correct index: {start_idx} for the first command, {start_idx + 1} for the second, ..., {end_idx} for the last).
+- The anti-text clause: no written text, labels, captions, symbols containing letters, or extra numbers inside the image; only the required faint image index is allowed.
+- The command MUST NOT end with a bare standalone number. Never append the index as a standalone trailing digit.
+
 Each sentence has its own scene context below. Every command MUST:
 - Begin EXACTLY with "Create a 2D cel-shaded illustration showing ..." (literal, mandatory).
 - Reflect the non-literal, conceptual visual storytelling for THAT sentence (never a literal restatement of the sentence).
 - Build on the scene's visual_concept, emotion, character_action, environment, camera, composition, continuity, and transitions.
-- Preserve the character DNA and all fixed visual constraints (orange skin, muscular body, smooth head, two large white oval eyes, no mouth, black shorts, consistent proportions, 2D cel-shaded, plain grey dominant background).
-- Place a very small, subtle, faint image index in the bottom-right corner (no other text in the image).
+- Spell out character DNA and background phrase literally inside the text.
+- Include a correct in-image number instruction with the correct index for that position.
+- Include the anti-text clause literally.
 - Evolve across the scene's sentences (establishing → continuation → escalation → reveal → transformation), not repeat identical images.
 
 CREATIVE BRIEF (global narrative anchor):
@@ -439,7 +661,7 @@ Use the CREATIVE BRIEF to keep every command aligned with the video's core_idea,
 VISUAL BIBLE (global style anchor for the whole video):
 {_format_visual_bible(visual_bible)}
 
-SENTENCES AND THEIR SCENE CONTEXTS:
+SENTENCES AND THEIR SCENE CONTEXTS (the [N] is the correct image index to place inside the in-image number instruction for that command):
 """
         for s_idx, sent in enumerate(batch_sentences, start=start_idx):
             scene = scene_map.get(s_idx)
@@ -448,8 +670,10 @@ SENTENCES AND THEIR SCENE CONTEXTS:
         user_prompt += (
             "\nReturn the image generation commands separated ONLY by a single blank line, in order, "
             "with no headers, no labels, no markdown, no quotes, and no extra commentary. "
-            "Remember: every command MUST begin with the literal prefix "
-            "\"Create a 2D cel-shaded illustration showing ...\"."
+            "Every command MUST begin with the literal prefix "
+            "\"Create a 2D cel-shaded illustration showing ...\", MUST spell out the full character DNA, "
+            "the plain grey background phrase, the anti-text clause, and MUST place the correct "
+            "in-image index number inside the bottom-right corner (never as a bare trailing number)."
         )
     else:
         system_instruction = STAGE_2_SYSTEM_PROMPT
@@ -461,17 +685,29 @@ Every single command MUST start EXACTLY with the literal text:
 "Create a 2D cel-shaded illustration showing ..."
 No command is allowed to begin with any other wording. This prefix is non-negotiable.
 
+MANDATORY LITERAL CONTENT INSIDE EVERY COMMAND:
+Each command MUST literally contain ALL of the following (do NOT omit any, even if it means repeating across commands):
+- The full character DNA: consistent orange muscular character, smooth head, two large white oval eyes, no mouth, black shorts, consistent proportions, clean 2D cel-shaded illustration style.
+- The literal background phrase: plain grey background as the dominant background (symbolic elements must be placed ON/OVER it, not replacing it).
+- A clear in-image number instruction using the CORRECT sequential image index for that command, in this style:
+  include the very small, subtle, faint number "N" inside the image, placed in the bottom-right corner
+  (replace N with the correct index: {start_idx} for the first command, {start_idx + 1} for the second, ..., {end_idx} for the last).
+- The anti-text clause: no written text, labels, captions, symbols containing letters, or extra numbers inside the image; only the required faint image index is allowed.
+- The command MUST NOT end with a bare standalone number. Never append the index as a standalone trailing digit.
+
 Reminder:
 - Every command MUST begin EXACTLY with "Create a 2D cel-shaded illustration showing ..." (literal, mandatory).
 - NEVER restate the sentence literally. Translate it into a conceptual, symbolic, or story-driven visual.
-- Always preserve character DNA (orange skin, muscular body, smooth head, two large white oval eyes, no mouth, black shorts, consistent proportions, 2D cel-shaded).
-- Always keep a plain grey dominant background.
-- Always include a very small, subtle, faint image index in the bottom-right corner; no other text in the image.
+- Always spell out character DNA literally inside the prompt text.
+- Always include "plain grey background as the dominant background" literally.
+- Always include a correct in-image number instruction: include the very small, subtle, faint number "N" inside the image, placed in the bottom-right corner.
+- Always include the anti-text clause literally.
+- Never end with a bare standalone number.
 
-Sentences:
+Sentences (the [N] is the correct image index to place inside the in-image number instruction for that command):
 """
         for s_idx, sent in enumerate(batch_sentences, start=start_idx):
-            user_prompt += f"{s_idx}. {sent}\n"
+            user_prompt += f"[{s_idx}] {sent}\n"
 
     raw_output = call_gemini_with_fallback(
         system_instruction=system_instruction,
@@ -480,15 +716,14 @@ Sentences:
     )
 
     prompts = clean_and_parse_prompts(raw_output)
+
+    # تحقق صارم: عدد الـPrompts مطابق لعدد جمل الدفعة
+    _validate_batch(batch_idx, len(batch_sentences), prompts)
+
+    # تحقق صارم لكل Prompt على حدة
+    _validate_batch_prompts(batch_idx, start_idx, prompts)
+
     return batch_idx, prompts
-
-
-def _validate_batch(batch_idx: int, expected_count: int, prompts: List[str]) -> None:
-    if len(prompts) != expected_count:
-        raise ValueError(
-            f"Batch [{batch_idx}] returned {len(prompts)} prompts, "
-            f"expected exactly {expected_count}. Refusing partial/inflated batch."
-        )
 
 
 def generate_stage2_prompts_batches(
@@ -501,7 +736,7 @@ def generate_stage2_prompts_batches(
 
     إذا تم تمرير stage1_result (يحتوي scene_plan / visual_bible / creative_brief)
     يتم استخدام سياق المرحلة الأولى لتوليد Prompts مفاهيمية غير حرفية
-    تبدأ حرفياً بأمر إنشاء صورة صريح.
+    تبدأ حرفياً بأمر إنشاء صورة صريح وتحتوي كل العناصر الإلزامية داخل النص.
 
     إذا لم يُمرَّر stage1_result أو كان ناقصاً، يتم الرجوع للسلوك القديم (fallback)
     دون أي فشل، مع الحفاظ على نفس القواعد البصرية والصياغة كأمر إنشاء صورة.
@@ -564,7 +799,7 @@ def generate_stage2_prompts_batches(
         for future in as_completed(future_to_batch):
             batch_num, prompts = future.result()
 
-            # التحقق الصارم: عدد الـPrompts في الدفعة = عدد الجمل في الدفعة
+            # تحقق نهائي على عدد الـPrompts في الدفعة (تكرار أمان)
             expected = len(batch_tasks[batch_num - 1][1])
             _validate_batch(batch_num, expected, prompts)
 
