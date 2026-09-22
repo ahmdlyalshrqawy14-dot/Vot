@@ -68,6 +68,18 @@ SENTENCE CADENCE:
 - Prefer clear, direct sentences. Avoid extremely long compound sentences, semicolons, or em-dashes.
 - Allow natural connecting words (And, But, So, That's why, Here's the thing) so the script is not choppy.
 
+SENTENCE COUNT RULES (CRITICAL):
+- The "full_script_sentences" array MUST contain between 60 and 80 sentences, inclusive.
+- The PREFERRED range is 60 to 70 sentences.
+- Do NOT exceed 80 sentences under any circumstance.
+- Do NOT go below 60 sentences under any circumstance.
+- Each sentence must be short, natural, and easy to speak in one breath.
+- Each sentence must be independently visualizable as its own shot.
+- Do NOT use overly long sentences just to reduce the count.
+- Do NOT add filler just to reach the count.
+- Preserve narrative flow. The script must NOT feel choppy or mechanical even though there are many sentences.
+- Each sentence must end with a period, question mark, or exclamation point.
+
 STRUCTURE & WORD BUDGET (800 - 900 words total):
 Distribute words according to the narrative architecture you chose — not a rigid template. Ensure the total stays in 800 - 900 words.
 
@@ -181,12 +193,23 @@ SCENE PLAN RULES:
 - scene_id MUST start at 1 and increase sequentially (1, 2, 3, ...) matching the order in the list.
 - scene_plan MUST cover the entire script from sentence index 0 to len(full_script_sentences)-1 with no gaps and no out-of-range indices.
 - sentence_start and sentence_end are 0-based indices into full_script_sentences.
+- The number of scenes is NOT fixed and MUST adapt to the actual number of sentences (60 - 80).
 - Each scene must add a visual idea, not just repeat the sentence.
 - Character identity must remain consistent across scenes.
 - Every scene must include character_action and visual_concept.
 - Visual progression must exist from start to end of the episode.
 - Do not make every scene the same pose against an empty background.
 """
+
+
+# ---------------------------------------------------------------------------
+# Sentence count bounds (new)
+# ---------------------------------------------------------------------------
+
+MIN_SENTENCES = 60
+MAX_SENTENCES = 80
+PREFERRED_MIN_SENTENCES = 60
+PREFERRED_MAX_SENTENCES = 70
 
 
 # ---------------------------------------------------------------------------
@@ -214,7 +237,7 @@ def _parse_json_safe(raw_text: str) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Internal validation helpers (new)
+# Internal validation helpers
 # ---------------------------------------------------------------------------
 
 def _require_non_empty_string(container: Dict[str, Any], key: str, context: str) -> str:
@@ -265,7 +288,7 @@ def _require_int(container: Dict[str, Any], key: str, context: str) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Field-level validators (new)
+# Field-level validators
 # ---------------------------------------------------------------------------
 
 _CREATIVE_BRIEF_STRING_FIELDS = [
@@ -373,7 +396,7 @@ def _validate_quality_report(data: Dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Scene plan validation (rewritten for sequential/overlap enforcement)
+# Scene plan validation
 # ---------------------------------------------------------------------------
 
 def _validate_scene_plan(data: Dict[str, Any], total_sentences: int) -> None:
@@ -382,18 +405,16 @@ def _validate_scene_plan(data: Dict[str, Any], total_sentences: int) -> None:
         raise ValueError("'scene_plan' يجب أن يكون قائمة غير فارغة.")
 
     covered = [False] * total_sentences
-    previous_end = -1  # ensures first scene starts at 0 and subsequent ones are contiguous
+    previous_end = -1
 
     for idx, scene in enumerate(scene_plan):
         if not isinstance(scene, dict):
             raise ValueError(f"عنصر scene_plan رقم {idx} ليس كائنًا صحيحًا.")
 
-        # ---- required numeric fields ----
         scene_id = _require_int(scene, "scene_id", f"scene_plan[{idx}]")
         s_start = _require_int(scene, "sentence_start", f"scene_plan[{idx}]")
         s_end = _require_int(scene, "sentence_end", f"scene_plan[{idx}]")
 
-        # ---- scene_id sequencing enforcement ----
         expected_scene_id = idx + 1
         if scene_id != expected_scene_id:
             raise ValueError(
@@ -405,11 +426,9 @@ def _validate_scene_plan(data: Dict[str, Any], total_sentences: int) -> None:
                 f"scene_plan[{idx}]: scene_id يجب أن يكون رقمًا صحيحًا موجبًا (وجدنا {scene_id})."
             )
 
-        # ---- required non-empty string fields (covers visual_concept & character_action) ----
         for field in _SCENE_REQUIRED_STRING_FIELDS:
             _require_non_empty_string(scene, field, f"scene_plan[{idx}]")
 
-        # ---- range checks ----
         if s_start < 0 or s_end < 0:
             raise ValueError(f"scene_plan[{idx}]: لا يمكن أن تكون الفهارس سالبة.")
         if s_start > s_end:
@@ -420,7 +439,6 @@ def _validate_scene_plan(data: Dict[str, Any], total_sentences: int) -> None:
                 f"(الحد الأقصى {total_sentences - 1})."
             )
 
-        # ---- sequencing / gap / overlap enforcement ----
         if idx == 0:
             if s_start != 0:
                 raise ValueError(
@@ -439,7 +457,6 @@ def _validate_scene_plan(data: Dict[str, Any], total_sentences: int) -> None:
                     f"يجب أن يبدأ عند {expected_start} لكنه بدأ عند {s_start}."
                 )
 
-        # ---- mark coverage & detect duplicate coverage explicitly ----
         for i in range(s_start, s_end + 1):
             if covered[i]:
                 raise ValueError(
@@ -449,13 +466,11 @@ def _validate_scene_plan(data: Dict[str, Any], total_sentences: int) -> None:
 
         previous_end = s_end
 
-    # ---- last scene must reach the end ----
     if previous_end != total_sentences - 1:
         raise ValueError(
             f"آخر مشهد يجب أن ينتهي عند {total_sentences - 1} لكنه انتهى عند {previous_end}."
         )
 
-    # ---- coverage (defensive, in case of an unforeseen edge case) ----
     if not all(covered):
         missing = [i for i, c in enumerate(covered) if not c]
         raise ValueError(
@@ -472,13 +487,12 @@ def validate_script_output(data: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError("مخرجات النموذج يجب أن تكون كائن JSON.")
 
-    # ---- top-level required keys (existing) ----
+    # ---- top-level required keys ----
     required_keys = ["id", "topic", "hook", "sections", "full_script_sentences"]
     for k in required_keys:
         if k not in data:
             raise ValueError(f"الحقل المطلوب '{k}' مفقود من مخرجات JSON!")
 
-    # ---- top-level new keys (existing) ----
     required_new_keys = [
         "creative_brief",
         "retention_plan",
@@ -490,7 +504,7 @@ def validate_script_output(data: Dict[str, Any]) -> Dict[str, Any]:
         if k not in data:
             raise ValueError(f"الحقل المطلوب '{k}' مفقود من مخرجات JSON!")
 
-    # ---- full_script_sentences (existing) ----
+    # ---- full_script_sentences ----
     sentences = data.get("full_script_sentences", [])
     if not isinstance(sentences, list) or not sentences:
         raise ValueError("مصفوفة 'full_script_sentences' فارغة!")
@@ -514,18 +528,45 @@ def validate_script_output(data: Dict[str, Any]) -> Dict[str, Any]:
     data["full_script_sentences"] = cleaned_sentences
     data["total_word_count"] = total_words
 
+    # ---- NEW: sentence count validation ----
+    sentence_count = len(cleaned_sentences)
+
+    if sentence_count < MIN_SENTENCES:
+        raise ValueError(
+            f"عدد الجمل في 'full_script_sentences' غير كافٍ. "
+            f"العدد الفعلي: {sentence_count}، الحد الأدنى المطلوب: {MIN_SENTENCES}."
+        )
+
+    if sentence_count > MAX_SENTENCES:
+        raise ValueError(
+            f"عدد الجمل في 'full_script_sentences' تجاوز الحد الأقصى. "
+            f"العدد الفعلي: {sentence_count}، الحد الأقصى المسموح: {MAX_SENTENCES}."
+        )
+
+    if PREFERRED_MIN_SENTENCES <= sentence_count <= PREFERRED_MAX_SENTENCES:
+        logger.info(
+            f"🎯 عدد الجمل: {sentence_count} (ضمن النطاق المفضل "
+            f"{PREFERRED_MIN_SENTENCES}-{PREFERRED_MAX_SENTENCES})."
+        )
+    else:
+        logger.warning(
+            f"ℹ️ عدد الجمل: {sentence_count} (مقبول لكنه أعلى من النطاق المفضل "
+            f"{PREFERRED_MIN_SENTENCES}-{PREFERRED_MAX_SENTENCES})."
+        )
+
+    # ---- word count log ----
     if 800 <= total_words <= 900:
         logger.info(f"🎯 حجم السكربت مثالي: {total_words} كلمة.")
     else:
         logger.warning(f"ℹ️ حجم السكربت: {total_words} كلمة (المستهدف: 800 - 900 كلمة).")
 
-    # ---- NEW: validate creative_brief / retention_plan / visual_bible / quality_report ----
+    # ---- validate sub-objects ----
     _validate_creative_brief(data)
     _validate_retention_plan(data)
     _validate_visual_bible(data)
     _validate_quality_report(data)
 
-    # ---- NEW: scene_plan validation (full fields + sequencing) ----
+    # ---- scene_plan validation ----
     total_sentences = len(cleaned_sentences)
     _validate_scene_plan(data, total_sentences)
 
