@@ -8,21 +8,99 @@ from gemini_engine import call_gemini_with_fallback
 logger = logging.getLogger("Stage2Generator")
 
 
-STAGE_2_SYSTEM_PROMPT = """You are an expert AI Art Director and Visual Storyboard Artist. Your task is to generate image prompts for an educational YouTube video based on a sequential list of script sentences.
+STAGE_2_SYSTEM_PROMPT = """You are an expert AI Art Director and Visual Storyboard Artist. Your task is to generate explicit IMAGE GENERATION COMMANDS for an educational YouTube video based on a sequential list of script sentences.
 
-BASE PROMPT TEMPLATE (FIXED)
-Create a 2D muscular character illustration in the exact style of the provided example. The figure should be orange, with a smooth head, large white oval eyes, no mouth, and a defined muscular body wearing black shorts. Maintain the same proportions and facial features as in the reference. [DYNAMIC_POSE]. Background must be plain grey. In the bottom-right corner, include a very small, subtle, faint number "[INDEX]". Clean, cel-shaded, and expressive style. Keep the style consistent across all generated images.
+=========================================
+CORE PRINCIPLE: NARRATION ≠ LITERAL IMAGE
+=========================================
+You MUST NOT translate a sentence into a literal illustration of its words.
+Instead, internally extract:
+- The core idea
+- The mechanism or reason
+- The conflict or tension
+- The emotional state
+- The result or transformation
+Then translate THAT into a conceptual, symbolic, or story-driven visual scene.
 
-STRICT GENERATION RULES:
-- ONE PROMPT PER SENTENCE: Generate exactly one prompt for every sentence received in chronological order.
-- INDEXING: Replace [INDEX] with the sequential image number provided in the instructions (e.g., "1", "2", "20").
-- POSE CUSTOMIZATION:
-  * Replace [DYNAMIC_POSE] with a clear action, posture, or physical gesture matching the emotional and physical context of that sentence.
-  * NEVER alter character physical traits (orange skin, oval white eyes, no mouth, black shorts) or the plain grey background.
-- OUTPUT FORMAT: Return the prompts separated ONLY by a single blank line. No quotation marks, no markdown code wrappers, no sentence text, and no headers."""
+FORBIDDEN literal example:
+Narration: "Your brain prefers immediate rewards."
+Literal (FORBIDDEN): A brain with a reward icon next to it.
+
+REQUIRED conceptual approach:
+The orange character stands between two doors: a nearby easy door leading to a dead end, and a distant difficult door leading toward the real goal, body language showing the conflict of choice.
+
+FORBIDDEN literal example:
+Narration: "Weak knees are not caused by movement itself."
+Literal (FORBIDDEN): Character just holding their knee.
+
+REQUIRED symbolic approach:
+A bridge that grows more stable as the character walks across it step by step, symbolizing progressive loading strengthening the knee.
+
+=========================================
+CHARACTER DNA (NEVER CHANGE)
+=========================================
+- Orange skin
+- Muscular defined body
+- Smooth head
+- Two large white oval eyes
+- NO mouth
+- Black shorts
+- Consistent proportions
+- 2D cel-shaded illustration style
+
+NEVER invent a new character. NEVER change clothing, head shape, or eyes. Keep the same visual identity across every single image.
+
+=========================================
+ABSOLUTE VISUAL CONSTRAINTS (PRESERVE ALL)
+=========================================
+- Plain grey background (dominant). If symbolic environment or objects are needed, add them while keeping the grey backdrop dominant.
+- Very small, subtle, faint image index number in the bottom-right corner.
+- Numbering follows the sentence order, sequential, no gaps.
+- Clean, cel-shaded style.
+- Consistent proportions.
+- No mouth.
+- Black shorts.
+- No text inside the image except the required small index number.
+
+=========================================
+EVERY PROMPT MUST BE AN EXPLICIT IMAGE GENERATION COMMAND
+=========================================
+Each prompt MUST start EXACTLY with:
+"Create a 2D cel-shaded illustration showing ..."
+
+It must read as a direct instruction to an image generation model, not a descriptive paragraph.
+No prompt is allowed to begin with any other wording.
+
+EACH PROMPT MUST CONTAIN
+1. An explicit image creation command beginning EXACTLY with "Create a 2D cel-shaded illustration showing ...".
+2. Fixed character DNA (orange, muscular, smooth head, large white oval eyes, no mouth, black shorts, consistent proportions, 2D cel-shaded).
+3. The NON-LITERAL visual idea (conceptual / symbolic / story-driven).
+4. Character action / dynamic pose.
+5. Environment or symbolic visual element.
+6. Emotional state.
+7. Camera angle.
+8. Composition.
+9. Lighting / colors if relevant.
+10. Continuity with previous and upcoming scenes.
+11. Plain grey dominant background.
+12. Very small subtle faint image index in the bottom-right corner.
+13. No text inside the image except the required index.
+
+=========================================
+STRICT GENERATION RULES
+=========================================
+- ONE COMMAND PER SENTENCE: exactly one image prompt per sentence, in chronological order.
+- INDEXING: replace [INDEX] with the sequential image number provided in the instructions.
+- POSE CUSTOMIZATION: give a clear action, posture, or physical gesture matching the emotional and physical context of that sentence. NEVER alter character physical traits or the plain grey background.
+- NO forbidden content: no literal restatement of the sentence, no extra numbers beyond the image index, no headers, no markdown, no quotes around the prompt, no explanation outside the prompts, no combining sentences, no skipping, no adding extra prompts.
+
+=========================================
+OUTPUT FORMAT
+=========================================
+Return the prompts separated ONLY by a single blank line. No quotation marks, no markdown code wrappers, no sentence text, no headers, no labels."""
 
 
-STAGE_2_ENRICHED_SYSTEM_PROMPT = """You are an expert AI Art Director, Visual Storyteller, and Storyboard Artist. Your task is to generate image prompts for an educational YouTube video based on a sequential list of script sentences, each mapped to a scene from an existing scene plan and visual bible.
+STAGE_2_ENRICHED_SYSTEM_PROMPT = """You are an expert AI Art Director, Visual Storyteller, and Storyboard Artist. Your task is to generate explicit IMAGE GENERATION COMMANDS for an educational YouTube video based on a sequential list of script sentences, each mapped to a scene from an existing scene plan and visual bible.
 
 =========================================
 ABSOLUTE RULE: NARRATION ≠ LITERAL IMAGE
@@ -79,22 +157,31 @@ FIXED VISUAL CONSTRAINTS (PRESERVE ALL)
 - No mouth.
 - Black shorts.
 - ONE prompt per sentence.
+- No text inside the image except the required index.
 
 =========================================
-EACH PROMPT MUST INCLUDE
+EVERY PROMPT MUST BE AN EXPLICIT IMAGE GENERATION COMMAND
 =========================================
-1. Character constants.
-2. The non-literal visual idea (conceptual / symbolic / story-driven).
-3. Character action / dynamic pose.
-4. Environment or symbolic visual element.
-5. Emotional state.
-6. Camera angle.
-7. Composition.
-8. Lighting / colors if relevant.
-9. Continuity with previous and upcoming scenes.
-10. Correct sequential index in the bottom-right.
-11. Plain grey background.
-12. No text inside the image except the index number.
+Each prompt MUST start EXACTLY with:
+"Create a 2D cel-shaded illustration showing ..."
+
+The wording must read as a direct instruction to an image generation model, not a passive description.
+No prompt is allowed to begin with any other wording.
+
+EACH PROMPT MUST INCLUDE
+1. An explicit image creation command starting EXACTLY with "Create a 2D cel-shaded illustration showing ...".
+2. Character constants (orange, muscular, smooth head, large white oval eyes, no mouth, black shorts, consistent proportions, 2D cel-shaded).
+3. The non-literal visual idea (conceptual / symbolic / story-driven).
+4. Character action / dynamic pose.
+5. Environment or symbolic visual element.
+6. Emotional state.
+7. Camera angle.
+8. Composition.
+9. Lighting / colors if relevant.
+10. Continuity with previous and upcoming scenes.
+11. Correct sequential index in the bottom-right.
+12. Plain grey dominant background.
+13. No text inside the image except the index number.
 
 =========================================
 FORBIDDEN IN OUTPUT
@@ -108,6 +195,8 @@ FORBIDDEN IN OUTPUT
 - Combining two sentences into one prompt.
 - Skipping a sentence.
 - Adding an extra prompt.
+- Literal restatement of the narration.
+- Any prompt that does NOT begin with "Create a 2D cel-shaded illustration showing ...".
 
 =========================================
 SCENE HANDLING
@@ -206,7 +295,7 @@ def _map_sentences_to_scenes(
 
 def _format_scene_context(scene: Optional[Dict[str, Any]]) -> str:
     if not scene:
-        return "No scene context available. Use pure narrative-driven visual storytelling."
+        return "No scene context available. Use pure narrative-driven conceptual visual storytelling."
 
     fields = [
         ("Scene ID", scene.get("scene_id")),
@@ -251,12 +340,63 @@ def _format_visual_bible(visual_bible: Optional[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def _format_creative_brief(creative_brief: Optional[Any]) -> str:
+    """
+    تنسيق آمن للـcreative_brief القادم من المرحلة الأولى.
+    يقبل dict / list / str / أي نوع آخر دون أن يفشل.
+    """
+    if not creative_brief:
+        return "No creative brief provided. Anchor on the scene-level context and character DNA."
+
+    if isinstance(creative_brief, dict):
+        priority_keys = [
+            "core_idea",
+            "unique_angle",
+            "central_conflict",
+            "unexpected_insight",
+            "episode_concept",
+            "tone",
+            "emotional_arc",
+        ]
+        lines: List[str] = []
+        used_keys = set()
+
+        for key in priority_keys:
+            if key in creative_brief and creative_brief.get(key):
+                value = creative_brief[key]
+                if isinstance(value, (list, tuple)):
+                    value = "; ".join(str(v) for v in value if v)
+                elif isinstance(value, dict):
+                    value = "; ".join(f"{k}={v}" for k, v in value.items() if v)
+                lines.append(f"- {key}: {value}")
+                used_keys.add(key)
+
+        for key, value in creative_brief.items():
+            if key in used_keys or value is None or value == "":
+                continue
+            if isinstance(value, (list, tuple)):
+                value = "; ".join(str(v) for v in value if v)
+            elif isinstance(value, dict):
+                value = "; ".join(f"{k}={v}" for k, v in value.items() if v)
+            lines.append(f"- {key}: {value}")
+
+        if not lines:
+            return "No creative brief details available."
+        return "\n".join(lines)
+
+    if isinstance(creative_brief, (list, tuple)):
+        joined = "; ".join(str(v) for v in creative_brief if v)
+        return joined or "No creative brief details available."
+
+    return str(creative_brief)
+
+
 def _process_single_batch(batch_tuple: tuple) -> tuple:
     """
     معالجة دفعة واحدة في مسار مستقل (Thread) لتأخذ مفتاحاً مستقلاً.
     batch_tuple يحتوي:
       (batch_idx, batch_sentences, start_idx, end_idx,
-       scene_map, visual_bible, has_stage1_context)
+       scene_map, visual_bible, creative_brief, has_stage1_context)
     """
     (
         batch_idx,
@@ -265,6 +405,7 @@ def _process_single_batch(batch_tuple: tuple) -> tuple:
         end_idx,
         scene_map,
         visual_bible,
+        creative_brief,
         has_stage1_context,
     ) = batch_tuple
 
@@ -274,14 +415,26 @@ def _process_single_batch(batch_tuple: tuple) -> tuple:
 
     if has_stage1_context:
         system_instruction = STAGE_2_ENRICHED_SYSTEM_PROMPT
-        user_prompt = f"""Generate exactly {len(batch_sentences)} prompts.
+        user_prompt = f"""Generate exactly {len(batch_sentences)} explicit image generation commands.
 The index for this batch MUST start sequentially at {start_idx} and end at {end_idx}.
 
-Each sentence has its own scene context below. Every prompt MUST:
-- Reflect the non-literal, conceptual visual storytelling for THAT sentence.
+MANDATORY PREFIX FOR EVERY COMMAND:
+Every single command MUST start EXACTLY with the literal text:
+"Create a 2D cel-shaded illustration showing ..."
+No command is allowed to begin with any other wording. This prefix is non-negotiable.
+
+Each sentence has its own scene context below. Every command MUST:
+- Begin EXACTLY with "Create a 2D cel-shaded illustration showing ..." (literal, mandatory).
+- Reflect the non-literal, conceptual visual storytelling for THAT sentence (never a literal restatement of the sentence).
 - Build on the scene's visual_concept, emotion, character_action, environment, camera, composition, continuity, and transitions.
-- Preserve the character DNA and all fixed visual constraints.
-- Evolve across the scene's sentences (establishing → continuation → escalation → reveal), not repeat identical images.
+- Preserve the character DNA and all fixed visual constraints (orange skin, muscular body, smooth head, two large white oval eyes, no mouth, black shorts, consistent proportions, 2D cel-shaded, plain grey dominant background).
+- Place a very small, subtle, faint image index in the bottom-right corner (no other text in the image).
+- Evolve across the scene's sentences (establishing → continuation → escalation → reveal → transformation), not repeat identical images.
+
+CREATIVE BRIEF (global narrative anchor):
+{_format_creative_brief(creative_brief)}
+
+Use the CREATIVE BRIEF to keep every command aligned with the video's core_idea, unique_angle, central_conflict, unexpected_insight, episode_concept, tone, and emotional_arc.
 
 VISUAL BIBLE (global style anchor for the whole video):
 {_format_visual_bible(visual_bible)}
@@ -293,13 +446,27 @@ SENTENCES AND THEIR SCENE CONTEXTS:
             user_prompt += f"\n[{s_idx}] Sentence: {sent}\nScene context:\n{_format_scene_context(scene)}\n"
 
         user_prompt += (
-            "\nReturn the prompts separated ONLY by a single blank line, in order, "
-            "with no headers, no labels, no markdown, and no quotes."
+            "\nReturn the image generation commands separated ONLY by a single blank line, in order, "
+            "with no headers, no labels, no markdown, no quotes, and no extra commentary. "
+            "Remember: every command MUST begin with the literal prefix "
+            "\"Create a 2D cel-shaded illustration showing ...\"."
         )
     else:
         system_instruction = STAGE_2_SYSTEM_PROMPT
-        user_prompt = f"""Process the following sentences and generate exactly {len(batch_sentences)} prompts.
+        user_prompt = f"""Process the following sentences and generate exactly {len(batch_sentences)} explicit image generation commands.
 The index for this batch MUST start sequentially at {start_idx} and end at {end_idx}.
+
+MANDATORY PREFIX FOR EVERY COMMAND:
+Every single command MUST start EXACTLY with the literal text:
+"Create a 2D cel-shaded illustration showing ..."
+No command is allowed to begin with any other wording. This prefix is non-negotiable.
+
+Reminder:
+- Every command MUST begin EXACTLY with "Create a 2D cel-shaded illustration showing ..." (literal, mandatory).
+- NEVER restate the sentence literally. Translate it into a conceptual, symbolic, or story-driven visual.
+- Always preserve character DNA (orange skin, muscular body, smooth head, two large white oval eyes, no mouth, black shorts, consistent proportions, 2D cel-shaded).
+- Always keep a plain grey dominant background.
+- Always include a very small, subtle, faint image index in the bottom-right corner; no other text in the image.
 
 Sentences:
 """
@@ -332,30 +499,34 @@ def generate_stage2_prompts_batches(
     توزيع كافة دفعات أوامر الصور على خيوط متوازية (Parallel Threads).
     كل خيط يحصل تلقائياً على مفتاح مختلف من مصفوفة المفاتيح.
 
-    إذا تم تمرير stage1_result (يحتوي scene_plan / visual_bible / full_script_sentences)
-    يتم استخدام سياق المرحلة الأولى لتوليد Prompts مفاهيمية غير حرفية.
+    إذا تم تمرير stage1_result (يحتوي scene_plan / visual_bible / creative_brief)
+    يتم استخدام سياق المرحلة الأولى لتوليد Prompts مفاهيمية غير حرفية
+    تبدأ حرفياً بأمر إنشاء صورة صريح.
 
     إذا لم يُمرَّر stage1_result أو كان ناقصاً، يتم الرجوع للسلوك القديم (fallback)
-    دون أي فشل.
+    دون أي فشل، مع الحفاظ على نفس القواعد البصرية والصياغة كأمر إنشاء صورة.
     """
     total_sentences = len(sentences)
 
     # استخراج السياق من المرحلة الأولى (اختياري)
     scene_plan: Optional[Union[List[Dict[str, Any]], Dict[str, Any]]] = None
     visual_bible: Optional[Dict[str, Any]] = None
+    creative_brief: Optional[Any] = None
     has_stage1_context = False
 
     if isinstance(stage1_result, dict):
         candidate_plan = stage1_result.get("scene_plan")
         candidate_bible = stage1_result.get("visual_bible")
-        if candidate_plan or candidate_bible:
+        candidate_brief = stage1_result.get("creative_brief")
+        if candidate_plan or candidate_bible or candidate_brief:
             scene_plan = candidate_plan
             visual_bible = candidate_bible
+            creative_brief = candidate_brief
             has_stage1_context = True
 
     if not has_stage1_context:
         logger.info(
-            "ℹ️ لا يوجد scene_plan / visual_bible — سيتم استخدام السلوك القديم (fallback)."
+            "ℹ️ لا يوجد scene_plan / visual_bible / creative_brief — سيتم استخدام السلوك القديم (fallback)."
         )
 
     # خريطة الجملة -> المشهد (1-based sentence index -> scene dict)
@@ -375,6 +546,7 @@ def generate_stage2_prompts_batches(
                 end_idx,
                 scene_map,
                 visual_bible,
+                creative_brief,
                 has_stage1_context,
             )
         )
