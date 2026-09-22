@@ -1,10 +1,16 @@
 import json
 import re
+import copy
 import logging
 from typing import Dict, Any, List
 from gemini_engine import call_gemini_with_fallback
 
 logger = logging.getLogger("Stage1Generator")
+
+
+# ===========================================================================
+# MAIN SYSTEM PROMPT (unchanged)
+# ===========================================================================
 
 STAGE_1_SYSTEM_PROMPT = """You are an elite AI Episode Director for a high-retention YouTube channel focused on self-development, fitness psychology, and human behavior.
 You are NOT a generic scriptwriter. You are a director who thinks in terms of narrative architecture, emotional pacing, visual storytelling, and viewer retention.
@@ -252,19 +258,102 @@ SCENE PLAN RULES:
 """
 
 
-# ---------------------------------------------------------------------------
-# Sentence count bounds
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# PARTIAL-REPAIR SYSTEM PROMPTS
+# ===========================================================================
+
+SCENE_PLAN_REPAIR_SYSTEM_PROMPT = """You are a scene-plan repair specialist for a YouTube script pipeline.
+You will receive a FROZEN list of sentences. You must NOT modify, reorder, paraphrase, merge, or split them.
+Your ONLY job is to output a valid "scene_plan" JSON array for those sentences.
+
+HARD RULES (CRITICAL):
+- Indexing is 0-based.
+- N = number of sentences. The last valid index is N - 1.
+- First scene: sentence_start MUST be 0.
+- Contiguity: each next scene's sentence_start MUST equal the previous scene's sentence_end + 1.
+- No gaps. No overlaps.
+- The final scene's sentence_end MUST equal N - 1.
+- NEVER use N as sentence_end. N is OUT OF RANGE.
+- scene_id starts at 1 and increments by 1 in list order.
+- Every scene MUST include these exact keys:
+  scene_id, sentence_start, sentence_end, script_segment, narrative_purpose,
+  emotion, visual_concept, character_action, environment, camera,
+  composition, motion_potential, transition, continuity_notes.
+- Every scene must add a real VISUAL IDEA (not just literal illustration).
+- Character DNA must be consistent: Orange character, muscular body, smooth head, two big white eyes, no mouth, black shorts.
+- Do NOT add text inside images unless essential.
+- Output ONLY the JSON array. No markdown, no backticks, no explanation.
+"""
+
+
+RETENTION_PLAN_REPAIR_SYSTEM_PROMPT = """You are a retention-plan repair specialist.
+Return ONLY a valid "retention_plan" JSON object with EXACTLY these fields:
+- hook_strategy (non-empty string)
+- open_loops (JSON array of non-empty strings)
+- pattern_interrupts (JSON array of non-empty strings)
+- escalation_points (JSON array of non-empty strings)
+- main_reveal (non-empty string)
+- payoff (non-empty string)
+- ending_callback (non-empty string)
+
+CRITICAL:
+- open_loops, pattern_interrupts, and escalation_points MUST be real JSON arrays of strings.
+- Even a single item MUST be wrapped in an array, e.g. ["one item"].
+- NEVER return them as a single string.
+- No markdown. No backticks. No explanation.
+Return only the JSON object.
+"""
+
+
+VISUAL_BIBLE_REPAIR_SYSTEM_PROMPT = """You are a visual-bible repair specialist.
+Return ONLY a valid "visual_bible" JSON object with EXACTLY these fields:
+- character_dna (string) — MUST be exactly: "Orange character, muscular body, smooth head, two big white eyes, no mouth, black shorts."
+- environment_style (non-empty string)
+- color_logic (non-empty string)
+- lighting_style (non-empty string)
+- camera_language (non-empty string)
+- composition_rules (non-empty string)
+- recurring_symbols (JSON array of strings)
+- visual_progression (non-empty string)
+
+No markdown. No backticks. No explanation.
+Return only the JSON object.
+"""
+
+
+QUALITY_REPORT_REPAIR_SYSTEM_PROMPT = """You are a quality-report repair specialist.
+Return ONLY a valid "quality_report" JSON object with EXACTLY these fields:
+- hook_score (number between 0 and 10)
+- originality_score (number between 0 and 10)
+- retention_score (number between 0 and 10)
+- narrative_coherence_score (number between 0 and 10)
+- visual_storytelling_score (number between 0 and 10)
+- repetition_check (non-empty string)
+- factual_caution_check (non-empty string)
+- final_issues (JSON array of strings — may be empty)
+- approved (boolean true/false)
+
+No markdown. No backticks. No explanation.
+Return only the JSON object.
+"""
+
+
+# ===========================================================================
+# CONSTANTS
+# ===========================================================================
 
 MIN_SENTENCES = 60
 MAX_SENTENCES = 80
 PREFERRED_MIN_SENTENCES = 60
 PREFERRED_MAX_SENTENCES = 70
 
+MAX_FULL_GENERATION_ATTEMPTS = 4
+MAX_FIELD_REPAIR_ATTEMPTS = 4
 
-# ---------------------------------------------------------------------------
+
+# ===========================================================================
 # JSON helpers
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 def _clean_json_string(raw_text: str) -> str:
     if raw_text is None:
@@ -276,7 +365,7 @@ def _clean_json_string(raw_text: str) -> str:
     return cleaned.strip()
 
 
-def _parse_json_safe(raw_text: str) -> Dict[str, Any]:
+def _parse_json_safe(raw_text: str) -> Any:
     cleaned = _clean_json_string(raw_text)
     if not cleaned:
         raise ValueError("استجابة النموذج فارغة بعد التنظيف.")
@@ -286,9 +375,9 @@ def _parse_json_safe(raw_text: str) -> Dict[str, Any]:
         raise ValueError(f"استجابة النموذج ليست JSON صالحًا: {e}") from e
 
 
-# ---------------------------------------------------------------------------
-# Internal validation helpers
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Base validation helpers
+# ===========================================================================
 
 def _require_non_empty_string(container: Dict[str, Any], key: str, context: str) -> str:
     if key not in container:
@@ -337,9 +426,9 @@ def _require_int(container: Dict[str, Any], key: str, context: str) -> int:
     return value
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # Field-level validators
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 _CREATIVE_BRIEF_STRING_FIELDS = [
     "core_idea",
@@ -450,9 +539,59 @@ def _validate_quality_report(data: Dict[str, Any]) -> None:
     _require_bool(qr, "approved", "quality_report")
 
 
-# ---------------------------------------------------------------------------
-# Scene plan validation (strict — no auto-correction)
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Sentence validation (extracted, reusable)
+# ===========================================================================
+
+def _extract_and_validate_full_script_sentences(
+    data: Dict[str, Any],
+) -> (List[str], int):
+    """Normalize and validate full_script_sentences. Returns (cleaned, total_words)."""
+    sentences = data.get("full_script_sentences", [])
+    if not isinstance(sentences, list) or not sentences:
+        raise ValueError("مصفوفة 'full_script_sentences' فارغة!")
+
+    cleaned_sentences: List[str] = []
+    total_words = 0
+    for index, s in enumerate(sentences):
+        if not isinstance(s, str):
+            raise ValueError(f"full_script_sentences[{index}] يجب أن يكون نصًا.")
+        s_clean = s.strip()
+        if not s_clean:
+            raise ValueError(
+                f"full_script_sentences[{index}] فارغة. "
+                "ممنوع وجود عناصر فارغة لأن scene_plan يعتمد على الفهرسة نفسها."
+            )
+        if not (
+            s_clean.endswith(".")
+            or s_clean.endswith("?")
+            or s_clean.endswith("!")
+        ):
+            s_clean += "."
+        cleaned_sentences.append(s_clean)
+        total_words += len(s_clean.split())
+
+    if not cleaned_sentences:
+        raise ValueError("مصفوفة 'full_script_sentences' فارغة بعد التنظيف.")
+
+    count = len(cleaned_sentences)
+    if count < MIN_SENTENCES:
+        raise ValueError(
+            f"عدد الجمل في 'full_script_sentences' غير كافٍ. "
+            f"العدد الفعلي: {count}، الحد الأدنى المطلوب: {MIN_SENTENCES}."
+        )
+    if count > MAX_SENTENCES:
+        raise ValueError(
+            f"عدد الجمل في 'full_script_sentences' تجاوز الحد الأقصى. "
+            f"العدد الفعلي: {count}، الحد الأقصى المسموح: {MAX_SENTENCES}."
+        )
+
+    return cleaned_sentences, total_words
+
+
+# ===========================================================================
+# Scene plan validation (strict, no auto-correction)
+# ===========================================================================
 
 def _validate_scene_plan(data: Dict[str, Any], total_sentences: int) -> None:
     scene_plan = data.get("scene_plan")
@@ -536,82 +675,46 @@ def _validate_scene_plan(data: Dict[str, Any], total_sentences: int) -> None:
         )
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Required top-level keys
+# ===========================================================================
+
+_REQUIRED_TOP_LEVEL_KEYS = [
+    "id",
+    "topic",
+    "hook",
+    "sections",
+    "full_script_sentences",
+    "creative_brief",
+    "retention_plan",
+    "scene_plan",
+    "visual_bible",
+    "quality_report",
+]
+
+
+def _check_required_top_level_keys(data: Dict[str, Any]) -> None:
+    for k in _REQUIRED_TOP_LEVEL_KEYS:
+        if k not in data:
+            raise ValueError(f"الحقل المطلوب '{k}' مفقود من مخرجات JSON!")
+
+
+# ===========================================================================
 # Public validator
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 def validate_script_output(data: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError("مخرجات النموذج يجب أن تكون كائن JSON.")
 
-    # ---- top-level required keys ----
-    required_keys = ["id", "topic", "hook", "sections", "full_script_sentences"]
-    for k in required_keys:
-        if k not in data:
-            raise ValueError(f"الحقل المطلوب '{k}' مفقود من مخرجات JSON!")
-
-    required_new_keys = [
-        "creative_brief",
-        "retention_plan",
-        "scene_plan",
-        "visual_bible",
-        "quality_report",
-    ]
-    for k in required_new_keys:
-        if k not in data:
-            raise ValueError(f"الحقل المطلوب '{k}' مفقود من مخرجات JSON!")
+    _check_required_top_level_keys(data)
 
     # ---- full_script_sentences ----
-    sentences = data.get("full_script_sentences", [])
-    if not isinstance(sentences, list) or not sentences:
-        raise ValueError("مصفوفة 'full_script_sentences' فارغة!")
-
-    cleaned_sentences: List[str] = []
-    total_words = 0
-    for index, s in enumerate(sentences):
-        if not isinstance(s, str):
-            raise ValueError(
-                f"full_script_sentences[{index}] يجب أن يكون نصًا."
-            )
-
-        s_clean = s.strip()
-
-        if not s_clean:
-            raise ValueError(
-                f"full_script_sentences[{index}] فارغة. "
-                "ممنوع وجود عناصر فارغة لأن scene_plan يعتمد على الفهرسة نفسها."
-            )
-
-        if not (
-            s_clean.endswith(".")
-            or s_clean.endswith("?")
-            or s_clean.endswith("!")
-        ):
-            s_clean += "."
-
-        cleaned_sentences.append(s_clean)
-        total_words += len(s_clean.split())
-
-    if not cleaned_sentences:
-        raise ValueError("مصفوفة 'full_script_sentences' فارغة بعد التنظيف.")
-
+    cleaned_sentences, total_words = _extract_and_validate_full_script_sentences(data)
     data["full_script_sentences"] = cleaned_sentences
     data["total_word_count"] = total_words
 
-    # ---- sentence count validation ----
     sentence_count = len(cleaned_sentences)
-
-    if sentence_count < MIN_SENTENCES:
-        raise ValueError(
-            f"عدد الجمل في 'full_script_sentences' غير كافٍ. "
-            f"العدد الفعلي: {sentence_count}، الحد الأدنى المطلوب: {MIN_SENTENCES}."
-        )
-
-    if sentence_count > MAX_SENTENCES:
-        raise ValueError(
-            f"عدد الجمل في 'full_script_sentences' تجاوز الحد الأقصى. "
-            f"العدد الفعلي: {sentence_count}، الحد الأقصى المسموح: {MAX_SENTENCES}."
-        )
 
     if PREFERRED_MIN_SENTENCES <= sentence_count <= PREFERRED_MAX_SENTENCES:
         logger.info(
@@ -624,7 +727,6 @@ def validate_script_output(data: Dict[str, Any]) -> Dict[str, Any]:
             f"{PREFERRED_MIN_SENTENCES}-{PREFERRED_MAX_SENTENCES})."
         )
 
-    # ---- word count log ----
     if 800 <= total_words <= 900:
         logger.info(f"🎯 حجم السكربت مثالي: {total_words} كلمة.")
     else:
@@ -637,23 +739,502 @@ def validate_script_output(data: Dict[str, Any]) -> Dict[str, Any]:
     _validate_quality_report(data)
 
     # ---- scene_plan validation (strict, no auto-correction) ----
-    total_sentences = len(cleaned_sentences)
-    _validate_scene_plan(data, total_sentences)
+    _validate_scene_plan(data, sentence_count)
 
     return data
 
 
-# ---------------------------------------------------------------------------
-# Public generator
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Partial repair: field checkers (silent)
+# ===========================================================================
 
-def generate_stage1_script(episode_data: Dict[str, Any]) -> Dict[str, Any]:
-    user_prompt = f"Here is the raw input JSON for the episode:\n{json.dumps(episode_data, ensure_ascii=False, indent=2)}"
+def _field_is_valid(validator, *args) -> bool:
+    try:
+        validator(*args)
+        return True
+    except ValueError:
+        return False
 
-    raw_response = call_gemini_with_fallback(
-        system_instruction=STAGE_1_SYSTEM_PROMPT,
-        user_prompt=user_prompt
+
+# ===========================================================================
+# Partial repair: individual field repair calls
+# ===========================================================================
+
+def _repair_scene_plan(
+    full_script_sentences: List[str],
+    episode_data: Dict[str, Any],
+    error_msg: Any,
+) -> List[Dict[str, Any]]:
+    N = len(full_script_sentences)
+    sentences_json = json.dumps(full_script_sentences, ensure_ascii=False, indent=2)
+    ep_json = json.dumps(episode_data, ensure_ascii=False, indent=2)
+
+    user_prompt = (
+        "This is a fresh independent repair request.\n"
+        "The provided full_script_sentences is frozen and must not be changed.\n"
+        "Return only the requested JSON field (scene_plan).\n"
+        "Do not return the full episode object.\n"
+        "Do not use markdown.\n\n"
+        f"Number of sentences N = {N}.\n"
+        f"Valid 0-based indices are 0 through {N - 1}.\n"
+        f"The first scene MUST start at sentence_start = 0.\n"
+        f"The final scene MUST end at sentence_end = {N - 1}.\n"
+        f"sentence_end = {N} is OUT OF RANGE and will be rejected.\n"
+        "Scenes must be contiguous: each next scene's sentence_start = previous sentence_end + 1.\n"
+        "No gaps. No overlaps. scene_id must start at 1 and increment by 1.\n\n"
+        f"Previous validation failure:\n{error_msg}\n\n"
+        f"Episode data (context only):\n{ep_json}\n\n"
+        f"Frozen full_script_sentences (DO NOT MODIFY):\n{sentences_json}\n\n"
+        "Return ONLY the scene_plan JSON array now."
     )
 
-    parsed_json = _parse_json_safe(raw_response)
-    return validate_script_output(parsed_json)
+    raw = call_gemini_with_fallback(
+        system_instruction=SCENE_PLAN_REPAIR_SYSTEM_PROMPT,
+        user_prompt=user_prompt,
+    )
+    parsed = _parse_json_safe(raw)
+
+    if isinstance(parsed, list):
+        return parsed
+    if isinstance(parsed, dict):
+        if isinstance(parsed.get("scene_plan"), list):
+            return parsed["scene_plan"]
+        raise ValueError(
+            "استجابة إصلاح scene_plan يجب أن تكون JSON array أو كائنًا يحتوي على scene_plan كقائمة."
+        )
+    raise ValueError("استجابة إصلاح scene_plan ليست قائمة JSON صالحة.")
+
+
+def _repair_retention_plan(
+    full_script_sentences: List[str],
+    current_retention_plan: Any,
+    episode_data: Dict[str, Any],
+    error_msg: Any,
+) -> Dict[str, Any]:
+    sentences_json = json.dumps(full_script_sentences, ensure_ascii=False, indent=2)
+    current_json = json.dumps(current_retention_plan, ensure_ascii=False, indent=2) \
+        if current_retention_plan is not None else "null"
+    ep_json = json.dumps(episode_data, ensure_ascii=False, indent=2)
+
+    user_prompt = (
+        "This is a fresh independent repair request.\n"
+        "The provided full_script_sentences is frozen and must not be changed.\n"
+        "Return only the requested JSON field (retention_plan).\n"
+        "Do not return the full episode object.\n"
+        "Do not use markdown.\n\n"
+        "Reminder: open_loops, pattern_interrupts, and escalation_points MUST be real JSON arrays of non-empty strings.\n"
+        "Even a single item MUST be wrapped in an array, e.g. [\"one item\"].\n\n"
+        f"Previous validation failure:\n{error_msg}\n\n"
+        f"Episode data (context only):\n{ep_json}\n\n"
+        f"Frozen full_script_sentences (DO NOT MODIFY):\n{sentences_json}\n\n"
+        f"Current (possibly broken) retention_plan:\n{current_json}\n\n"
+        "Return ONLY the retention_plan JSON object now."
+    )
+
+    raw = call_gemini_with_fallback(
+        system_instruction=RETENTION_PLAN_REPAIR_SYSTEM_PROMPT,
+        user_prompt=user_prompt,
+    )
+    parsed = _parse_json_safe(raw)
+
+    if not isinstance(parsed, dict):
+        raise ValueError("استجابة إصلاح retention_plan يجب أن تكون كائن JSON.")
+    if isinstance(parsed.get("retention_plan"), dict):
+        return parsed["retention_plan"]
+    return parsed
+
+
+def _repair_visual_bible(
+    full_script_sentences: List[str],
+    current_visual_bible: Any,
+    episode_data: Dict[str, Any],
+    error_msg: Any,
+) -> Dict[str, Any]:
+    sentences_json = json.dumps(full_script_sentences, ensure_ascii=False, indent=2)
+    current_json = json.dumps(current_visual_bible, ensure_ascii=False, indent=2) \
+        if current_visual_bible is not None else "null"
+    ep_json = json.dumps(episode_data, ensure_ascii=False, indent=2)
+
+    user_prompt = (
+        "This is a fresh independent repair request.\n"
+        "The provided full_script_sentences is frozen and must not be changed.\n"
+        "Return only the requested JSON field (visual_bible).\n"
+        "Do not return the full episode object.\n"
+        "Do not use markdown.\n\n"
+        "Reminder: character_dna MUST be exactly: "
+        "\"Orange character, muscular body, smooth head, two big white eyes, no mouth, black shorts.\"\n\n"
+        f"Previous validation failure:\n{error_msg}\n\n"
+        f"Episode data (context only):\n{ep_json}\n\n"
+        f"Frozen full_script_sentences (DO NOT MODIFY):\n{sentences_json}\n\n"
+        f"Current (possibly broken) visual_bible:\n{current_json}\n\n"
+        "Return ONLY the visual_bible JSON object now."
+    )
+
+    raw = call_gemini_with_fallback(
+        system_instruction=VISUAL_BIBLE_REPAIR_SYSTEM_PROMPT,
+        user_prompt=user_prompt,
+    )
+    parsed = _parse_json_safe(raw)
+
+    if not isinstance(parsed, dict):
+        raise ValueError("استجابة إصلاح visual_bible يجب أن تكون كائن JSON.")
+    if isinstance(parsed.get("visual_bible"), dict):
+        return parsed["visual_bible"]
+    return parsed
+
+
+def _repair_quality_report(
+    full_script_sentences: List[str],
+    creative_brief: Any,
+    retention_plan: Any,
+    scene_plan: Any,
+    visual_bible: Any,
+    current_quality_report: Any,
+    error_msg: Any,
+) -> Dict[str, Any]:
+    sentences_json = json.dumps(full_script_sentences, ensure_ascii=False, indent=2)
+    cb_json = json.dumps(creative_brief, ensure_ascii=False, indent=2)
+    rp_json = json.dumps(retention_plan, ensure_ascii=False, indent=2)
+    sp_json = json.dumps(scene_plan, ensure_ascii=False, indent=2)
+    vb_json = json.dumps(visual_bible, ensure_ascii=False, indent=2)
+    current_json = json.dumps(current_quality_report, ensure_ascii=False, indent=2) \
+        if current_quality_report is not None else "null"
+
+    user_prompt = (
+        "This is a fresh independent repair request.\n"
+        "Return only the requested JSON field (quality_report).\n"
+        "Do not return the full episode object.\n"
+        "Do not use markdown.\n\n"
+        "Scores must be numbers between 0 and 10. approved must be a real boolean.\n\n"
+        f"Previous validation failure:\n{error_msg}\n\n"
+        f"Frozen full_script_sentences:\n{sentences_json}\n\n"
+        f"creative_brief:\n{cb_json}\n\n"
+        f"retention_plan:\n{rp_json}\n\n"
+        f"scene_plan:\n{sp_json}\n\n"
+        f"visual_bible:\n{vb_json}\n\n"
+        f"Current (possibly broken) quality_report:\n{current_json}\n\n"
+        "Return ONLY the quality_report JSON object now."
+    )
+
+    raw = call_gemini_with_fallback(
+        system_instruction=QUALITY_REPORT_REPAIR_SYSTEM_PROMPT,
+        user_prompt=user_prompt,
+    )
+    parsed = _parse_json_safe(raw)
+
+    if not isinstance(parsed, dict):
+        raise ValueError("استجابة إصلاح quality_report يجب أن تكون كائن JSON.")
+    if isinstance(parsed.get("quality_report"), dict):
+        return parsed["quality_report"]
+    return parsed
+
+
+# ===========================================================================
+# Partial repair: per-field retry wrappers
+# ===========================================================================
+
+def _repair_scene_plan_with_attempts(
+    full_script_sentences: List[str],
+    data: Dict[str, Any],
+    episode_data: Dict[str, Any],
+    first_error: Any,
+) -> List[Dict[str, Any]]:
+    N = len(full_script_sentences)
+    last_err: Any = first_error
+
+    for attempt in range(MAX_FIELD_REPAIR_ATTEMPTS):
+        try:
+            sp = _repair_scene_plan(full_script_sentences, episode_data, last_err)
+            test_data = copy.deepcopy(data)
+            test_data["scene_plan"] = sp
+            _validate_scene_plan(test_data, N)
+            return sp
+        except Exception as e:
+            last_err = e
+            logger.warning(
+                f"scene_plan repair attempt {attempt + 1}/{MAX_FIELD_REPAIR_ATTEMPTS} "
+                f"failed: {e}"
+            )
+
+    raise ValueError(
+        f"فشل إصلاح scene_plan بعد {MAX_FIELD_REPAIR_ATTEMPTS} محاولات. آخر خطأ: {last_err}"
+    )
+
+
+def _repair_retention_plan_with_attempts(
+    full_script_sentences: List[str],
+    data: Dict[str, Any],
+    episode_data: Dict[str, Any],
+    first_error: Any,
+) -> Dict[str, Any]:
+    last_err: Any = first_error
+    current = data.get("retention_plan")
+
+    for attempt in range(MAX_FIELD_REPAIR_ATTEMPTS):
+        try:
+            rp = _repair_retention_plan(
+                full_script_sentences, current, episode_data, last_err
+            )
+            test_data = copy.deepcopy(data)
+            test_data["retention_plan"] = rp
+            _validate_retention_plan(test_data)
+            return rp
+        except Exception as e:
+            last_err = e
+            logger.warning(
+                f"retention_plan repair attempt {attempt + 1}/{MAX_FIELD_REPAIR_ATTEMPTS} "
+                f"failed: {e}"
+            )
+
+    raise ValueError(
+        f"فشل إصلاح retention_plan بعد {MAX_FIELD_REPAIR_ATTEMPTS} محاولات. آخر خطأ: {last_err}"
+    )
+
+
+def _repair_visual_bible_with_attempts(
+    full_script_sentences: List[str],
+    data: Dict[str, Any],
+    episode_data: Dict[str, Any],
+    first_error: Any,
+) -> Dict[str, Any]:
+    last_err: Any = first_error
+    current = data.get("visual_bible")
+
+    for attempt in range(MAX_FIELD_REPAIR_ATTEMPTS):
+        try:
+            vb = _repair_visual_bible(
+                full_script_sentences, current, episode_data, last_err
+            )
+            test_data = copy.deepcopy(data)
+            test_data["visual_bible"] = vb
+            _validate_visual_bible(test_data)
+            return vb
+        except Exception as e:
+            last_err = e
+            logger.warning(
+                f"visual_bible repair attempt {attempt + 1}/{MAX_FIELD_REPAIR_ATTEMPTS} "
+                f"failed: {e}"
+            )
+
+    raise ValueError(
+        f"فشل إصلاح visual_bible بعد {MAX_FIELD_REPAIR_ATTEMPTS} محاولات. آخر خطأ: {last_err}"
+    )
+
+
+def _repair_quality_report_with_attempts(
+    data: Dict[str, Any],
+    episode_data: Dict[str, Any],
+    first_error: Any,
+) -> Dict[str, Any]:
+    last_err: Any = first_error
+    current = data.get("quality_report")
+
+    for attempt in range(MAX_FIELD_REPAIR_ATTEMPTS):
+        try:
+            qr = _repair_quality_report(
+                full_script_sentences=data["full_script_sentences"],
+                creative_brief=data.get("creative_brief"),
+                retention_plan=data.get("retention_plan"),
+                scene_plan=data.get("scene_plan"),
+                visual_bible=data.get("visual_bible"),
+                current_quality_report=current,
+                error_msg=last_err,
+            )
+            test_data = copy.deepcopy(data)
+            test_data["quality_report"] = qr
+            _validate_quality_report(test_data)
+            return qr
+        except Exception as e:
+            last_err = e
+            logger.warning(
+                f"quality_report repair attempt {attempt + 1}/{MAX_FIELD_REPAIR_ATTEMPTS} "
+                f"failed: {e}"
+            )
+
+    raise ValueError(
+        f"فشل إصلاح quality_report بعد {MAX_FIELD_REPAIR_ATTEMPTS} محاولات. آخر خطأ: {last_err}"
+    )
+
+
+# ===========================================================================
+# Merge + partial repair orchestrator
+# ===========================================================================
+
+def _merge_and_validate_partial_repairs(
+    base_data: Dict[str, Any],
+    episode_data: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Given base_data whose full_script_sentences is already normalized and valid,
+    attempt to repair only the auxiliary fields that fail validation:
+      - retention_plan
+      - visual_bible
+      - scene_plan
+      - quality_report
+
+    Non-repairable field failures (creative_brief) bubble up so the caller can
+    trigger a full regeneration.
+    """
+    data = copy.deepcopy(base_data)
+
+    # Sentences must be frozen and valid.
+    sentences = data.get("full_script_sentences")
+    if not isinstance(sentences, list) or not sentences:
+        raise ValueError(
+            "_merge_and_validate_partial_repairs: full_script_sentences missing or empty."
+        )
+    N = len(sentences)
+
+    # ---- creative_brief: NOT repairable here ----
+    if not _field_is_valid(_validate_creative_brief, data):
+        # Force the caller to regenerate the whole JSON.
+        _validate_creative_brief(data)
+
+    # ---- retention_plan ----
+    if not _field_is_valid(_validate_retention_plan, data):
+        logger.info("Detected invalid retention_plan. Attempting partial repair...")
+        rp = _repair_retention_plan_with_attempts(
+            full_script_sentences=sentences,
+            data=data,
+            episode_data=episode_data,
+            first_error="retention_plan validation failed.",
+        )
+        data["retention_plan"] = rp
+        _validate_retention_plan(data)
+
+    # ---- visual_bible ----
+    if not _field_is_valid(_validate_visual_bible, data):
+        logger.info("Detected invalid visual_bible. Attempting partial repair...")
+        vb = _repair_visual_bible_with_attempts(
+            full_script_sentences=sentences,
+            data=data,
+            episode_data=episode_data,
+            first_error="visual_bible validation failed.",
+        )
+        data["visual_bible"] = vb
+        _validate_visual_bible(data)
+
+    # ---- scene_plan ----
+    if not _field_is_valid(_validate_scene_plan, data, N):
+        logger.info("Detected invalid scene_plan. Attempting partial repair...")
+        # Capture first error message for the repair prompt.
+        first_err: Any = "scene_plan validation failed."
+        try:
+            _validate_scene_plan(data, N)
+        except ValueError as e:
+            first_err = e
+
+        sp = _repair_scene_plan_with_attempts(
+            full_script_sentences=sentences,
+            data=data,
+            episode_data=episode_data,
+            first_error=first_err,
+        )
+        data["scene_plan"] = sp
+        _validate_scene_plan(data, N)
+
+    # ---- quality_report ----
+    if not _field_is_valid(_validate_quality_report, data):
+        logger.info("Detected invalid quality_report. Attempting partial repair...")
+        qr = _repair_quality_report_with_attempts(
+            data=data,
+            episode_data=episode_data,
+            first_error="quality_report validation failed.",
+        )
+        data["quality_report"] = qr
+        _validate_quality_report(data)
+
+    # Final full validation on the merged result.
+    return validate_script_output(data)
+
+
+# ===========================================================================
+# Public generator
+# ===========================================================================
+
+def generate_stage1_script(episode_data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Generate the Stage-1 script with a partial-repair strategy:
+
+    1. Ask the model for a full JSON.
+    2. If full_script_sentences is invalid -> discard and regenerate full JSON.
+    3. If full_script_sentences is valid -> freeze it and try to repair only the
+       auxiliary fields that fail (retention_plan / visual_bible / scene_plan /
+       quality_report). Never mutate the frozen sentences.
+    4. Only return after a successful full validate_script_output().
+    """
+    last_error: Any = None
+
+    for full_attempt in range(MAX_FULL_GENERATION_ATTEMPTS):
+        logger.info(
+            f"Full generation attempt {full_attempt + 1}/{MAX_FULL_GENERATION_ATTEMPTS}"
+        )
+
+        user_prompt = (
+            "Here is the raw input JSON for the episode:\n"
+            f"{json.dumps(episode_data, ensure_ascii=False, indent=2)}"
+        )
+
+        # ---------- call model ----------
+        try:
+            raw_response = call_gemini_with_fallback(
+                system_instruction=STAGE_1_SYSTEM_PROMPT,
+                user_prompt=user_prompt,
+            )
+            parsed_json = _parse_json_safe(raw_response)
+        except Exception as e:
+            last_error = e
+            logger.warning(
+                f"Attempt {full_attempt + 1}: model call / JSON parse failed: {e}"
+            )
+            continue
+
+        if not isinstance(parsed_json, dict):
+            last_error = ValueError("استجابة النموذج ليست كائن JSON.")
+            logger.warning(f"Attempt {full_attempt + 1}: response is not a JSON object.")
+            continue
+
+        # ---------- core checks (top-level keys + sentences) ----------
+        try:
+            _check_required_top_level_keys(parsed_json)
+            cleaned_sentences, total_words = _extract_and_validate_full_script_sentences(
+                parsed_json
+            )
+        except ValueError as e:
+            last_error = e
+            logger.warning(
+                f"Attempt {full_attempt + 1}: core validation failed (sentences / keys). "
+                f"Regenerating full JSON. Reason: {e}"
+            )
+            continue
+
+        # Freeze sentences as the source of truth for this attempt.
+        parsed_json["full_script_sentences"] = cleaned_sentences
+        parsed_json["total_word_count"] = total_words
+
+        # ---------- try full validation first ----------
+        try:
+            return validate_script_output(parsed_json)
+        except ValueError as e:
+            last_error = e
+            logger.info(
+                f"Attempt {full_attempt + 1}: full validation failed. "
+                f"Trying partial repairs. Reason: {e}"
+            )
+
+        # ---------- try partial repairs ----------
+        try:
+            repaired = _merge_and_validate_partial_repairs(parsed_json, episode_data)
+            return repaired
+        except Exception as e:
+            last_error = e
+            logger.warning(
+                f"Attempt {full_attempt + 1}: partial repairs did not produce a valid "
+                f"result. Regenerating full JSON. Reason: {e}"
+            )
+            continue
+
+    raise ValueError(
+        f"فشل توليد سكربت المرحلة الأولى بعد {MAX_FULL_GENERATION_ATTEMPTS} محاولات كاملة. "
+        f"آخر خطأ: {last_error}"
+    )
