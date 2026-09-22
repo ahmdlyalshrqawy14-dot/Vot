@@ -80,6 +80,29 @@ SENTENCE COUNT RULES (CRITICAL):
 - Preserve narrative flow. The script must NOT feel choppy or mechanical even though there are many sentences.
 - Each sentence must end with a period, question mark, or exclamation point.
 
+FULL_SCRIPT_SENTENCES INTEGRITY RULES (CRITICAL):
+- "full_script_sentences" MUST be a JSON array of NON-EMPTY strings.
+- Every element MUST contain real, speakable text after stripping whitespace.
+- NEVER include empty strings, whitespace-only strings, or null entries.
+- NEVER include placeholders or filler tokens such as "...", "-", or similar.
+- If a sentence is meant to exist, it MUST contain actual words.
+- The number of elements in "full_script_sentences" defines N (the total sentence count).
+- The final element of "full_script_sentences" is at index N - 1.
+- Indices are 0-based, NOT 1-based.
+
+SCENE PLAN INDEXING RULES (CRITICAL — READ CAREFULLY):
+- Build the "scene_plan" ONLY AFTER the final "full_script_sentences" list is fully written and frozen.
+- Count the final sentences yourself. Let N be that count.
+- The last valid 0-based index is N - 1.
+- sentence_start and sentence_end MUST both be between 0 and N - 1 inclusive.
+- NEVER use N as a value for sentence_end. N is OUT OF RANGE and will be rejected.
+- The first scene MUST start at sentence_start = 0.
+- Scenes MUST be contiguous: each next scene's sentence_start MUST equal the previous scene's sentence_end + 1.
+- There MUST be NO gaps between scenes and NO overlaps between scenes.
+- The final scene in scene_plan MUST end exactly at index N - 1.
+- Concretely: if "full_script_sentences" has 74 sentences, the last scene must end at sentence_end = 73, NOT 74.
+- The number of scenes is NOT fixed and MUST adapt to the actual number of sentences (60 - 80).
+
 STRUCTURE & WORD BUDGET (800 - 900 words total):
 Distribute words according to the narrative architecture you chose — not a rigid template. Ensure the total stays in 800 - 900 words.
 
@@ -226,22 +249,11 @@ SCENE PLAN RULES:
 - Every scene must include character_action and visual_concept.
 - Visual progression must exist from start to end of the episode.
 - Do not make every scene the same pose against an empty background.
-
-SCENE PLAN INDEXING RULES (CRITICAL — READ CAREFULLY):
-- If full_script_sentences contains N sentences, the last valid index is N - 1.
-- sentence_start and sentence_end MUST both be between 0 and N - 1 inclusive.
-- NEVER use N as a value for sentence_end. N is OUT OF RANGE and will be rejected.
-- Build the scene_plan ONLY AFTER the final full_script_sentences list is frozen and its count N is known.
-- The final scene in scene_plan MUST end exactly at index len(full_script_sentences) - 1.
-- Concretely: if the final full_script_sentences has 74 sentences, the last scene must end at sentence_end = 73, NOT 74.
-- Indices are 0-based, never 1-based. The first scene must start at sentence_start = 0.
-- Scenes must be contiguous: each next scene's sentence_start must equal the previous scene's sentence_end + 1.
-- Do NOT leave gaps between scenes and do NOT overlap scenes.
 """
 
 
 # ---------------------------------------------------------------------------
-# Sentence count bounds (new)
+# Sentence count bounds
 # ---------------------------------------------------------------------------
 
 MIN_SENTENCES = 60
@@ -409,7 +421,12 @@ def _validate_retention_plan(data: Dict[str, Any]) -> None:
     for field in _RETENTION_PLAN_STRING_FIELDS:
         _require_non_empty_string(rp, field, "retention_plan")
     for field in _RETENTION_PLAN_LIST_FIELDS:
-        _require_list(rp, field, "retention_plan")
+        items = _require_list(rp, field, "retention_plan")
+        for i, item in enumerate(items):
+            if not isinstance(item, str) or not item.strip():
+                raise ValueError(
+                    f"retention_plan.{field}[{i}] يجب أن يكون نصًا غير فارغ."
+                )
 
 
 def _validate_visual_bible(data: Dict[str, Any]) -> None:
@@ -434,87 +451,7 @@ def _validate_quality_report(data: Dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Safe off-by-one fix for the LAST scene's sentence_end
-# ---------------------------------------------------------------------------
-
-def _attempt_last_scene_off_by_one_fix(data: Dict[str, Any], total_sentences: int) -> bool:
-    """
-    محاولة إصلاح آمنة لحالة واحدة فقط:
-    - جميع المشاهد السابقة صحيحة ومتسلسلة بلا فجوات أو تداخل.
-    - آخر مشهد sentence_end يساوي بالضبط len(cleaned_sentences) (خطأ off-by-one بمقدار +1).
-
-    لا يُطبَّق الإصلاح إذا كان هناك أي خطأ آخر (فجوة، تداخل، فهرس سالب،
-    sentence_end أكبر من len، أو أي مشكلة في مشهد سابق).
-
-    يُعيد True إذا تم التصحيح، False إذا لم ينطبق شرط التصحيح الآمن.
-    """
-    scene_plan = data.get("scene_plan")
-    if not isinstance(scene_plan, list) or not scene_plan:
-        return False
-
-    previous_end = -1
-    last_index = len(scene_plan) - 1
-
-    for idx, scene in enumerate(scene_plan):
-        if not isinstance(scene, dict):
-            return False
-
-        s_start = scene.get("sentence_start")
-        s_end = scene.get("sentence_end")
-
-        # يجب أن يكونا أعدادًا صحيحة حقيقية (لا bool)
-        if isinstance(s_start, bool) or not isinstance(s_start, int):
-            return False
-        if isinstance(s_end, bool) or not isinstance(s_end, int):
-            return False
-
-        # لا نقبل أي فهرس سالب
-        if s_start < 0 or s_end < 0:
-            return False
-
-        # لا نقبل أي sentence_end أكبر من total_sentences
-        if s_end > total_sentences:
-            return False
-
-        if s_start > s_end:
-            return False
-
-        is_last = (idx == last_index)
-
-        if idx == 0:
-            if s_start != 0:
-                return False
-        else:
-            # لا فجوات ولا تداخل
-            if s_start != previous_end + 1:
-                return False
-
-        if is_last:
-            # الحالة الوحيدة المسموح إصلاحها: off-by-one بمقدار +1 في النهاية
-            if s_end == total_sentences:
-                scene["sentence_end"] = total_sentences - 1
-                logger.warning(
-                    "⚠️ تم إصلاح خطأ off-by-one في آخر مشهد داخل scene_plan: "
-                    "sentence_end كان %d (خارج النطاق) وتم تصحيحه إلى %d "
-                    "(آخر فهرس مسموح لـ full_script_sentences). "
-                    "لم يتم تغيير أي مشهد سابق، ولم تُضف أو تُحذف مشاهد.",
-                    total_sentences,
-                    total_sentences - 1,
-                )
-                return True
-            # أي قيمة أخرى: لا نصلح هنا، نترك المدقق الرئيسي يرمي خطأه
-            return False
-        else:
-            # المشاهد غير الأخيرة يجب أن تنتهي قبل آخر فهرس
-            if s_end >= total_sentences:
-                return False
-            previous_end = s_end
-
-    return False
-
-
-# ---------------------------------------------------------------------------
-# Scene plan validation
+# Scene plan validation (strict — no auto-correction)
 # ---------------------------------------------------------------------------
 
 def _validate_scene_plan(data: Dict[str, Any], total_sentences: int) -> None:
@@ -554,7 +491,8 @@ def _validate_scene_plan(data: Dict[str, Any], total_sentences: int) -> None:
         if s_end >= total_sentences:
             raise ValueError(
                 f"scene_plan[{idx}]: sentence_end={s_end} خارج نطاق full_script_sentences "
-                f"(الحد الأقصى {total_sentences - 1})."
+                f"(الحد الأقصى {total_sentences - 1}). "
+                f"عدد الجمل الفعلي N = {total_sentences}، لذا آخر فهرس مسموح هو {total_sentences - 1}."
             )
 
         if idx == 0:
@@ -586,7 +524,8 @@ def _validate_scene_plan(data: Dict[str, Any], total_sentences: int) -> None:
 
     if previous_end != total_sentences - 1:
         raise ValueError(
-            f"آخر مشهد يجب أن ينتهي عند {total_sentences - 1} لكنه انتهى عند {previous_end}."
+            f"آخر مشهد يجب أن ينتهي عند {total_sentences - 1} لكنه انتهى عند {previous_end}. "
+            f"عدد الجمل الفعلي N = {total_sentences}."
         )
 
     if not all(covered):
@@ -629,14 +568,27 @@ def validate_script_output(data: Dict[str, Any]) -> Dict[str, Any]:
 
     cleaned_sentences: List[str] = []
     total_words = 0
-    for s in sentences:
+    for index, s in enumerate(sentences):
         if not isinstance(s, str):
-            raise ValueError("كل عنصر في 'full_script_sentences' يجب أن يكون نصًا.")
+            raise ValueError(
+                f"full_script_sentences[{index}] يجب أن يكون نصًا."
+            )
+
         s_clean = s.strip()
+
         if not s_clean:
-            continue
-        if not (s_clean.endswith(".") or s_clean.endswith("?") or s_clean.endswith("!")):
+            raise ValueError(
+                f"full_script_sentences[{index}] فارغة. "
+                "ممنوع وجود عناصر فارغة لأن scene_plan يعتمد على الفهرسة نفسها."
+            )
+
+        if not (
+            s_clean.endswith(".")
+            or s_clean.endswith("?")
+            or s_clean.endswith("!")
+        ):
             s_clean += "."
+
         cleaned_sentences.append(s_clean)
         total_words += len(s_clean.split())
 
@@ -646,7 +598,7 @@ def validate_script_output(data: Dict[str, Any]) -> Dict[str, Any]:
     data["full_script_sentences"] = cleaned_sentences
     data["total_word_count"] = total_words
 
-    # ---- NEW: sentence count validation ----
+    # ---- sentence count validation ----
     sentence_count = len(cleaned_sentences)
 
     if sentence_count < MIN_SENTENCES:
@@ -684,15 +636,8 @@ def validate_script_output(data: Dict[str, Any]) -> Dict[str, Any]:
     _validate_visual_bible(data)
     _validate_quality_report(data)
 
-    # ---- scene_plan validation ----
+    # ---- scene_plan validation (strict, no auto-correction) ----
     total_sentences = len(cleaned_sentences)
-
-    # إصلاح آمن لحالة واحدة فقط:
-    # off-by-one بمقدار +1 في sentence_end الخاص بآخر مشهد فقط،
-    # مع بقاء جميع المشاهد السابقة صحيحة ومتسلسلة بلا فجوات أو تداخل.
-    # لا يُطبَّق أي إصلاح آخر، وأي خطأ مختلف سيُرفع كـ ValueError من المدقق الرئيسي.
-    _attempt_last_scene_off_by_one_fix(data, total_sentences)
-
     _validate_scene_plan(data, total_sentences)
 
     return data
