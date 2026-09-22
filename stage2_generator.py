@@ -27,6 +27,83 @@ REQUIRED_CORNER_PHRASE = "bottom-right corner"
 REQUIRED_SUBTLE_TOKENS = ("faint", "subtle")
 REQUIRED_ANTI_TEXT_TOKENS = ("no written text", "no text")
 
+# ---------------------------------------------------------
+# Extended semantic keyword groups (used for validation only)
+# These are NEVER added as a raw checklist; they must appear
+# naturally inside a coherent, copy-pasteable image prompt.
+# ---------------------------------------------------------
+CONCEPTUAL_KEYWORDS = (
+    "symbol", "symbolic", "symbolizing", "symbolising", "symbolizes",
+    "metaphor", "metaphorical", "representing", "represents",
+    "conceptual", "conceptually", "allegory", "allegorical",
+    "as if", "as though", "visually conveys", "evokes", "embodies",
+    "serves as", "stands for", "story-driven",
+)
+
+ACTION_KEYWORDS = (
+    "standing", "stands", "walking", "walks", "running", "runs",
+    "stepping", "steps", "climbing", "climbs", "holding", "holds",
+    "reaching", "reaches", "gazing", "gazes", "looking", "looks",
+    "facing", "faces", "turning", "turns", "raising", "raises",
+    "lowering", "lowers", "moving", "moves", "crouching", "crouches",
+    "leaning", "leans", "pushing", "pushes", "pulling", "pulls",
+    "gesture", "gesturing", "pose", "posture", "body language",
+    "arms", "hands", "shoulders",
+)
+
+ENVIRONMENT_KEYWORDS = (
+    "on the grey background", "over the grey background",
+    "on the background", "over the background",
+    "placed on", "placed over", "resting on", "emerging from",
+    "rising from", "in front of",
+    "door", "doors", "bridge", "path", "pathway", "stairs", "steps",
+    "wall", "floor", "ground", "platform", "structure", "barrier",
+    "threshold", "gateway", "tunnel", "ladder", "rope", "box",
+    "cage", "mirror", "clock", "mask", "chain", "chains", "rock",
+    "mountain", "river", "weight", "stone", "block", "pillar",
+    "element", "prop", "object", "surface", "environment",
+    "landscape", "scene",
+)
+
+EMOTION_KEYWORDS = (
+    "determined", "confused", "tired", "hopeful", "worried", "calm",
+    "frustrated", "curious", "focused", "confident", "anxious",
+    "relieved", "surprised", "thoughtful", "hesitant", "resigned",
+    "eager", "defeated", "proud", "ashamed", "doubtful", "serene",
+    "tense", "relaxed", "emotion", "emotional", "expression",
+    "mood", "feeling",
+)
+
+CAMERA_KEYWORDS = (
+    "close-up", "close up", "medium shot", "wide shot", "long shot",
+    "side-profile", "side profile", "low-angle", "low angle",
+    "high-angle", "high angle", "overhead", "dutch angle",
+    "camera", "shot", "framing", "angle",
+)
+
+COMPOSITION_KEYWORDS = (
+    "composition", "centered", "centred", "symmetrical",
+    "character on the left", "character on the right",
+    "foreground", "background depth", "depth", "leading lines",
+    "balanced composition", "balanced", "rule of thirds",
+    "framed", "framing",
+)
+
+LIGHTING_KEYWORDS = (
+    "lighting", "light", "rim light", "soft light", "directional light",
+    "high contrast", "cinematic lighting", "muted", "warm light",
+    "cool light", "color palette", "colour palette", "palette",
+    "gold", "shadow", "shadows", "glow", "tones",
+)
+
+CONTINUITY_KEYWORDS = (
+    "continuing", "continuity", "matching the previous",
+    "evolving from", "preparing for the next", "preserving the same",
+    "previous shot", "previous image", "next shot", "next image",
+    "same visual world", "same environment", "next transformation",
+    "same symbol", "same setting", "same world",
+)
+
 
 STAGE_2_SYSTEM_PROMPT = """You are an expert AI Art Director and Visual Storyboard Artist. Your task is to generate explicit IMAGE GENERATION COMMANDS for an educational YouTube video based on a sequential list of script sentences.
 
@@ -321,6 +398,7 @@ Return prompts separated ONLY by a single blank line. No quotation marks, no mar
 
 
 BATCH_SIZE = 24
+MAX_PROMPT_REPAIR_ATTEMPTS = 4
 
 
 def clean_and_parse_prompts(raw_text: str) -> List[str]:
@@ -336,19 +414,6 @@ def _map_sentences_to_scenes(
 ) -> Dict[int, Dict[str, Any]]:
     """
     يرجع قاموساً: index الجملة (1-based) -> بيانات المشهد الخاص بها.
-
-    المرحلة الأولى تُنتج scene_plan كقائمة مباشرة:
-        [
-            {"scene_id": 1, "sentence_start": 0, "sentence_end": 3, ...},
-            ...
-        ]
-
-    فهارس scene_plan هي 0-based (sentence_start / sentence_end)،
-    بينما أرقام الجمل والـimage prompts في المرحلة الثانية هي 1-based.
-    لذلك نقوم بتحويل one_based = zero_based + 1.
-
-    للتوافق الخلفي فقط: إذا وصل scene_plan كقاموس يحتوي على مفتاح "scenes"
-    وكانت قيمته قائمة، فسنستخرجها. لكن المسار الأساسي هو القائمة المباشرة.
     """
     mapping: Dict[int, Dict[str, Any]] = {}
     if not scene_plan:
@@ -356,10 +421,8 @@ def _map_sentences_to_scenes(
 
     scenes: Optional[List[Dict[str, Any]]] = None
 
-    # المسار الأساسي: قائمة مباشرة (كما تنتجها stage1_generator)
     if isinstance(scene_plan, list):
         scenes = scene_plan
-    # توافق خلفي فقط: قاموس يحتوي "scenes"
     elif isinstance(scene_plan, dict):
         candidate = scene_plan.get("scenes")
         if isinstance(candidate, list):
@@ -380,7 +443,6 @@ def _map_sentences_to_scenes(
         if not isinstance(s_start, int) or not isinstance(s_end, int):
             continue
 
-        # فهارس المرحلة الأولى 0-based
         if s_start < 0 or s_end < s_start:
             continue
 
@@ -440,10 +502,6 @@ def _format_visual_bible(visual_bible: Optional[Dict[str, Any]]) -> str:
 
 
 def _format_creative_brief(creative_brief: Optional[Any]) -> str:
-    """
-    تنسيق آمن للـcreative_brief القادم من المرحلة الأولى.
-    يقبل dict / list / str / أي نوع آخر دون أن يفشل.
-    """
     if not creative_brief:
         return "No creative brief provided. Anchor on the scene-level context and character DNA."
 
@@ -491,72 +549,59 @@ def _format_creative_brief(creative_brief: Optional[Any]) -> str:
 
 
 # =========================================================
-# STRICT PER-PROMPT VALIDATION
+# STRICT PER-PROMPT VALIDATION (ISSUE COLLECTION)
 # =========================================================
-def _validate_single_prompt(
-    prompt: str,
-    expected_index: int,
-    position_in_batch: int,
-    batch_num: int,
-) -> None:
+def _collect_prompt_issues(prompt: str, expected_index: int) -> List[str]:
     """
-    يتحقق من أن الـPrompt:
-    - يبدأ بالبادئة الإلزامية حرفيًا.
-    - يحتوي على كل عناصر Character DNA صراحةً.
-    - يحتوي على عبارة الخلفية الرمادية.
-    - يحتوي على إشارة الركن السفلي الأيمن.
-    - يحتوي على faint أو subtle.
-    - يحتوي على رقم الصورة الصحيح داخل تعليمات الرقم.
-    - لا ينتهي برقم مجرد منفصل.
-    - يحتوي على شرط منع النصوص الأخرى.
-    يرفع ValueError واضحًا عند أول فشل، ويرفض الدفعة كاملة.
+    تُرجع قائمة بكل المخالفات الموجودة في Prompt واحد.
+    إذا كانت القائمة فارغة فمعناه أن الـPrompt سليم تمامًا.
     """
     issues: List[str] = []
     lower = prompt.lower()
 
-    # 1) البادئة الإلزامية حرفيًا
+    # 1) Mandatory literal prefix
     if not prompt.startswith(MANDATORY_PREFIX):
         issues.append(
             f"does not start with the mandatory literal prefix '{MANDATORY_PREFIX}'"
         )
 
-    # 2) عناصر Character DNA
+    # 2) Character DNA tokens
     for token in REQUIRED_CHARACTER_DNA_TOKENS:
         if token.lower() not in lower:
             issues.append(f"missing required character DNA token '{token}'")
 
-    # 3) عبارة الخلفية الرمادية
+    # 3) Background phrase
     if REQUIRED_BACKGROUND_PHRASE.lower() not in lower:
         issues.append(
             f"missing required background phrase '{REQUIRED_BACKGROUND_PHRASE}'"
         )
 
-    # 4) عبارة الركن السفلي الأيمن
+    # 4) Corner phrase
     if REQUIRED_CORNER_PHRASE.lower() not in lower:
         issues.append(
             f"missing required corner phrase '{REQUIRED_CORNER_PHRASE}'"
         )
 
-    # 5) faint أو subtle لوصف الرقم
+    # 5) faint / subtle descriptor
     if not any(tok in lower for tok in REQUIRED_SUBTLE_TOKENS):
         issues.append(
             "missing 'faint' or 'subtle' descriptor for the in-image index number"
         )
 
-    # 6) رقم الصورة الصحيح داخل تعليمات الرقم
+    # 6) Correct index inside the in-image number instruction
     if f'"{expected_index}"' not in prompt:
         issues.append(
             f"does not contain the correct image index '\"{expected_index}\"' "
             "inside the in-image number instruction"
         )
 
-    # 7) ممنوع الانتهاء برقم مجرد منفصل
+    # 7) Forbidden bare trailing number
     if re.search(r"[\s,;]\d+\s*[.!]?\s*$", prompt):
         issues.append(
             "ends with a bare standalone number instead of an in-image number instruction"
         )
 
-    # 8) شرط منع النصوص الأخرى
+    # 8) Anti-text clause
     if not any(tok in lower for tok in REQUIRED_ANTI_TEXT_TOKENS):
         issues.append(
             "missing explicit anti-text clause "
@@ -564,6 +609,57 @@ def _validate_single_prompt(
             "only the required faint image index is allowed')"
         )
 
+    # 9) Conceptual / symbolic / non-literal idea
+    if not any(tok in lower for tok in CONCEPTUAL_KEYWORDS):
+        issues.append(
+            "missing non-literal / conceptual / symbolic visual idea"
+        )
+
+    # 10) Clear character action / pose
+    if not any(tok in lower for tok in ACTION_KEYWORDS):
+        issues.append("missing clear character action / pose / body language")
+
+    # 11) Environment or symbolic visual element placed on/over grey background
+    if not any(tok in lower for tok in ENVIRONMENT_KEYWORDS):
+        issues.append(
+            "missing environment or symbolic visual element placed ON/OVER the grey background"
+        )
+
+    # 12) Emotional state / expression
+    if not any(tok in lower for tok in EMOTION_KEYWORDS):
+        issues.append(
+            "missing emotional state or body-language expression"
+        )
+
+    # 13) Camera angle / shot type
+    if not any(tok in lower for tok in CAMERA_KEYWORDS):
+        issues.append("missing camera angle or shot type")
+
+    # 14) Composition
+    if not any(tok in lower for tok in COMPOSITION_KEYWORDS):
+        issues.append("missing clear visual composition")
+
+    # 15) Lighting / colors
+    if not any(tok in lower for tok in LIGHTING_KEYWORDS):
+        issues.append("missing lighting or color direction")
+
+    # 16) Continuity
+    if not any(tok in lower for tok in CONTINUITY_KEYWORDS):
+        issues.append("missing visual continuity or transition hint")
+
+    return issues
+
+
+def _validate_single_prompt(
+    prompt: str,
+    expected_index: int,
+    position_in_batch: int,
+    batch_num: int,
+) -> None:
+    """
+    تحقق كامل من Prompt واحد. يرفع ValueError مع تفاصيل دقيقة عند أي فشل.
+    """
+    issues = _collect_prompt_issues(prompt, expected_index)
     if issues:
         raise ValueError(
             f"Batch [{batch_num}] prompt #{position_in_batch} "
@@ -580,9 +676,6 @@ def _validate_batch_prompts(
     start_idx: int,
     prompts: List[str],
 ) -> None:
-    """
-    تحقق كامل لكل prompt داخل دفعة واحدة مع تمرير رقم الصورة الصحيح لكل موضع.
-    """
     for offset, prompt in enumerate(prompts):
         expected_index = start_idx + offset
         position_in_batch = offset + 1
@@ -602,12 +695,201 @@ def _validate_batch(batch_idx: int, expected_count: int, prompts: List[str]) -> 
         )
 
 
+# =========================================================
+# PARTIAL REPAIR FOR INVALID PROMPTS ONLY
+# =========================================================
+def _build_repair_request(
+    invalid_items: List[Dict[str, Any]],
+    visual_bible: Any,
+    creative_brief: Any,
+    start_idx: int,
+    end_idx: int,
+) -> str:
+    header = (
+        "This is a fresh independent repair request.\n\n"
+        "Repair ONLY the invalid image-generation prompts listed below.\n"
+        "Do not rewrite, replace, or return any valid prompt.\n"
+        "Return exactly one repaired prompt for each invalid item.\n"
+        "Return the repaired prompts in the same order.\n"
+        "Return prompts separated ONLY by a single blank line.\n"
+        "No JSON.\n"
+        "No markdown.\n"
+        "No headers.\n"
+        "No explanations.\n\n"
+        "Every repaired prompt MUST start EXACTLY with:\n"
+        "Create a 2D cel-shaded illustration showing\n\n"
+    )
+
+    body = f"Batch index range: {start_idx} .. {end_idx}\n\n"
+
+    body += "CREATIVE BRIEF (global narrative anchor):\n"
+    body += _format_creative_brief(creative_brief) + "\n\n"
+
+    body += "VISUAL BIBLE (global style anchor):\n"
+    body += _format_visual_bible(visual_bible) + "\n\n"
+
+    body += "MANDATORY LITERAL CONTENT inside every repaired prompt:\n"
+    body += "- Start with EXACTLY: Create a 2D cel-shaded illustration showing\n"
+    body += (
+        "- Full character DNA spelled out literally: consistent orange muscular character, "
+        "smooth head, two large white oval eyes, no mouth, black shorts, consistent proportions, "
+        "clean 2D cel-shaded illustration style\n"
+    )
+    body += (
+        "- Literal background phrase: plain grey background as the dominant background "
+        "(symbolic elements placed ON/OVER it, not replacing it)\n"
+    )
+    body += (
+        "- In-image number instruction with the CORRECT index for that prompt: "
+        "include the very small, subtle, faint number \"N\" inside the image, "
+        "placed in the bottom-right corner\n"
+    )
+    body += (
+        "- Anti-text clause: no written text, labels, captions, symbols containing letters, "
+        "or extra numbers inside the image; only the required faint image index is allowed\n"
+    )
+    body += "- Conceptual / symbolic (NON-literal) visual idea\n"
+    body += "- Clear character action / pose / body language\n"
+    body += "- Symbolic environment or visual element placed ON/OVER the grey background\n"
+    body += "- Emotional state / expression\n"
+    body += "- Camera angle / shot type\n"
+    body += "- Composition\n"
+    body += "- Lighting / colors when relevant\n"
+    body += "- Continuity with the previous and next scenes\n"
+    body += "- Do NOT end with a bare standalone number.\n\n"
+
+    body += "INVALID PROMPTS TO REPAIR (in order):\n"
+
+    for item in invalid_items:
+        body += "\n---\n"
+        body += f"Image index: {item['absolute_index']}\n"
+        body += f"Sentence: {item['sentence']}\n"
+        body += f"Scene context:\n{item['scene_context']}\n"
+        if item.get("previous_prompt"):
+            body += f"Previous valid prompt (for continuity): {item['previous_prompt']}\n"
+        if item.get("next_prompt"):
+            body += f"Next valid prompt (for continuity): {item['next_prompt']}\n"
+        body += "Issues to fix: " + "; ".join(item["issues"]) + "\n"
+        body += f"Rejected prompt:\n{item['invalid_prompt']}\n"
+
+    body += (
+        "\nReturn ONLY the repaired prompts separated by a single blank line, in order, "
+        "with no headers, no labels, no markdown, no quotes, no JSON, and no commentary."
+    )
+    return header + body
+
+
+def _repair_invalid_prompts(
+    invalid_items: List[Dict[str, Any]],
+    valid_prompts: Dict[int, str],
+    batch_sentences: List[str],
+    start_idx: int,
+    end_idx: int,
+    scene_map: Dict[int, Dict[str, Any]],
+    visual_bible: Any,
+    creative_brief: Any,
+    batch_num: int,
+) -> Dict[int, str]:
+    """
+    تصلح فقط الـPrompts المخالفة عبر طلبات مستقلة، مع إعادة المحاولة حتى
+    MAX_PROMPT_REPAIR_ATTEMPTS. تُرجع قاموساً: absolute_index -> repaired prompt.
+
+    الـPrompts الصحيحة لا تُعاد كتابتها إطلاقاً.
+    """
+    if not invalid_items:
+        return {}
+
+    repaired: Dict[int, str] = {}
+    remaining: List[Dict[str, Any]] = list(invalid_items)
+    attempts = 0
+
+    while remaining and attempts < MAX_PROMPT_REPAIR_ATTEMPTS:
+        attempts += 1
+        logger.info(
+            f"🔧 الدفعة [{batch_num}] محاولة إصلاح {attempts}/{MAX_PROMPT_REPAIR_ATTEMPTS} "
+            f"لـ {len(remaining)} برومبت مخالف."
+        )
+
+        # حدّث معلومات الجوار قبل كل محاولة (بما أن بعض البرومبتات قد تكون
+        # قد أُصلحت في محاولة سابقة فأصبحت جزءًا من valid_prompts).
+        enriched_items: List[Dict[str, Any]] = []
+        for item in remaining:
+            new_item = dict(item)
+            idx = new_item["absolute_index"]
+            if idx - 1 in valid_prompts:
+                new_item["previous_prompt"] = valid_prompts[idx - 1]
+            if idx + 1 in valid_prompts:
+                new_item["next_prompt"] = valid_prompts[idx + 1]
+            enriched_items.append(new_item)
+
+        user_prompt = _build_repair_request(
+            invalid_items=enriched_items,
+            visual_bible=visual_bible,
+            creative_brief=creative_brief,
+            start_idx=start_idx,
+            end_idx=end_idx,
+        )
+
+        raw = call_gemini_with_fallback(
+            system_instruction=STAGE_2_ENRICHED_SYSTEM_PROMPT,
+            user_prompt=user_prompt,
+            response_mime_type="text/plain",
+        )
+        parsed = clean_and_parse_prompts(raw)
+
+        if len(parsed) != len(enriched_items):
+            logger.warning(
+                f"⚠️ الدفعة [{batch_num}] محاولة إصلاح {attempts}: "
+                f"عدد البرومبتات المُعادة ({len(parsed)}) لا يطابق المطلوب "
+                f"({len(enriched_items)}). سيتم إعادة المحاولة."
+            )
+            continue
+
+        still_invalid: List[Dict[str, Any]] = []
+        for i, item in enumerate(enriched_items):
+            candidate = parsed[i]
+            expected_index = item["absolute_index"]
+            candidate_issues = _collect_prompt_issues(candidate, expected_index)
+            if candidate_issues:
+                new_item = dict(item)
+                new_item["issues"] = candidate_issues
+                new_item["invalid_prompt"] = candidate
+                still_invalid.append(new_item)
+            else:
+                repaired[expected_index] = candidate
+
+        if not still_invalid:
+            remaining = []
+        else:
+            remaining = still_invalid
+
+    if remaining:
+        failed_indices = [item["absolute_index"] for item in remaining]
+        details = "\n".join(
+            f"  - index {item['absolute_index']}: " + "; ".join(item["issues"])
+            for item in remaining
+        )
+        raise ValueError(
+            f"Batch [{batch_num}] failed to repair {len(remaining)} prompt(s) "
+            f"after {MAX_PROMPT_REPAIR_ATTEMPTS} attempts. "
+            f"Unrepaired image indices: {failed_indices}.\nDetails:\n{details}"
+        )
+
+    return repaired
+
+
+# =========================================================
+# BATCH PROCESSING
+# =========================================================
 def _process_single_batch(batch_tuple: tuple) -> tuple:
     """
-    معالجة دفعة واحدة في مسار مستقل (Thread) لتأخذ مفتاحاً مستقلاً.
-    batch_tuple يحتوي:
-      (batch_idx, batch_sentences, start_idx, end_idx,
-       scene_map, visual_bible, creative_brief, has_stage1_context)
+    معالجة دفعة واحدة:
+    1) توليد البرومبتات الأساسية.
+    2) فحص كل برومبت.
+    3) تصنيف إلى valid_prompts / invalid_items.
+    4) إصلاح المخالف فقط (بدون المساس بالصحيح).
+    5) إعادة الفحص، ثم إرجاع الدفعة كاملة بترتيبها الأصلي.
+    لا تُرجَع الدفعة إلا بعد أن يصبح كل برومبت صحيحًا.
     """
     (
         batch_idx,
@@ -651,6 +933,7 @@ Each sentence has its own scene context below. Every command MUST:
 - Spell out character DNA and background phrase literally inside the text.
 - Include a correct in-image number instruction with the correct index for that position.
 - Include the anti-text clause literally.
+- Include a clear character action / pose, a symbolic visual element placed on/over the grey background, an emotional state, a camera angle, a clear composition, lighting / color direction, and continuity with adjacent scenes.
 - Evolve across the scene's sentences (establishing → continuation → escalation → reveal → transformation), not repeat identical images.
 
 CREATIVE BRIEF (global narrative anchor):
@@ -665,7 +948,10 @@ SENTENCES AND THEIR SCENE CONTEXTS (the [N] is the correct image index to place 
 """
         for s_idx, sent in enumerate(batch_sentences, start=start_idx):
             scene = scene_map.get(s_idx)
-            user_prompt += f"\n[{s_idx}] Sentence: {sent}\nScene context:\n{_format_scene_context(scene)}\n"
+            user_prompt += (
+                f"\n[{s_idx}] Sentence: {sent}\n"
+                f"Scene context:\n{_format_scene_context(scene)}\n"
+            )
 
         user_prompt += (
             "\nReturn the image generation commands separated ONLY by a single blank line, in order, "
@@ -702,6 +988,7 @@ Reminder:
 - Always include "plain grey background as the dominant background" literally.
 - Always include a correct in-image number instruction: include the very small, subtle, faint number "N" inside the image, placed in the bottom-right corner.
 - Always include the anti-text clause literally.
+- Always include a clear character action / pose, a symbolic visual element placed on/over the grey background, an emotional state, a camera angle, a clear composition, lighting / color direction, and continuity with adjacent scenes.
 - Never end with a bare standalone number.
 
 Sentences (the [N] is the correct image index to place inside the in-image number instruction for that command):
@@ -717,13 +1004,70 @@ Sentences (the [N] is the correct image index to place inside the in-image numbe
 
     prompts = clean_and_parse_prompts(raw_output)
 
-    # تحقق صارم: عدد الـPrompts مطابق لعدد جمل الدفعة
+    # تحقق صارم على العدد الكلي للدفعة قبل التصنيف
     _validate_batch(batch_idx, len(batch_sentences), prompts)
 
-    # تحقق صارم لكل Prompt على حدة
-    _validate_batch_prompts(batch_idx, start_idx, prompts)
+    # ---- تصنيف كل برومبت إلى valid / invalid ----
+    valid_prompts: Dict[int, str] = {}
+    invalid_items: List[Dict[str, Any]] = []
 
-    return batch_idx, prompts
+    for offset, prompt in enumerate(prompts):
+        expected_index = start_idx + offset
+        issues = _collect_prompt_issues(prompt, expected_index)
+
+        if issues:
+            sentence = batch_sentences[offset]
+            scene = scene_map.get(expected_index) if scene_map else None
+            invalid_items.append(
+                {
+                    "absolute_index": expected_index,
+                    "sentence": sentence,
+                    "scene_context": _format_scene_context(scene),
+                    "invalid_prompt": prompt,
+                    "issues": issues,
+                }
+            )
+        else:
+            valid_prompts[expected_index] = prompt
+
+    logger.info(
+        f"📊 الدفعة [{batch_idx}]: {len(valid_prompts)} صحيح، "
+        f"{len(invalid_items)} مخالف يحتاج إصلاحًا."
+    )
+
+    # ---- إصلاح المخالف فقط دون لمس الصحيح ----
+    if invalid_items:
+        repaired = _repair_invalid_prompts(
+            invalid_items=invalid_items,
+            valid_prompts=valid_prompts,
+            batch_sentences=batch_sentences,
+            start_idx=start_idx,
+            end_idx=end_idx,
+            scene_map=scene_map,
+            visual_bible=visual_bible,
+            creative_brief=creative_brief,
+            batch_num=batch_idx,
+        )
+        valid_prompts.update(repaired)
+
+    # ---- إعادة بناء الدفعة بالترتيب الأصلي ----
+    ordered_prompts: List[str] = []
+    for offset in range(len(batch_sentences)):
+        idx = start_idx + offset
+        if idx not in valid_prompts:
+            raise ValueError(
+                f"Batch [{batch_idx}] is missing a valid prompt for image index {idx} "
+                "after repair. Refusing to return an incomplete batch."
+            )
+        ordered_prompts.append(valid_prompts[idx])
+
+    # ---- فحص نهائي صارم قبل الإرجاع ----
+    _validate_batch_prompts(batch_idx, start_idx, ordered_prompts)
+
+    logger.info(
+        f"✅ الدفعة [{batch_idx}] جاهزة ({len(ordered_prompts)} برومبت صحيح)."
+    )
+    return batch_idx, ordered_prompts
 
 
 def generate_stage2_prompts_batches(
@@ -734,12 +1078,14 @@ def generate_stage2_prompts_batches(
     توزيع كافة دفعات أوامر الصور على خيوط متوازية (Parallel Threads).
     كل خيط يحصل تلقائياً على مفتاح مختلف من مصفوفة المفاتيح.
 
-    إذا تم تمرير stage1_result (يحتوي scene_plan / visual_bible / creative_brief)
-    يتم استخدام سياق المرحلة الأولى لتوليد Prompts مفاهيمية غير حرفية
-    تبدأ حرفياً بأمر إنشاء صورة صريح وتحتوي كل العناصر الإلزامية داخل النص.
+    كل دفعة:
+    - تُولَّد.
+    - تُفحص بالكامل.
+    - تُصنَّف إلى صحيحة ومخالفة.
+    - تُصلَح المخالفة فقط في طلبات مستقلة (حتى MAX_PROMPT_REPAIR_ATTEMPTS).
+    - لا تُرجَع إلا بعد نجاح كل برومبت في التحقق الصارم.
 
-    إذا لم يُمرَّر stage1_result أو كان ناقصاً، يتم الرجوع للسلوك القديم (fallback)
-    دون أي فشل، مع الحفاظ على نفس القواعد البصرية والصياغة كأمر إنشاء صورة.
+    أي دفعة يفشل إصلاحها بالكامل تُرفع كـValueError ولا تُحفظ.
     """
     total_sentences = len(sentences)
 
@@ -765,7 +1111,9 @@ def generate_stage2_prompts_batches(
         )
 
     # خريطة الجملة -> المشهد (1-based sentence index -> scene dict)
-    scene_map = _map_sentences_to_scenes(sentences, scene_plan) if has_stage1_context else {}
+    scene_map = (
+        _map_sentences_to_scenes(sentences, scene_plan) if has_stage1_context else {}
+    )
 
     # تجهيز بيانات الدفعات
     batch_tasks = []
@@ -794,7 +1142,8 @@ def generate_stage2_prompts_batches(
 
     with ThreadPoolExecutor(max_workers=min(len(batch_tasks), 4)) as executor:
         future_to_batch = {
-            executor.submit(_process_single_batch, task): task[0] for task in batch_tasks
+            executor.submit(_process_single_batch, task): task[0]
+            for task in batch_tasks
         }
         for future in as_completed(future_to_batch):
             batch_num, prompts = future.result()
