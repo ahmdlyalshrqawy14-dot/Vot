@@ -755,7 +755,7 @@ async def run_stage2_after_approval(query, context):
     ✅ تعمل عند ضغط زر approve_stage1_{ep_id}.
     - تقرأ stage1_res من الجلسة أو من الملف.
     - تستخرج full_script_sentences.
-    - تشغّل generate_stage2_prompts_batches فقط.
+    - تشغّل generate_stage2_prompts_batches مع تمرير stage1_result كاملًا.
     - تحفظ المراسلات وترسل نفس ملفات prompts (بدون أي تغيير).
     - ثم تستمر لواجهة اختيار الصوت (كما كان).
     """
@@ -831,7 +831,12 @@ async def run_stage2_after_approval(query, context):
         prompts_dir = OUTPUTS_DIR / f"episode_{ep_id}_prompts"
         prompts_dir.mkdir(parents=True, exist_ok=True)
 
-        batches = await asyncio.to_thread(generate_stage2_prompts_batches, sentences)
+        # ✅ التعديل الجوهري: تمرير stage1_result كاملًا إلى المرحلة الثانية
+        batches = await asyncio.to_thread(
+            generate_stage2_prompts_batches,
+            sentences,
+            stage1_result=stage1_res,
+        )
 
         if _is_stale(chat_id, session):
             logger.info(f"⛔ تم إيقاف المرحلة 2 للحلقة {ep_id} بسبب /start")
