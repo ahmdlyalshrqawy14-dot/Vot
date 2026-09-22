@@ -1,6 +1,6 @@
 import re
 import logging
-from typing import List, Dict, Any, Optional, Union
+from typing import List, Dict, Any, Optional, Union, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from gemini_engine import call_gemini_with_fallback
@@ -9,7 +9,7 @@ logger = logging.getLogger("Stage2Generator")
 
 
 # =========================================================
-# STRICT VALIDATION CONSTANTS
+# HARD CONSTRAINTS (STRICT — NEVER RELAXED)
 # =========================================================
 MANDATORY_PREFIX = "Create a 2D cel-shaded illustration showing"
 
@@ -24,85 +24,95 @@ REQUIRED_CHARACTER_DNA_TOKENS = [
 
 REQUIRED_BACKGROUND_PHRASE = "plain grey background"
 REQUIRED_CORNER_PHRASE = "bottom-right corner"
-REQUIRED_SUBTLE_TOKENS = ("faint", "subtle")
+REQUIRED_SUBTLE_TOKENS = ("subtle", "faint")
+REQUIRED_SMALL_TOKENS = ("very small", "small", "tiny")
 REQUIRED_ANTI_TEXT_TOKENS = ("no written text", "no text")
 
-# ---------------------------------------------------------
-# Extended semantic keyword groups (used for validation only)
-# These are NEVER added as a raw checklist; they must appear
-# naturally inside a coherent, copy-pasteable image prompt.
-# ---------------------------------------------------------
-CONCEPTUAL_KEYWORDS = (
-    "symbol", "symbolic", "symbolizing", "symbolising", "symbolizes",
-    "metaphor", "metaphorical", "representing", "represents",
-    "conceptual", "conceptually", "allegory", "allegorical",
-    "as if", "as though", "visually conveys", "evokes", "embodies",
-    "serves as", "stands for", "story-driven",
-)
 
-ACTION_KEYWORDS = (
-    "standing", "stands", "walking", "walks", "running", "runs",
-    "stepping", "steps", "climbing", "climbs", "holding", "holds",
-    "reaching", "reaches", "gazing", "gazes", "looking", "looks",
-    "facing", "faces", "turning", "turns", "raising", "raises",
-    "lowering", "lowers", "moving", "moves", "crouching", "crouches",
-    "leaning", "leans", "pushing", "pushes", "pulling", "pulls",
-    "gesture", "gesturing", "pose", "posture", "body language",
-    "arms", "hands", "shoulders",
-)
+# =========================================================
+# FLEXIBLE VISUAL GROUPS (LENIENT — SCORED, NOT HARD-FAILED)
+# A prompt no longer fails just because it lacks the literal word
+# "composition" / "continuity" / "emotion" / "lighting".
+# Instead, we count how many of these 8 semantic groups are covered.
+# =========================================================
+FLEXIBLE_GROUPS: Dict[str, Tuple[str, ...]] = {
+    "conceptual": (
+        "symbol", "symbolic", "symbolizing", "symbolising", "symbolizes",
+        "symbolises", "metaphor", "metaphorical", "representing", "represents",
+        "conceptual", "conceptually", "allegory", "allegorical",
+        "as if", "as though", "visually conveys", "evokes", "embodies",
+        "serves as", "stands for", "story-driven", "illustrates the idea",
+        "communicates", "conveys", "transformation", "progression", "contrast",
+    ),
+    "action": (
+        "standing", "stands", "walking", "walks", "running", "runs",
+        "stepping", "steps", "climbing", "climbs", "holding", "holds",
+        "reaching", "reaches", "gazing", "gazes", "looking", "looks",
+        "facing", "faces", "turning", "turns", "raising", "raises",
+        "lowering", "lowers", "moving", "moves", "crouching", "crouches",
+        "leaning", "leans", "pushing", "pushes", "pulling", "pulls",
+        "gesture", "gesturing", "pointing", "performing", "squatting",
+        "lifting", "observing", "watching", "touching", "pose", "posture",
+        "body language", "arms", "hands", "shoulders",
+    ),
+    "environment": (
+        "on the grey background", "over the grey background",
+        "on the background", "over the background",
+        "placed on", "placed over", "resting on", "emerging from",
+        "rising from", "in front of",
+        "door", "doors", "bridge", "path", "pathway", "stairs", "steps",
+        "wall", "floor", "ground", "platform", "structure", "barrier",
+        "threshold", "gateway", "tunnel", "ladder", "rope", "box",
+        "cage", "mirror", "clock", "mask", "chain", "chains", "rock",
+        "mountain", "river", "weight", "stone", "block", "pillar",
+        "element", "prop", "object", "surface", "environment",
+        "landscape", "scene", "hologram", "joint", "knee", "vault",
+        "statue", "room", "gym", "studio", "background", "visual element",
+    ),
+    "emotion": (
+        "determined", "confused", "tired", "hopeful", "worried", "calm",
+        "frustrated", "curious", "focused", "confident", "anxious",
+        "relieved", "surprised", "thoughtful", "hesitant", "resigned",
+        "eager", "defeated", "proud", "ashamed", "doubtful", "serene",
+        "tense", "relaxed", "emotion", "emotional", "expression",
+        "mood", "feeling", "stance",
+    ),
+    "camera": (
+        "close-up", "close up", "medium shot", "wide shot", "long shot",
+        "side-profile", "side profile", "low-angle", "low angle",
+        "high-angle", "high angle", "overhead", "dutch angle",
+        "camera", "shot", "framing", "angle", "view",
+    ),
+    "composition": (
+        "composition", "centered", "centred", "symmetrical",
+        "character on the left", "character on the right",
+        "foreground", "background depth", "depth", "leading lines",
+        "balanced composition", "balanced", "rule of thirds",
+        "framed", "framing",
+    ),
+    "lighting": (
+        "lighting", "light", "rim light", "soft light", "directional light",
+        "high contrast", "cinematic lighting", "muted", "warm light",
+        "cool light", "color palette", "colour palette", "palette",
+        "gold", "shadow", "shadows", "glow", "glowing", "tones",
+        "color", "colour", "blue", "red", "warm", "cool", "bright",
+        "dark", "contrast", "illuminated",
+    ),
+    "continuity": (
+        "continuing", "continuation", "continuity", "matching the previous",
+        "evolving from", "preparing for the next", "preserving the same",
+        "previous shot", "previous image", "next shot", "next image",
+        "same visual world", "same environment", "next transformation",
+        "same symbol", "same setting", "same world", "preserving",
+        "evolving", "previous", "next", "transition", "transformation",
+        "progression", "sequence",
+    ),
+}
 
-ENVIRONMENT_KEYWORDS = (
-    "on the grey background", "over the grey background",
-    "on the background", "over the background",
-    "placed on", "placed over", "resting on", "emerging from",
-    "rising from", "in front of",
-    "door", "doors", "bridge", "path", "pathway", "stairs", "steps",
-    "wall", "floor", "ground", "platform", "structure", "barrier",
-    "threshold", "gateway", "tunnel", "ladder", "rope", "box",
-    "cage", "mirror", "clock", "mask", "chain", "chains", "rock",
-    "mountain", "river", "weight", "stone", "block", "pillar",
-    "element", "prop", "object", "surface", "environment",
-    "landscape", "scene",
-)
-
-EMOTION_KEYWORDS = (
-    "determined", "confused", "tired", "hopeful", "worried", "calm",
-    "frustrated", "curious", "focused", "confident", "anxious",
-    "relieved", "surprised", "thoughtful", "hesitant", "resigned",
-    "eager", "defeated", "proud", "ashamed", "doubtful", "serene",
-    "tense", "relaxed", "emotion", "emotional", "expression",
-    "mood", "feeling",
-)
-
-CAMERA_KEYWORDS = (
-    "close-up", "close up", "medium shot", "wide shot", "long shot",
-    "side-profile", "side profile", "low-angle", "low angle",
-    "high-angle", "high angle", "overhead", "dutch angle",
-    "camera", "shot", "framing", "angle",
-)
-
-COMPOSITION_KEYWORDS = (
-    "composition", "centered", "centred", "symmetrical",
-    "character on the left", "character on the right",
-    "foreground", "background depth", "depth", "leading lines",
-    "balanced composition", "balanced", "rule of thirds",
-    "framed", "framing",
-)
-
-LIGHTING_KEYWORDS = (
-    "lighting", "light", "rim light", "soft light", "directional light",
-    "high contrast", "cinematic lighting", "muted", "warm light",
-    "cool light", "color palette", "colour palette", "palette",
-    "gold", "shadow", "shadows", "glow", "tones",
-)
-
-CONTINUITY_KEYWORDS = (
-    "continuing", "continuity", "matching the previous",
-    "evolving from", "preparing for the next", "preserving the same",
-    "previous shot", "previous image", "next shot", "next image",
-    "same visual world", "same environment", "next transformation",
-    "same symbol", "same setting", "same world",
-)
+# Acceptance rules for the flexible creative score:
+MIN_FLEXIBLE_GROUPS = 5
+REQUIRED_FLEXIBLE_GROUPS = ("action", "environment")
+REQUIRED_ONE_OF = ("conceptual", "emotion", "camera")
 
 
 STAGE_2_SYSTEM_PROMPT = """You are an expert AI Art Director and Visual Storyboard Artist. Your task is to generate explicit IMAGE GENERATION COMMANDS for an educational YouTube video based on a sequential list of script sentences.
@@ -549,12 +559,12 @@ def _format_creative_brief(creative_brief: Optional[Any]) -> str:
 
 
 # =========================================================
-# STRICT PER-PROMPT VALIDATION (ISSUE COLLECTION)
+# HARD CONSTRAINT CHECK (STRICT — 100%, NO RELAXATION)
 # =========================================================
-def _collect_prompt_issues(prompt: str, expected_index: int) -> List[str]:
+def _check_hard_constraints(prompt: str, expected_index: int) -> List[str]:
     """
-    تُرجع قائمة بكل المخالفات الموجودة في Prompt واحد.
-    إذا كانت القائمة فارغة فمعناه أن الـPrompt سليم تمامًا.
+    فحص الشروط الحاكمة الصارمة فقط.
+    أي فشل هنا يعني رفض الـPrompt مباشرة (بدون مساحة إبداعية).
     """
     issues: List[str] = []
     lower = prompt.lower()
@@ -582,26 +592,32 @@ def _collect_prompt_issues(prompt: str, expected_index: int) -> List[str]:
             f"missing required corner phrase '{REQUIRED_CORNER_PHRASE}'"
         )
 
-    # 5) faint / subtle descriptor
+    # 5) Small descriptor for the in-image index ("very small")
+    if not any(tok in lower for tok in REQUIRED_SMALL_TOKENS):
+        issues.append(
+            "missing 'very small' descriptor for the in-image index number"
+        )
+
+    # 6) Subtle / faint descriptor
     if not any(tok in lower for tok in REQUIRED_SUBTLE_TOKENS):
         issues.append(
             "missing 'faint' or 'subtle' descriptor for the in-image index number"
         )
 
-    # 6) Correct index inside the in-image number instruction
+    # 7) Correct index inside the in-image number instruction
     if f'"{expected_index}"' not in prompt:
         issues.append(
             f"does not contain the correct image index '\"{expected_index}\"' "
             "inside the in-image number instruction"
         )
 
-    # 7) Forbidden bare trailing number
+    # 8) Forbidden bare trailing number
     if re.search(r"[\s,;]\d+\s*[.!]?\s*$", prompt):
         issues.append(
             "ends with a bare standalone number instead of an in-image number instruction"
         )
 
-    # 8) Anti-text clause
+    # 9) Anti-text clause
     if not any(tok in lower for tok in REQUIRED_ANTI_TEXT_TOKENS):
         issues.append(
             "missing explicit anti-text clause "
@@ -609,45 +625,76 @@ def _collect_prompt_issues(prompt: str, expected_index: int) -> List[str]:
             "only the required faint image index is allowed')"
         )
 
-    # 9) Conceptual / symbolic / non-literal idea
-    if not any(tok in lower for tok in CONCEPTUAL_KEYWORDS):
-        issues.append(
-            "missing non-literal / conceptual / symbolic visual idea"
-        )
-
-    # 10) Clear character action / pose
-    if not any(tok in lower for tok in ACTION_KEYWORDS):
-        issues.append("missing clear character action / pose / body language")
-
-    # 11) Environment or symbolic visual element placed on/over grey background
-    if not any(tok in lower for tok in ENVIRONMENT_KEYWORDS):
-        issues.append(
-            "missing environment or symbolic visual element placed ON/OVER the grey background"
-        )
-
-    # 12) Emotional state / expression
-    if not any(tok in lower for tok in EMOTION_KEYWORDS):
-        issues.append(
-            "missing emotional state or body-language expression"
-        )
-
-    # 13) Camera angle / shot type
-    if not any(tok in lower for tok in CAMERA_KEYWORDS):
-        issues.append("missing camera angle or shot type")
-
-    # 14) Composition
-    if not any(tok in lower for tok in COMPOSITION_KEYWORDS):
-        issues.append("missing clear visual composition")
-
-    # 15) Lighting / colors
-    if not any(tok in lower for tok in LIGHTING_KEYWORDS):
-        issues.append("missing lighting or color direction")
-
-    # 16) Continuity
-    if not any(tok in lower for tok in CONTINUITY_KEYWORDS):
-        issues.append("missing visual continuity or transition hint")
-
     return issues
+
+
+# =========================================================
+# FLEXIBLE VISUAL QUALITY CHECK (LENIENT — SCORED, NOT HARD-FAILED)
+# =========================================================
+def _check_flexible_visual(
+    prompt: str,
+) -> Tuple[int, List[str], List[str], bool]:
+    """
+    ترجع:
+      (matched_count, matched_groups, missing_groups, has_required_combination)
+
+    - matched_count: عدد المجموعات الإبداعية الثمانية المحققة.
+    - has_required_combination: True إذا تحققت action + environment
+      وأيضًا واحدة على الأقل من (conceptual / emotion / camera).
+    """
+    lower = prompt.lower()
+
+    matched: List[str] = []
+    missing: List[str] = []
+
+    for group_name, keywords in FLEXIBLE_GROUPS.items():
+        if any(kw in lower for kw in keywords):
+            matched.append(group_name)
+        else:
+            missing.append(group_name)
+
+    has_required_combination = (
+        all(g in matched for g in REQUIRED_FLEXIBLE_GROUPS)
+        and any(g in matched for g in REQUIRED_ONE_OF)
+    )
+
+    return len(matched), matched, missing, has_required_combination
+
+
+def _collect_prompt_issues(prompt: str, expected_index: int) -> List[str]:
+    """
+    تُرجع قائمة بكل المخالفات الموجودة في Prompt واحد.
+
+    - أولًا: الشروط الحاكمة الصارمة (أي فشل هنا => رفض مباشر).
+    - ثانيًا: الجودة الإبداعية المرنة (يجب تحقيق 5/8 على الأقل،
+      مع اشتراط action + environment + واحدة على الأقل من conceptual/emotion/camera).
+
+    إذا كانت القائمة فارغة فمعناه أن الـPrompt سليم تمامًا.
+    """
+    # --- 1) Hard constraints (strict, no flexibility) ---
+    hard_issues = _check_hard_constraints(prompt, expected_index)
+    if hard_issues:
+        return ["Hard constraint failure: " + "; ".join(hard_issues)]
+
+    # --- 2) Flexible visual quality (scored) ---
+    matched_count, matched, missing, has_required_combination = _check_flexible_visual(prompt)
+
+    if matched_count < MIN_FLEXIBLE_GROUPS or not has_required_combination:
+        lines = [
+            "Flexible visual quality score too low:",
+            f"matched_groups = {matched_count}/8",
+        ]
+        if missing:
+            lines.append(f"missing_groups = {missing}")
+        lines.append(f"required_minimum = {MIN_FLEXIBLE_GROUPS}")
+        if not has_required_combination:
+            lines.append(
+                "missing required group combination: "
+                "action + environment + at least one of (conceptual, emotion, camera)"
+            )
+        return ["\n".join(lines)]
+
+    return []
 
 
 def _validate_single_prompt(
@@ -664,7 +711,7 @@ def _validate_single_prompt(
         raise ValueError(
             f"Batch [{batch_num}] prompt #{position_in_batch} "
             f"(expected image index {expected_index}) failed strict validation: "
-            + "; ".join(issues)
+            + " | ".join(issues)
             + "\n--- INVALID PROMPT ---\n"
             + prompt
             + "\n----------------------"
@@ -769,7 +816,7 @@ def _build_repair_request(
             body += f"Previous valid prompt (for continuity): {item['previous_prompt']}\n"
         if item.get("next_prompt"):
             body += f"Next valid prompt (for continuity): {item['next_prompt']}\n"
-        body += "Issues to fix: " + "; ".join(item["issues"]) + "\n"
+        body += "Issues to fix: " + " | ".join(item["issues"]) + "\n"
         body += f"Rejected prompt:\n{item['invalid_prompt']}\n"
 
     body += (
@@ -866,7 +913,7 @@ def _repair_invalid_prompts(
     if remaining:
         failed_indices = [item["absolute_index"] for item in remaining]
         details = "\n".join(
-            f"  - index {item['absolute_index']}: " + "; ".join(item["issues"])
+            f"  - index {item['absolute_index']}: " + " | ".join(item["issues"])
             for item in remaining
         )
         raise ValueError(
@@ -885,7 +932,7 @@ def _process_single_batch(batch_tuple: tuple) -> tuple:
     """
     معالجة دفعة واحدة:
     1) توليد البرومبتات الأساسية.
-    2) فحص كل برومبت.
+    2) فحص كل برومبت (شروط صارمة + جودة إبداعية مرنة).
     3) تصنيف إلى valid_prompts / invalid_items.
     4) إصلاح المخالف فقط (بدون المساس بالصحيح).
     5) إعادة الفحص، ثم إرجاع الدفعة كاملة بترتيبها الأصلي.
@@ -1080,10 +1127,10 @@ def generate_stage2_prompts_batches(
 
     كل دفعة:
     - تُولَّد.
-    - تُفحص بالكامل.
+    - تُفحص بالكامل (شروط صارمة + جودة إبداعية مرنة).
     - تُصنَّف إلى صحيحة ومخالفة.
     - تُصلَح المخالفة فقط في طلبات مستقلة (حتى MAX_PROMPT_REPAIR_ATTEMPTS).
-    - لا تُرجَع إلا بعد نجاح كل برومبت في التحقق الصارم.
+    - لا تُرجَع إلا بعد نجاح كل برومبت في التحقق.
 
     أي دفعة يفشل إصلاحها بالكامل تُرفع كـValueError ولا تُحفظ.
     """
