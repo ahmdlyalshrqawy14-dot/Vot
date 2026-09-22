@@ -3,6 +3,7 @@ import json
 import shutil
 import asyncio
 import logging
+import html
 from pathlib import Path
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
@@ -75,6 +76,10 @@ def _fresh_session():
         "voice": None,
         "cancelled": False,
         "token": object(),
+        # ── حالة المرحلة الأولى (تدفق جديد بمرحلتين) ──
+        "stage1_result": None,
+        "stage1_approved": False,
+        "stage1_plan_message_id": None,
         # ── حالة التعيين اليدوي (Manual Assignment) ──
         "manual_map": {},                 # {int(slot): Path}
         "manual_queue": [],               # [Path, ...]
@@ -115,6 +120,85 @@ def _cancel_user_task(chat_id):
         except Exception as e:
             logger.warning(f"فشل إلغاء الـ Task: {e}")
     return False
+
+
+# =================================================================
+# ✅ [جديد] أدوات التنسيق الآمن لرسائل Telegram (HTML-Safe)
+# =================================================================
+def _esc(val, fallback: str = "—") -> str:
+    """يهرّب أي قيمة قادمة من النموذج قبل وضعها في رسائل HTML."""
+    if val is None:
+        return fallback
+    try:
+        s = str(val)
+    except Exception:
+        return fallback
+    if not s.strip():
+        return fallback
+    return html.escape(s)
+
+
+def _as_list(val):
+    return val if isinstance(val, list) else []
+
+
+def _as_dict(val):
+    return val if isinstance(val, dict) else {}
+
+
+def _build_stage1_summary(ep_id, episode, stage1_res) -> str:
+    """يبني رسالة ملخص المرحلة الأولى (HTML Safe)."""
+    if not isinstance(stage1_res, dict):
+        stage1_res = {}
+
+    cb = _as_dict(stage1_res.get("creative_brief"))
+    rp = _as_dict(stage1_res.get("retention_plan"))
+    qr = _as_dict(stage1_res.get("quality_report"))
+
+    scene_plan = _as_list(stage1_res.get("scene_plan"))
+    open_loops = _as_list(rp.get("open_loops"))
+    pattern_interrupts = _as_list(rp.get("pattern_interrupts"))
+    sentences = _as_list(stage1_res.get("full_script_sentences"))
+
+    words_cnt = stage1_res.get("total_word_count", 0)
+    try:
+        words_cnt_int = int(words_cnt)
+    except Exception:
+        words_cnt_int = 0
+
+    approved = bool(qr.get("approved"))
+    approved_tag = "✅ نعم" if approved else "⚠️ لا"
+
+    topic = _esc(episode.get("topic", "—")) if isinstance(episode, dict) else "—"
+
+    lines = [
+        f"<b>📋 ملخص المرحلة الأولى — الحلقة #{_esc(ep_id)}</b>",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"📌 <b>الموضوع:</b> {topic}",
+        f"📝 <b>عدد الكلمات:</b> <code>{words_cnt_int}</code>",
+        f"🧩 <b>عدد الجمل:</b> <code>{len(sentences)}</code>",
+        f"🎬 <b>عدد المشاهد في الخطة:</b> <code>{len(scene_plan)}</code>",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "<b>🧠 الفكرة الإبداعية (Creative Brief)</b>",
+        f"├ 💡 <b>الفكرة الأساسية:</b> {_esc(cb.get('core_idea'))}",
+        f"├ 🎯 <b>الزاوية الفريدة:</b> {_esc(cb.get('unique_angle'))}",
+        f"├ 🎞️ <b>صيغة الحلقة:</b> {_esc(cb.get('episode_format'))}",
+        f"└ 🎁 <b>مخرجات المشاهد:</b> {_esc(cb.get('viewer_outcome'))}",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "<b>🪝 الخطاف (Hook)</b>",
+        f"{_esc(stage1_res.get('hook'))}",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "<b>📈 خطة الاحتفاظ (Retention Plan)</b>",
+        f"├ 🎣 <b>استراتيجية الخطاف:</b> {_esc(rp.get('hook_strategy'))}",
+        f"├ 🔁 <b>عدد الحلقات المفتوحة:</b> <code>{len(open_loops)}</code>",
+        f"├ ⚡ <b>عدد مقاطعات النمط:</b> <code>{len(pattern_interrupts)}</code>",
+        f"└ 🎁 <b>المكافأة النهائية:</b> {_esc(rp.get('payoff'))}",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"<b>✅ تقرير الجودة:</b> معتمد = {approved_tag}",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "هل تود اعتماد هذه الخطة والانتقال إلى <b>المرحلة الثانية</b>؟",
+    ]
+    return "\n".join(lines)
 
 
 # =================================================================
@@ -271,7 +355,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         msg = "<b>📋 قائمة الحلقات المسجلة في السيرفر:</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         for ep in episodes[:10]:
             st = "🟡 انتظار" if ep.get("status") == "pending" else "🟢 مكتملة"
-            msg += f"• <b>ID [{ep.get('id')}]:</b> {ep.get('topic')}\n   └ الحالة: {st}\n"
+            msg += f"• <b>ID [{ep.get('id')}]:</b> {_esc(ep.get('topic'))}\n   └ الحالة: {st}\n"
 
         buttons = [
             [InlineKeyboardButton("▶️ بدء الحلقة التالية المجدولة", callback_data="btn_start_next")],
@@ -284,13 +368,98 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     elif data == "btn_back_main":
         await start_command(query, context)
 
-    # ── 4) تأكيد بدء إنتاج حلقة معينة ──
+    # ── 4) تأكيد بدء إنتاج حلقة معينة → الآن يشغّل المرحلة الأولى فقط ──
     elif data.startswith("confirm_ep_"):
         target_id = data.replace("confirm_ep_", "")
         ep = get_episode(target_id)
         if ep:
+            _cancel_user_task(chat_id)
             user_tasks[chat_id] = asyncio.create_task(
-                run_stage1_and_2(query, context, ep)
+                run_stage1_only(query, context, ep)
+            )
+
+    # ── 4.b) ✅ جديد: اعتماد المرحلة الأولى → تشغيل المرحلة الثانية (مع تحقق آمن) ──
+    elif data.startswith("approve_stage1_"):
+        target_id = data.replace("approve_stage1_", "")
+        active_id = session.get("episode_id")
+
+        # (1) تحقق أن الزر يخص الحلقة النشطة حالياً
+        if not active_id or str(active_id) != str(target_id):
+            logger.warning(
+                f"⚠️ approve_stage1 قديم/غير مطابق | target={target_id} | active={active_id}"
+            )
+            try:
+                await query.answer(
+                    "⚠️ هذا الزر لا يخص الحلقة النشطة الحالية.",
+                    show_alert=True,
+                )
+            except Exception:
+                pass
+            try:
+                await query.edit_message_text(
+                    "⚠️ <b>زر الاعتماد قديم أو لا يخص الحلقة النشطة حالياً.</b>\n"
+                    "تم تجاهل الطلب دون أي تغيير في الجلسة.\n"
+                    "استخدم /start لبدء حلقة جديدة.",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
+            return
+
+        # (2) تحقق أن المرحلة الثانية ليست معتمدة/قيد التنفيذ مسبقاً
+        if session.get("stage1_approved") is True:
+            logger.info(f"⏩ تم اعتماد المرحلة مسبقاً للحلقة {target_id}")
+            try:
+                await query.answer(
+                    "ℹ️ تم اعتماد هذه المرحلة مسبقاً بالفعل.",
+                    show_alert=True,
+                )
+            except Exception:
+                pass
+            return
+
+        # (3) تحقق من وجود بيانات المرحلة الأولى (dict في الجلسة أو ملف على القرص)
+        stage1_res = session.get("stage1_result")
+        has_stage1_in_session = isinstance(stage1_res, dict)
+        s1_file = OUTPUTS_DIR / f"stage1_episode_{target_id}.json"
+        has_stage1_on_disk = s1_file.exists()
+
+        if not has_stage1_in_session and not has_stage1_on_disk:
+            logger.warning(
+                f"⚠️ لا توجد بيانات مرحلة أولى للحلقة {target_id} "
+                f"(session={has_stage1_in_session}, disk={has_stage1_on_disk})"
+            )
+            try:
+                await query.answer(
+                    "⚠️ لا توجد بيانات مرحلة أولى معتمدة لهذه الحلقة.",
+                    show_alert=True,
+                )
+            except Exception:
+                pass
+            try:
+                await query.edit_message_text(
+                    "❌ <b>لا توجد بيانات مرحلة أولى صالحة لهذه الحلقة.</b>\n"
+                    "الرجاء إعادة توليد المرحلة الأولى عبر /start.",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
+            return
+
+        # ✅ بعد نجاح التحقق الكامل: شغّل المرحلة الثانية
+        _cancel_user_task(chat_id)
+        user_tasks[chat_id] = asyncio.create_task(
+            run_stage2_after_approval(query, context)
+        )
+
+    # ── 4.c) ✅ جديد: إعادة توليد المرحلة الأولى ──
+    elif data.startswith("regenerate_stage1_"):
+        target_id = data.replace("regenerate_stage1_", "")
+        ep = session.get("episode_data") or get_episode(target_id)
+        if ep:
+            _cancel_user_task(chat_id)
+            user_tasks[chat_id] = asyncio.create_task(
+                run_stage1_only(query, context, ep)
             )
 
     # ── 5) معاينة صوت (Voice Preview) — لا تغيّر حالة الجلسة ──
@@ -422,16 +591,16 @@ async def show_episode_confirmation(query, ep):
     card_text = (
         f"<b>🎯 بطاقة بيانات الحلقة المحددة</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🆔 <b>رقم الحلقة:</b> <code>{ep_id}</code>\n"
-        f"📌 <b>الموضوع:</b> <b>{topic}</b>\n"
-        f"💡 <b>الخرافة المستهدفة:</b> <i>{myth}</i>\n"
+        f"🆔 <b>رقم الحلقة:</b> <code>{_esc(ep_id)}</code>\n"
+        f"📌 <b>الموضوع:</b> <b>{_esc(topic)}</b>\n"
+        f"💡 <b>الخرافة المستهدفة:</b> <i>{_esc(myth)}</i>\n"
         f"📊 <b>الحالة الحالية:</b> {status_tag}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"هل تود بدء دورة الإنتاج الآلي لهذه الحلقة؟"
+        f"هل تود بدء <b>المرحلة الأولى</b> (السكربت + الخطة الإبداعية) لهذه الحلقة؟"
     )
 
     keyboard = [
-        [InlineKeyboardButton("🚀 تأكيد وبدء الإنتاج الآن", callback_data=f"confirm_ep_{ep_id}")],
+        [InlineKeyboardButton("🚀 تأكيد وبدء المرحلة الأولى", callback_data=f"confirm_ep_{ep_id}")],
         [InlineKeyboardButton("❌ إلغاء والعودة للقائمة", callback_data="btn_back_main")],
     ]
     await query.edit_message_text(
@@ -461,14 +630,14 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             card_text = (
                 f"<b>🎯 تم العثور على الحلقة بنجاح!</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"🆔 <b>رقم الحلقة:</b> <code>{ep_id}</code>\n"
-                f"📌 <b>الموضوع:</b> <b>{ep.get('topic')}</b>\n"
-                f"💡 <b>الخرافة:</b> <i>{ep.get('the_myth')}</i>\n"
+                f"🆔 <b>رقم الحلقة:</b> <code>{_esc(ep_id)}</code>\n"
+                f"📌 <b>الموضوع:</b> <b>{_esc(ep.get('topic'))}</b>\n"
+                f"💡 <b>الخرافة:</b> <i>{_esc(ep.get('the_myth'))}</i>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"جاهز للبدء؟"
             )
             keyboard = [
-                [InlineKeyboardButton("🚀 تأكيد وبدء الإنتاج الآن", callback_data=f"confirm_ep_{ep_id}")],
+                [InlineKeyboardButton("🚀 تأكيد وبدء المرحلة الأولى", callback_data=f"confirm_ep_{ep_id}")],
                 [InlineKeyboardButton("❌ إلغاء والعودة", callback_data="btn_back_main")],
             ]
             await update.message.reply_text(
@@ -478,42 +647,49 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
         else:
             await update.message.reply_text(
-                f"❌ لم يتم العثور على حلقة برقم ID <code>{entered_text}</code>.\n"
+                f"❌ لم يتم العثور على حلقة برقم ID <code>{_esc(entered_text)}</code>.\n"
                 f"تأكد من الرقم وحاول مجدداً، أو اضغط /start للعودة للقائمة.",
                 parse_mode=ParseMode.HTML,
             )
 
 
 # =================================================================
-# 4. المراحل 1 + 2
+# 4. ✅ [معدّل] المرحلة الأولى فقط + عرض الخطة واعتماد المستخدم
 # =================================================================
 
-async def run_stage1_and_2(query, context, episode):
+async def run_stage1_only(query, context, episode):
+    """
+    ✅ يشغّل المرحلة الأولى فقط (سكربت + خطة إبداعية)،
+    يحفظ JSON، يخزّن النتيجة في الجلسة، ثم يعرض الملخص + أزرار الاعتماد.
+    لا يشغّل المرحلة الثانية تلقائيًا.
+    """
     chat_id = query.message.chat_id
     session = get_session(chat_id)
     ep_id = str(episode.get("id", "201"))
 
+    # تحديث الجلسة وتصفير حقول المرحلة الأولى
     session["episode_id"] = ep_id
     session["episode_data"] = episode
     session["uploaded_count"] = 0
+    session["stage1_approved"] = False
+    session["stage1_result"] = None
 
     if _is_stale(chat_id, session):
         return
 
     status_card = (
-        f"<b>⚙️ جاري معالجة الحلقة #{ep_id}</b>\n"
+        f"<b>⚙️ [ 1/2 ] جاري تشغيل المرحلة الأولى للحلقة #{_esc(ep_id)}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"⏳ <b>[ 1/5 ]</b> توليد السكربت الإنجليزي وهندسة الجمل القصيرة...\n"
-        f"⚪ <b>[ 2/5 ]</b> توليد وتجزئة أوامر الصور (24 لكل ملف)\n"
-        f"⚪ <b>[ 3/5 ]</b> التعليق الصوتي التعبيري\n"
-        f"⚪ <b>[ 4/5 ]</b> المونتاج والدمج الآلي (FFmpeg)\n"
-        f"⚪ <b>[ 5/5 ]</b> التغليف والنشر الرقمي\n"
+        f"⏳ توليد السكربت الإنجليزي + هندسة الجمل القصيرة + الخطة الإبداعية...\n"
+        f"<i>لن تبدأ المرحلة الثانية حتى تعتمد الخطة بنفسك.</i>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     )
     try:
         status_msg = await query.edit_message_text(status_card, parse_mode=ParseMode.HTML)
     except Exception:
         return
+
+    session["stage1_plan_message_id"] = status_msg.message_id
 
     try:
         stage1_res = await asyncio.to_thread(generate_stage1_script, episode)
@@ -522,25 +698,34 @@ async def run_stage1_and_2(query, context, episode):
             logger.info(f"⛔ تم إيقاف المرحلة 1 للحلقة {ep_id} بسبب /start")
             return
 
+        # حفظ JSON بنفس المسار والاسم
         s1_file = OUTPUTS_DIR / f"stage1_episode_{ep_id}.json"
         with open(s1_file, "w", encoding="utf-8") as f:
             json.dump(stage1_res, f, ensure_ascii=False, indent=2)
 
-        sentences = stage1_res.get("full_script_sentences", [])
-        words_cnt = stage1_res.get("total_word_count", 0)
+        sentences = _as_list(stage1_res.get("full_script_sentences"))
+        session["stage1_result"] = stage1_res
         session["sentences"] = sentences
 
-        status_card = (
-            f"<b>⚙️ جاري معالجة الحلقة #{ep_id}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"✅ <b>[ 1/5 ]</b> تم إنتاج السكربت ({words_cnt} كلمة | {len(sentences)} جملة)\n"
-            f"⏳ <b>[ 2/5 ]</b> جاري صياغة أوامر الصور وتجزئتها بدقة (1:1)...\n"
-            f"⚪ <b>[ 3/5 ]</b> التعليق الصوتي التعبيري\n"
-            f"⚪ <b>[ 4/5 ]</b> المونتاج والدمج الآلي (FFmpeg)\n"
-            f"⚪ <b>[ 5/5 ]</b> التغليف والنشر الرقمي\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        summary_text = _build_stage1_summary(ep_id, episode, stage1_res)
+
+        keyboard = [
+            [InlineKeyboardButton(
+                "✅ اعتماد الخطة والانتقال للمرحلة الثانية",
+                callback_data=f"approve_stage1_{ep_id}",
+            )],
+            [InlineKeyboardButton(
+                "🔄 إعادة توليد المرحلة الأولى",
+                callback_data=f"regenerate_stage1_{ep_id}",
+            )],
+            [InlineKeyboardButton("❌ إلغاء والعودة للقائمة", callback_data="btn_back_main")],
+        ]
+
+        await status_msg.edit_text(
+            summary_text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.HTML,
         )
-        await status_msg.edit_text(status_card, parse_mode=ParseMode.HTML)
 
     except asyncio.CancelledError:
         logger.info(f"🛑 تم إلغاء المرحلة 1 للحلقة {ep_id}")
@@ -548,10 +733,98 @@ async def run_stage1_and_2(query, context, episode):
     except Exception as e:
         if _is_stale(chat_id, session):
             return
-        await status_msg.edit_text(
-            f"❌ <b>خطأ أثناء توليد السكربت:</b>\n<code>{str(e)}</code>",
-            parse_mode=ParseMode.HTML,
-        )
+        logger.exception(f"خطأ في المرحلة الأولى للحلقة {ep_id}")
+        try:
+            await status_msg.edit_text(
+                f"❌ <b>خطأ أثناء توليد المرحلة الأولى:</b>\n"
+                f"<code>{_esc(str(e))}</code>\n\n"
+                f"<i>يمكنك إعادة المحاولة عبر /start.</i>",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        return
+
+
+# =================================================================
+# 4.b ✅ [معدّل] المرحلة الثانية — تُشغّل فقط بعد اعتماد المستخدم
+# =================================================================
+
+async def run_stage2_after_approval(query, context):
+    """
+    ✅ تعمل عند ضغط زر approve_stage1_{ep_id}.
+    - تقرأ stage1_res من الجلسة أو من الملف.
+    - تستخرج full_script_sentences.
+    - تشغّل generate_stage2_prompts_batches فقط.
+    - تحفظ المراسلات وترسل نفس ملفات prompts (بدون أي تغيير).
+    - ثم تستمر لواجهة اختيار الصوت (كما كان).
+    """
+    chat_id = query.message.chat_id
+    session = get_session(chat_id)
+    ep_id = session.get("episode_id")
+
+    if _is_stale(chat_id, session):
+        return
+
+    if not ep_id:
+        try:
+            await query.edit_message_text("⚠️ لا توجد حلقة نشطة. اضغط /start للبدء.")
+        except Exception:
+            pass
+        return
+
+    # ── استرجاع نتيجة المرحلة الأولى من الجلسة أو من الملف ──
+    stage1_res = session.get("stage1_result")
+    if not isinstance(stage1_res, dict):
+        s1_file = OUTPUTS_DIR / f"stage1_episode_{ep_id}.json"
+        if s1_file.exists():
+            try:
+                with open(s1_file, "r", encoding="utf-8") as f:
+                    stage1_res = json.load(f)
+                session["stage1_result"] = stage1_res
+            except Exception as e:
+                logger.error(f"فشل قراءة stage1_episode_{ep_id}.json: {e}")
+                stage1_res = None
+
+    if not isinstance(stage1_res, dict):
+        try:
+            await query.edit_message_text(
+                "❌ <b>تعذّر العثور على بيانات المرحلة الأولى.</b>\n"
+                "الرجاء إعادة توليد المرحلة الأولى من جديد.",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        return
+
+    sentences = _as_list(stage1_res.get("full_script_sentences"))
+    if not sentences:
+        sentences = session.get("sentences") or []
+
+    if not sentences:
+        try:
+            await query.edit_message_text(
+                "❌ <b>لا توجد جمل صالحة لتشغيل المرحلة الثانية.</b>\n"
+                "الرجاء إعادة توليد المرحلة الأولى.",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        return
+
+    session["sentences"] = sentences
+    session["stage1_approved"] = True
+
+    status_card = (
+        f"<b>⚙️ [ 2/2 ] جاري تشغيل المرحلة الثانية للحلقة #{_esc(ep_id)}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"✅ تم اعتماد خطة المرحلة الأولى.\n"
+        f"⏳ جاري صياغة أوامر الصور وتجزئتها بدقة (1:1)...\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    )
+    try:
+        status_msg = await query.edit_message_text(status_card, parse_mode=ParseMode.HTML)
+    except Exception:
         return
 
     try:
@@ -564,6 +837,7 @@ async def run_stage1_and_2(query, context, episode):
             logger.info(f"⛔ تم إيقاف المرحلة 2 للحلقة {ep_id} بسبب /start")
             return
 
+        # ── حفظ وإرسال نفس ملفات prompts (نفس المنطق) ──
         for idx, batch in enumerate(batches, start=1):
             if _is_stale(chat_id, session):
                 return
@@ -586,14 +860,19 @@ async def run_stage1_and_2(query, context, episode):
         if _is_stale(chat_id, session):
             return
 
-        status_card = (
-            f"<b>✅ اكتملت المرحلتان (1 و 2) بنجاح!</b>\n"
+        done_card = (
+            f"<b>✅ اكتملت المرحلة الثانية بنجاح!</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📝 <b>إجمالي الجمل المولدة:</b> <code>{len(sentences)}</code> جملة.\n"
+            f"📝 <b>إجمالي الجمل:</b> <code>{len(sentences)}</code> جملة.\n"
             f"📦 <b>الملفات النصية:</b> تم إرسال <code>{len(batches)}</code> ملفات (.txt).\n"
-            f"🎯 <b>الخطوة التالية:</b> تحديد الصوت الصوتي التعبيري."
+            f"🎯 <b>الخطوة التالية:</b> تحديد الصوت التعبيري."
         )
-        await context.bot.send_message(chat_id=chat_id, text=status_card, parse_mode=ParseMode.HTML)
+        try:
+            await status_msg.edit_text(done_card, parse_mode=ParseMode.HTML)
+        except Exception:
+            await context.bot.send_message(chat_id=chat_id, text=done_card, parse_mode=ParseMode.HTML)
+
+        # ── الاستمرار إلى واجهة اختيار الصوت كما هو ──
         await present_audio_engine_choice(context.bot, chat_id=chat_id)
 
     except asyncio.CancelledError:
@@ -602,11 +881,14 @@ async def run_stage1_and_2(query, context, episode):
     except Exception as e:
         if _is_stale(chat_id, session):
             return
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=f"❌ <b>خطأ في المرحلة الثانية:</b>\n<code>{str(e)}</code>",
-            parse_mode=ParseMode.HTML,
-        )
+        logger.exception(f"خطأ في المرحلة الثانية للحلقة {ep_id}")
+        try:
+            await status_msg.edit_text(
+                f"❌ <b>خطأ في المرحلة الثانية:</b>\n<code>{_esc(str(e))}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
 
 
 async def present_audio_engine_choice(bot_or_query, chat_id=None):
@@ -715,7 +997,7 @@ async def run_stage3(query, context):
         if _is_stale(chat_id, session):
             return
         await wait_msg.edit_text(
-            f"❌ <b>خطأ أثناء توليد الصوت:</b>\n<code>{str(e)}</code>",
+            f"❌ <b>خطأ أثناء توليد الصوت:</b>\n<code>{_esc(str(e))}</code>",
             parse_mode=ParseMode.HTML,
         )
 
@@ -869,7 +1151,7 @@ async def show_next_manual_image(context, chat_id):
                 photo=img,
                 caption=(
                     f"🖼️ <b>تعيين يدوي — متبقٍ {len(queue)}</b>\n"
-                    f"الملف: <code>{Path(current_path).name}</code>\n\n"
+                    f"الملف: <code>{_esc(Path(current_path).name)}</code>\n\n"
                     f"👇 اختر رقم الكادر (من النواقص) الذي تنتمي إليه هذه الصورة:\n"
                     f"أو اضغط <b>❌ صورة غلط</b> لو الصورة مش تبع الشغل أصلاً."
                 ),
@@ -969,7 +1251,7 @@ async def run_stage4_and_5(msg_obj, context, allow_partial: bool = False):
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"تم التحقق بنجاح من <b>{m_err.found_count}</b> صورة من أصل <b>{m_err.total_expected}</b>.{extra_note}\n\n"
             f"⚠️ <b>الصور المفقودة المطلوب رفعها:</b>\n"
-            f"<code>{missing_preview}</code>\n\n"
+            f"<code>{_esc(missing_preview)}</code>\n\n"
             f"👇 <b>الخيارات المتاحة:</b>\n"
             f"• <b>تعيين يدوي</b>: اربط الصور التي فشل قراءة رقمها بكادراتها يدوياً.\n"
             f"• <b>متابعة ورندرة</b>: فيديو أقصر بالصور المتوفرة فقط.\n"
@@ -984,7 +1266,7 @@ async def run_stage4_and_5(msg_obj, context, allow_partial: bool = False):
         if _is_stale(chat_id, session):
             return
         await progress_msg.edit_text(
-            f"❌ <b>خطأ أثناء معالجة الصور:</b>\n<code>{str(e)}</code>",
+            f"❌ <b>خطأ أثناء معالجة الصور:</b>\n<code>{_esc(str(e))}</code>",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -1055,7 +1337,7 @@ async def run_stage4_and_5(msg_obj, context, allow_partial: bool = False):
         if _is_stale(chat_id, session):
             return
         await progress_msg.edit_text(
-            f"❌ <b>حدث خطأ أثناء الرندرة:</b>\n<code>{str(e)}</code>",
+            f"❌ <b>حدث خطأ أثناء الرندرة:</b>\n<code>{_esc(str(e))}</code>",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -1091,7 +1373,7 @@ async def run_stage4_and_5(msg_obj, context, allow_partial: bool = False):
         if _is_stale(chat_id, session):
             return
         await context.bot.send_message(
-            chat_id=chat_id, text=f"⚠️ تعذر استخراج ميتاداتا النشر: {str(e)}"
+            chat_id=chat_id, text=f"⚠️ تعذر استخراج ميتاداتا النشر: {_esc(str(e))}"
         )
 
 
@@ -1116,7 +1398,7 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_media_upload))
 
     print("=" * 60)
-    print("🚀 محرك Vot Studio Pro يعمل الآن — Hard Reset + Force Render + Manual Assignment")
+    print("🚀 محرك Vot Studio Pro يعمل الآن — Stage1 Approval Flow + Manual Assignment")
     print("=" * 60)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
