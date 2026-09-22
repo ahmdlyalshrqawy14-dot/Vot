@@ -101,6 +101,33 @@ VISUAL RULES FOR SCENES:
 - Do NOT make every scene just a different pose of the character in an empty background.
 - Do NOT add text inside images unless absolutely essential to the idea.
 
+RETENTION_PLAN STRUCTURE RULES (CRITICAL — READ CAREFULLY):
+The "retention_plan" object MUST follow this exact JSON shape, and the three list fields MUST ALWAYS be real JSON arrays of strings:
+
+"retention_plan": {
+  "hook_strategy": "string",
+  "open_loops": ["string", "string"],
+  "pattern_interrupts": ["string", "string"],
+  "escalation_points": ["string", "string"],
+  "main_reveal": "string",
+  "payoff": "string",
+  "ending_callback": "string"
+}
+
+Mandatory rules for these three fields:
+- retention_plan.open_loops
+- retention_plan.pattern_interrupts
+- retention_plan.escalation_points
+
+They MUST be JSON arrays (Lists) of strings, always.
+- These three fields MUST be Lists/Arrays of strings.
+- NEVER return them as a single string.
+- Even if there is only ONE item, you MUST still use an array, e.g. ["single item"].
+- Do NOT use a direct string such as: "open_loops": "single item".
+- Do NOT write the list as Markdown, and do NOT use a comma-separated string; the required format is a real JSON array.
+- Every item inside each of these lists MUST be a non-empty string.
+- This applies to EVERY item of the retention_plan, with no exceptions.
+
 OUTPUT FORMAT
 Return a single valid, parsable JSON object ONLY. No markdown, no backticks, no conversational filler.
 Required JSON schema (all fields mandatory):
@@ -138,9 +165,9 @@ Required JSON schema (all fields mandatory):
 
   "retention_plan": {
     "hook_strategy": "string",
-    "open_loops": ["string"],
-    "pattern_interrupts": ["string"],
-    "escalation_points": ["string"],
+    "open_loops": ["string", "string"],
+    "pattern_interrupts": ["string", "string"],
+    "escalation_points": ["string", "string"],
     "main_reveal": "string",
     "payoff": "string",
     "ending_callback": "string"
