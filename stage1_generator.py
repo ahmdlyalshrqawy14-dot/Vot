@@ -199,6 +199,17 @@ SCENE PLAN RULES:
 - Every scene must include character_action and visual_concept.
 - Visual progression must exist from start to end of the episode.
 - Do not make every scene the same pose against an empty background.
+
+SCENE PLAN INDEXING RULES (CRITICAL — READ CAREFULLY):
+- If full_script_sentences contains N sentences, the last valid index is N - 1.
+- sentence_start and sentence_end MUST both be between 0 and N - 1 inclusive.
+- NEVER use N as a value for sentence_end. N is OUT OF RANGE and will be rejected.
+- Build the scene_plan ONLY AFTER the final full_script_sentences list is frozen and its count N is known.
+- The final scene in scene_plan MUST end exactly at index len(full_script_sentences) - 1.
+- Concretely: if the final full_script_sentences has 74 sentences, the last scene must end at sentence_end = 73, NOT 74.
+- Indices are 0-based, never 1-based. The first scene must start at sentence_start = 0.
+- Scenes must be contiguous: each next scene's sentence_start must equal the previous scene's sentence_end + 1.
+- Do NOT leave gaps between scenes and do NOT overlap scenes.
 """
 
 
@@ -396,6 +407,86 @@ def _validate_quality_report(data: Dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Safe off-by-one fix for the LAST scene's sentence_end
+# ---------------------------------------------------------------------------
+
+def _attempt_last_scene_off_by_one_fix(data: Dict[str, Any], total_sentences: int) -> bool:
+    """
+    محاولة إصلاح آمنة لحالة واحدة فقط:
+    - جميع المشاهد السابقة صحيحة ومتسلسلة بلا فجوات أو تداخل.
+    - آخر مشهد sentence_end يساوي بالضبط len(cleaned_sentences) (خطأ off-by-one بمقدار +1).
+
+    لا يُطبَّق الإصلاح إذا كان هناك أي خطأ آخر (فجوة، تداخل، فهرس سالب،
+    sentence_end أكبر من len، أو أي مشكلة في مشهد سابق).
+
+    يُعيد True إذا تم التصحيح، False إذا لم ينطبق شرط التصحيح الآمن.
+    """
+    scene_plan = data.get("scene_plan")
+    if not isinstance(scene_plan, list) or not scene_plan:
+        return False
+
+    previous_end = -1
+    last_index = len(scene_plan) - 1
+
+    for idx, scene in enumerate(scene_plan):
+        if not isinstance(scene, dict):
+            return False
+
+        s_start = scene.get("sentence_start")
+        s_end = scene.get("sentence_end")
+
+        # يجب أن يكونا أعدادًا صحيحة حقيقية (لا bool)
+        if isinstance(s_start, bool) or not isinstance(s_start, int):
+            return False
+        if isinstance(s_end, bool) or not isinstance(s_end, int):
+            return False
+
+        # لا نقبل أي فهرس سالب
+        if s_start < 0 or s_end < 0:
+            return False
+
+        # لا نقبل أي sentence_end أكبر من total_sentences
+        if s_end > total_sentences:
+            return False
+
+        if s_start > s_end:
+            return False
+
+        is_last = (idx == last_index)
+
+        if idx == 0:
+            if s_start != 0:
+                return False
+        else:
+            # لا فجوات ولا تداخل
+            if s_start != previous_end + 1:
+                return False
+
+        if is_last:
+            # الحالة الوحيدة المسموح إصلاحها: off-by-one بمقدار +1 في النهاية
+            if s_end == total_sentences:
+                scene["sentence_end"] = total_sentences - 1
+                logger.warning(
+                    "⚠️ تم إصلاح خطأ off-by-one في آخر مشهد داخل scene_plan: "
+                    "sentence_end كان %d (خارج النطاق) وتم تصحيحه إلى %d "
+                    "(آخر فهرس مسموح لـ full_script_sentences). "
+                    "لم يتم تغيير أي مشهد سابق، ولم تُضف أو تُحذف مشاهد.",
+                    total_sentences,
+                    total_sentences - 1,
+                )
+                return True
+            # أي قيمة أخرى: لا نصلح هنا، نترك المدقق الرئيسي يرمي خطأه
+            return False
+        else:
+            # المشاهد غير الأخيرة يجب أن تنتهي قبل آخر فهرس
+            if s_end >= total_sentences:
+                return False
+            previous_end = s_end
+
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Scene plan validation
 # ---------------------------------------------------------------------------
 
@@ -568,6 +659,13 @@ def validate_script_output(data: Dict[str, Any]) -> Dict[str, Any]:
 
     # ---- scene_plan validation ----
     total_sentences = len(cleaned_sentences)
+
+    # إصلاح آمن لحالة واحدة فقط:
+    # off-by-one بمقدار +1 في sentence_end الخاص بآخر مشهد فقط،
+    # مع بقاء جميع المشاهد السابقة صحيحة ومتسلسلة بلا فجوات أو تداخل.
+    # لا يُطبَّق أي إصلاح آخر، وأي خطأ مختلف سيُرفع كـ ValueError من المدقق الرئيسي.
+    _attempt_last_scene_off_by_one_fix(data, total_sentences)
+
     _validate_scene_plan(data, total_sentences)
 
     return data
