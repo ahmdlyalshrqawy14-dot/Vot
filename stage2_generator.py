@@ -1,4 +1,5 @@
 import re
+import json
 import logging
 from typing import List, Dict, Any, Optional, Union, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -30,10 +31,9 @@ REQUIRED_ANTI_TEXT_TOKENS = ("no written text", "no text")
 
 
 # =========================================================
-# FLEXIBLE VISUAL GROUPS (LENIENT — SCORED, NOT HARD-FAILED)
-# A prompt no longer fails just because it lacks the literal word
-# "composition" / "continuity" / "emotion" / "lighting".
-# Instead, we count how many of these 8 semantic groups are covered.
+# LEGACY FLEXIBLE GROUPS (KEPT FOR DIAGNOSTICS ONLY).
+# These must NEVER cause a prompt to be rejected or repaired.
+# They are used only to log a rough "shape" of the prompt.
 # =========================================================
 FLEXIBLE_GROUPS: Dict[str, Tuple[str, ...]] = {
     "conceptual": (
@@ -109,12 +109,21 @@ FLEXIBLE_GROUPS: Dict[str, Tuple[str, ...]] = {
     ),
 }
 
-# Acceptance rules for the flexible creative score:
-MIN_FLEXIBLE_GROUPS = 5
-REQUIRED_FLEXIBLE_GROUPS = ("action", "environment")
-REQUIRED_ONE_OF = ("conceptual", "emotion", "camera")
+
+# =========================================================
+# AI CREATIVE REVIEWER CONFIG
+# =========================================================
+MAX_AI_REVIEW_ATTEMPTS = 2
+CREATIVE_REVIEW_REPAIR_THRESHOLD = 80   # score < 80  -> add to repair list
+CREATIVE_REVIEW_ACCEPT_THRESHOLD = 90   # score >= 90 -> auto-accept
+
+BATCH_SIZE = 24
+MAX_PROMPT_REPAIR_ATTEMPTS = 4
 
 
+# =========================================================
+# SYSTEM PROMPTS
+# =========================================================
 STAGE_2_SYSTEM_PROMPT = """You are an expert AI Art Director and Visual Storyboard Artist. Your task is to generate explicit IMAGE GENERATION COMMANDS for an educational YouTube video based on a sequential list of script sentences.
 
 =========================================
@@ -407,10 +416,77 @@ OUTPUT FORMAT
 Return prompts separated ONLY by a single blank line. No quotation marks, no markdown code wrappers, no sentence text, no headers."""
 
 
-BATCH_SIZE = 24
-MAX_PROMPT_REPAIR_ATTEMPTS = 4
+CREATIVE_REVIEWER_SYSTEM_PROMPT = """You are a senior Visual Quality Reviewer for AI image-generation prompts used in an educational YouTube video.
+
+The recurring character is:
+- consistent orange muscular figure
+- smooth head
+- two large white oval eyes
+- no mouth
+- black shorts
+- clean 2D cel-shaded illustration style
+- plain grey background as the dominant background
+- a very small, subtle, faint in-image index number in the bottom-right corner
+- no written text inside the image except that index
+
+Your job is to score each prompt's CREATIVE AND VISUAL QUALITY, not to check word presence.
+
+IMPORTANT RULES FOR YOUR REVIEW
+================================
+- Do NOT penalize a prompt for repeating the Character DNA, the plain grey background phrase, or the in-image index number. This repetition is MANDATORY.
+- Do NOT require the literal words "composition", "continuity", "emotion", "lighting", or "camera". Judge the actual visual meaning, not the vocabulary.
+- If composition, continuity, emotion, or lighting are clearly conveyed in meaning (even without those exact words), treat them as present.
+- Judge whether the visual idea is CONCEPTUAL / SYMBOLIC rather than a literal restatement of the sentence.
+- Judge whether the action / pose is clear and drawable.
+- Judge whether the prompt is executable in Google Flow (self-contained, explicit, no contradictions).
+- Judge whether character identity and background constraints are preserved.
+- Judge camera, composition, lighting, and continuity between adjacent prompts.
+
+SCORING (TOTAL 100)
+===================
+1. Conceptual clarity / non-literal visual idea — 25 points.
+2. Action, scene, and image-convertibility — 20 points.
+3. Executability in Google Flow — 20 points.
+4. Character identity and visual constraints preserved — 20 points.
+5. Camera, composition, lighting, continuity — 15 points.
+
+DECISION RULES
+==============
+- score >= 90 -> "accept"
+- 80 <= score < 90 -> "accept" unless you identify a MATERIAL visual defect that would clearly harm the image -> then "repair"
+- score < 80 -> "repair"
+
+OUTPUT FORMAT
+=============
+Return ONLY valid JSON. No markdown, no code fences, no commentary outside JSON.
+
+{
+  "reviews": [
+    {
+      "image_index": 1,
+      "score": 94,
+      "decision": "accept",
+      "strengths": ["Clear conceptual metaphor", "Strong visual action"],
+      "issues": []
+    }
+  ]
+}
+
+Rules:
+- One review element per prompt.
+- Same order as prompts given.
+- image_index must be the integer index provided with each prompt.
+- score must be an integer 0-100.
+- decision must be "accept" or "repair".
+- issues must be a list of strings (empty if none).
+- Do NOT rewrite the prompts.
+- Do NOT add any text outside the JSON.
+"""
 
 
+# =========================================================
+# UTILITIES
+# =========================================================
 def clean_and_parse_prompts(raw_text: str) -> List[str]:
     cleaned = raw_text.strip()
     cleaned = re.sub(r"^```(?:text)?\s*", "", cleaned)
@@ -629,84 +705,209 @@ def _check_hard_constraints(prompt: str, expected_index: int) -> List[str]:
 
 
 # =========================================================
-# FLEXIBLE VISUAL QUALITY CHECK (LENIENT — SCORED, NOT HARD-FAILED)
+# DIAGNOSTIC ONLY: LEGACY FLEXIBLE GROUPS (never used to reject)
 # =========================================================
-def _check_flexible_visual(
-    prompt: str,
-) -> Tuple[int, List[str], List[str], bool]:
+def _diagnose_flexible_groups(prompt: str) -> Tuple[int, List[str], List[str]]:
     """
-    ترجع:
-      (matched_count, matched_groups, missing_groups, has_required_combination)
-
-    - matched_count: عدد المجموعات الإبداعية الثمانية المحققة.
-    - has_required_combination: True إذا تحققت action + environment
-      وأيضًا واحدة على الأقل من (conceptual / emotion / camera).
+    تُرجع فقط معلومات تشخيصية لعدد المجموعات الإبداعية المكتشفة بالكلمات.
+    لا تُستخدم أبدًا لقبول أو رفض.
     """
     lower = prompt.lower()
-
     matched: List[str] = []
     missing: List[str] = []
-
     for group_name, keywords in FLEXIBLE_GROUPS.items():
         if any(kw in lower for kw in keywords):
             matched.append(group_name)
         else:
             missing.append(group_name)
+    return len(matched), matched, missing
 
-    has_required_combination = (
-        all(g in matched for g in REQUIRED_FLEXIBLE_GROUPS)
-        and any(g in matched for g in REQUIRED_ONE_OF)
+
+# =========================================================
+# AI CREATIVE REVIEWER
+# =========================================================
+def _build_creative_review_request(
+    prompts: List[str],
+    sentences: List[str],
+    prompt_indices: List[int],
+    scene_map: Dict[int, Dict[str, Any]],
+    visual_bible: Any,
+    creative_brief: Any,
+) -> str:
+    body = "Review the following batch of image-generation prompts.\n\n"
+    body += "CREATIVE BRIEF (narrative anchor):\n"
+    body += _format_creative_brief(creative_brief) + "\n\n"
+    body += "VISUAL BIBLE (style anchor):\n"
+    body += _format_visual_bible(visual_bible) + "\n\n"
+    body += "PROMPTS TO REVIEW (each is self-contained):\n"
+
+    for i, prompt in enumerate(prompts):
+        abs_idx = prompt_indices[i]
+        sentence = sentences[i] if i < len(sentences) else ""
+        scene = scene_map.get(abs_idx) if scene_map else None
+        body += "\n---\n"
+        body += f"image_index: {abs_idx}\n"
+        body += f"narration sentence: {sentence}\n"
+        body += f"scene context:\n{_format_scene_context(scene)}\n"
+        body += f"prompt:\n{prompt}\n"
+
+    body += "\nReturn ONLY the JSON object described in the system instructions."
+    return body
+
+
+def _parse_creative_review_response(
+    raw: str,
+    expected_count: int,
+    expected_indices: List[int],
+) -> Optional[List[Dict[str, Any]]]:
+    if not raw:
+        return None
+
+    text = raw.strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
+
+    data: Optional[Any] = None
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        m = re.search(r"\{[\s\S]*\}", text)
+        if not m:
+            return None
+        try:
+            data = json.loads(m.group(0))
+        except json.JSONDecodeError:
+            return None
+
+    if not isinstance(data, dict):
+        return None
+
+    reviews = data.get("reviews")
+    if not isinstance(reviews, list):
+        return None
+    if len(reviews) != expected_count:
+        return None
+
+    validated: List[Dict[str, Any]] = []
+    for i, r in enumerate(reviews):
+        if not isinstance(r, dict):
+            return None
+        idx = r.get("image_index")
+        score = r.get("score")
+        decision = r.get("decision")
+        # image_index must be a plain int (not bool)
+        if not isinstance(idx, int) or isinstance(idx, bool):
+            return None
+        if idx != expected_indices[i]:
+            return None
+        # score must be a real number in [0, 100] — reject bool explicitly
+        if isinstance(score, bool) or not isinstance(score, (int, float)):
+            return None
+        if not (0 <= score <= 100):
+            return None
+        if decision not in ("accept", "repair"):
+            return None
+
+        strengths = r.get("strengths", [])
+        issues = r.get("issues", [])
+        if not isinstance(strengths, list):
+            strengths = []
+        if not isinstance(issues, list):
+            issues = []
+
+        validated.append({
+            "image_index": int(idx),
+            "score": int(score),
+            "decision": decision,
+            "strengths": [str(s) for s in strengths],
+            "issues": [str(s) for s in issues],
+        })
+
+    return validated
+
+
+def _review_batch_creatively(
+    prompts: List[str],
+    sentences: List[str],
+    prompt_indices: List[int],
+    scene_map: Dict[int, Dict[str, Any]],
+    visual_bible: Any,
+    creative_brief: Any,
+) -> Optional[List[Dict[str, Any]]]:
+    """
+    يستدعي مراجع الذكاء الاصطناعي على الدفعة كاملة في طلب واحد.
+    يرجع قائمة reviews بنفس ترتيب prompts، أو None إذا فشل المراجع
+    بعد MAX_AI_REVIEW_ATTEMPTS (وهذا لا يُعد فشلًا للمرحلة).
+
+    prompt_indices: قائمة الفهارس الحقيقية (absolute indices) المقابلة لكل prompt
+                    بنفس الترتيب. قد تكون غير متتابعة (مثل [1,3,4,7]).
+    """
+    if not prompts:
+        return []
+
+    expected_count = len(prompts)
+    expected_indices = list(prompt_indices)
+
+    if len(expected_indices) != expected_count:
+        raise ValueError(
+            "_review_batch_creatively: prompt_indices length "
+            f"({len(expected_indices)}) must match prompts length ({expected_count})."
+        )
+
+    user_prompt = _build_creative_review_request(
+        prompts=prompts,
+        sentences=sentences,
+        prompt_indices=prompt_indices,
+        scene_map=scene_map,
+        visual_bible=visual_bible,
+        creative_brief=creative_brief,
     )
 
-    return len(matched), matched, missing, has_required_combination
-
-
-def _collect_prompt_issues(prompt: str, expected_index: int) -> List[str]:
-    """
-    تُرجع قائمة بكل المخالفات الموجودة في Prompt واحد.
-
-    - أولًا: الشروط الحاكمة الصارمة (أي فشل هنا => رفض مباشر).
-    - ثانيًا: الجودة الإبداعية المرنة (يجب تحقيق 5/8 على الأقل،
-      مع اشتراط action + environment + واحدة على الأقل من conceptual/emotion/camera).
-
-    إذا كانت القائمة فارغة فمعناه أن الـPrompt سليم تمامًا.
-    """
-    # --- 1) Hard constraints (strict, no flexibility) ---
-    hard_issues = _check_hard_constraints(prompt, expected_index)
-    if hard_issues:
-        return ["Hard constraint failure: " + "; ".join(hard_issues)]
-
-    # --- 2) Flexible visual quality (scored) ---
-    matched_count, matched, missing, has_required_combination = _check_flexible_visual(prompt)
-
-    if matched_count < MIN_FLEXIBLE_GROUPS or not has_required_combination:
-        lines = [
-            "Flexible visual quality score too low:",
-            f"matched_groups = {matched_count}/8",
-        ]
-        if missing:
-            lines.append(f"missing_groups = {missing}")
-        lines.append(f"required_minimum = {MIN_FLEXIBLE_GROUPS}")
-        if not has_required_combination:
-            lines.append(
-                "missing required group combination: "
-                "action + environment + at least one of (conceptual, emotion, camera)"
+    for attempt in range(1, MAX_AI_REVIEW_ATTEMPTS + 1):
+        try:
+            raw = call_gemini_with_fallback(
+                system_instruction=CREATIVE_REVIEWER_SYSTEM_PROMPT,
+                user_prompt=user_prompt,
+                response_mime_type="application/json",
             )
-        return ["\n".join(lines)]
+        except Exception as exc:
+            logger.warning(
+                f"⚠️ AI creative review attempt {attempt}/{MAX_AI_REVIEW_ATTEMPTS} "
+                f"failed to call Gemini: {exc}"
+            )
+            continue
 
-    return []
+        parsed = _parse_creative_review_response(
+            raw=raw,
+            expected_count=expected_count,
+            expected_indices=expected_indices,
+        )
+        if parsed is not None:
+            return parsed
+
+        logger.warning(
+            f"⚠️ AI creative review attempt {attempt}/{MAX_AI_REVIEW_ATTEMPTS} "
+            "returned invalid JSON. Retrying."
+        )
+
+    logger.warning(
+        "⚠️ AI creative review unavailable after "
+        f"{MAX_AI_REVIEW_ATTEMPTS} attempts. "
+        "Falling back to hard-constraints-only acceptance for this batch."
+    )
+    return None
 
 
+# =========================================================
+# BATCH VALIDATION HELPERS
+# =========================================================
 def _validate_single_prompt(
     prompt: str,
     expected_index: int,
     position_in_batch: int,
     batch_num: int,
 ) -> None:
-    """
-    تحقق كامل من Prompt واحد. يرفع ValueError مع تفاصيل دقيقة عند أي فشل.
-    """
-    issues = _collect_prompt_issues(prompt, expected_index)
+    issues = _check_hard_constraints(prompt, expected_index)
     if issues:
         raise ValueError(
             f"Batch [{batch_num}] prompt #{position_in_batch} "
@@ -841,7 +1042,8 @@ def _repair_invalid_prompts(
     تصلح فقط الـPrompts المخالفة عبر طلبات مستقلة، مع إعادة المحاولة حتى
     MAX_PROMPT_REPAIR_ATTEMPTS. تُرجع قاموساً: absolute_index -> repaired prompt.
 
-    الـPrompts الصحيحة لا تُعاد كتابتها إطلاقاً.
+    الفحص داخل الحلقة: الشروط الحاكمة فقط.
+    المراجعة الإبداعية بعد الإصلاح تُنفَّذ على مستوى _process_single_batch.
     """
     if not invalid_items:
         return {}
@@ -857,8 +1059,6 @@ def _repair_invalid_prompts(
             f"لـ {len(remaining)} برومبت مخالف."
         )
 
-        # حدّث معلومات الجوار قبل كل محاولة (بما أن بعض البرومبتات قد تكون
-        # قد أُصلحت في محاولة سابقة فأصبحت جزءًا من valid_prompts).
         enriched_items: List[Dict[str, Any]] = []
         for item in remaining:
             new_item = dict(item)
@@ -896,10 +1096,12 @@ def _repair_invalid_prompts(
         for i, item in enumerate(enriched_items):
             candidate = parsed[i]
             expected_index = item["absolute_index"]
-            candidate_issues = _collect_prompt_issues(candidate, expected_index)
-            if candidate_issues:
+            hard_issues = _check_hard_constraints(candidate, expected_index)
+            if hard_issues:
                 new_item = dict(item)
-                new_item["issues"] = candidate_issues
+                new_item["issues"] = [
+                    "Hard constraint failure after repair: " + "; ".join(hard_issues)
+                ]
                 new_item["invalid_prompt"] = candidate
                 still_invalid.append(new_item)
             else:
@@ -931,12 +1133,16 @@ def _repair_invalid_prompts(
 def _process_single_batch(batch_tuple: tuple) -> tuple:
     """
     معالجة دفعة واحدة:
-    1) توليد البرومبتات الأساسية.
-    2) فحص كل برومبت (شروط صارمة + جودة إبداعية مرنة).
-    3) تصنيف إلى valid_prompts / invalid_items.
-    4) إصلاح المخالف فقط (بدون المساس بالصحيح).
-    5) إعادة الفحص، ثم إرجاع الدفعة كاملة بترتيبها الأصلي.
-    لا تُرجَع الدفعة إلا بعد أن يصبح كل برومبت صحيحًا.
+      1) توليد البرومبتات الأساسية.
+      2) فحص الشروط الحاكمة الصارمة فقط.
+      3) مراجعة إبداعية ذكية عبر AI على الدفعة كاملة (طلب واحد)
+         مع تمرير الفهارس الحقيقية للبرومبتات الناجحة.
+      4) تصنيف: صحيح / يحتاج إصلاح
+         (فشل hard OR score < 80 OR قرار reviewer = "repair").
+      5) إصلاح المخالف فقط (فحص hard constraints داخل الحلقة).
+      6) بعد الإصلاح: إعادة مراجعة إبداعية سريعة للبرومبتات المُصلَحة (للتوثيق فقط).
+      7) إعادة بناء الدفعة بترتيبها الأصلي، مع فحص نهائي صارم.
+    لا تُرجَع الدفعة إلا بعد أن يصبح كل برومبت صحيحًا بالشروط الحاكمة.
     """
     (
         batch_idx,
@@ -953,6 +1159,7 @@ def _process_single_batch(batch_tuple: tuple) -> tuple:
         f"🚀 بدء معالجة الدفعة [{batch_idx}] بالتوازي: الجمل من {start_idx} إلى {end_idx}"
     )
 
+    # ---- بناء الـUser Prompt ----
     if has_stage1_context:
         system_instruction = STAGE_2_ENRICHED_SYSTEM_PROMPT
         user_prompt = f"""Generate exactly {len(batch_sentences)} explicit image generation commands.
@@ -1050,39 +1257,101 @@ Sentences (the [N] is the correct image index to place inside the in-image numbe
     )
 
     prompts = clean_and_parse_prompts(raw_output)
-
-    # تحقق صارم على العدد الكلي للدفعة قبل التصنيف
     _validate_batch(batch_idx, len(batch_sentences), prompts)
 
-    # ---- تصنيف كل برومبت إلى valid / invalid ----
+    # ---- 1) فحص الشروط الحاكمة الصارمة ----
     valid_prompts: Dict[int, str] = {}
     invalid_items: List[Dict[str, Any]] = []
 
     for offset, prompt in enumerate(prompts):
         expected_index = start_idx + offset
-        issues = _collect_prompt_issues(prompt, expected_index)
+        hard_issues = _check_hard_constraints(prompt, expected_index)
 
-        if issues:
+        # تشخيصي فقط (لا يؤثر على القبول)
+        diag_matched, diag_matched_groups, _ = _diagnose_flexible_groups(prompt)
+        logger.debug(
+            f"🔎 [idx={expected_index}] hard_issues={len(hard_issues)} "
+            f"flexible_matched={diag_matched}/8 groups={diag_matched_groups}"
+        )
+
+        if hard_issues:
             sentence = batch_sentences[offset]
             scene = scene_map.get(expected_index) if scene_map else None
-            invalid_items.append(
-                {
-                    "absolute_index": expected_index,
-                    "sentence": sentence,
-                    "scene_context": _format_scene_context(scene),
-                    "invalid_prompt": prompt,
-                    "issues": issues,
-                }
-            )
+            invalid_items.append({
+                "absolute_index": expected_index,
+                "sentence": sentence,
+                "scene_context": _format_scene_context(scene),
+                "invalid_prompt": prompt,
+                "issues": ["Hard constraint failure: " + "; ".join(hard_issues)],
+                "origin": "hard",
+            })
         else:
             valid_prompts[expected_index] = prompt
+
+    # ---- 2) مراجعة إبداعية ذكية على البرومبتات التي نجحت في الشروط الحاكمة ----
+    if valid_prompts:
+        ordered_indices = sorted(valid_prompts.keys())
+        review_prompts = [valid_prompts[i] for i in ordered_indices]
+        review_sentences = [batch_sentences[i - start_idx] for i in ordered_indices]
+
+        reviews = _review_batch_creatively(
+            prompts=review_prompts,
+            sentences=review_sentences,
+            prompt_indices=ordered_indices,
+            scene_map=scene_map,
+            visual_bible=visual_bible,
+            creative_brief=creative_brief,
+        )
+
+        if reviews is not None:
+            for i, review in enumerate(reviews):
+                idx = ordered_indices[i]
+                score = review["score"]
+                decision = review["decision"]
+                review_issues = review.get("issues", []) or []
+
+                should_repair = (
+                    decision == "repair"
+                    or score < CREATIVE_REVIEW_REPAIR_THRESHOLD
+                )
+
+                if should_repair:
+                    sentence = batch_sentences[idx - start_idx]
+                    scene = scene_map.get(idx) if scene_map else None
+                    issue_lines = [
+                        f"AI reviewer score {score}/100 (decision={decision})"
+                    ]
+                    if review_issues:
+                        issue_lines.append(
+                            "Reviewer issues: "
+                            + "; ".join(str(x) for x in review_issues)
+                        )
+                    invalid_items.append({
+                        "absolute_index": idx,
+                        "sentence": sentence,
+                        "scene_context": _format_scene_context(scene),
+                        "invalid_prompt": valid_prompts[idx],
+                        "issues": issue_lines,
+                        "origin": "creative",
+                    })
+                    del valid_prompts[idx]
+                else:
+                    logger.info(
+                        f"✅ [idx={idx}] creative score {score}/100 accepted "
+                        f"(decision={decision})."
+                    )
+        else:
+            logger.warning(
+                f"⚠️ Batch [{batch_idx}] AI creative review unavailable — "
+                "accepting hard-constraint-valid prompts as-is."
+            )
 
     logger.info(
         f"📊 الدفعة [{batch_idx}]: {len(valid_prompts)} صحيح، "
         f"{len(invalid_items)} مخالف يحتاج إصلاحًا."
     )
 
-    # ---- إصلاح المخالف فقط دون لمس الصحيح ----
+    # ---- 3) إصلاح المخالف فقط (فحص hard constraints داخل الحلقة) ----
     if invalid_items:
         repaired = _repair_invalid_prompts(
             invalid_items=invalid_items,
@@ -1095,9 +1364,43 @@ Sentences (the [N] is the correct image index to place inside the in-image numbe
             creative_brief=creative_brief,
             batch_num=batch_idx,
         )
+
+        # ---- 4) إعادة مراجعة إبداعية للبرومبتات المُصلَحة (توثيق فقط) ----
+        creative_origins = {
+            item["absolute_index"] for item in invalid_items
+            if item.get("origin") == "creative"
+        }
+        repaired_for_review = sorted(
+            idx for idx in repaired.keys() if idx in creative_origins
+        )
+        if repaired_for_review:
+            review_prompts = [repaired[i] for i in repaired_for_review]
+            review_sentences = [
+                batch_sentences[i - start_idx] for i in repaired_for_review
+            ]
+            post_reviews = _review_batch_creatively(
+                prompts=review_prompts,
+                sentences=review_sentences,
+                prompt_indices=repaired_for_review,
+                scene_map=scene_map,
+                visual_bible=visual_bible,
+                creative_brief=creative_brief,
+            )
+            if post_reviews is not None:
+                for i, r in enumerate(post_reviews):
+                    logger.info(
+                        f"🔁 post-repair review [idx={repaired_for_review[i]}]: "
+                        f"score {r['score']}/100 decision={r['decision']}"
+                    )
+            else:
+                logger.info(
+                    "ℹ️ post-repair creative review unavailable — "
+                    "repaired prompts accepted on hard constraints."
+                )
+
         valid_prompts.update(repaired)
 
-    # ---- إعادة بناء الدفعة بالترتيب الأصلي ----
+    # ---- 5) إعادة بناء الدفعة بالترتيب الأصلي ----
     ordered_prompts: List[str] = []
     for offset in range(len(batch_sentences)):
         idx = start_idx + offset
@@ -1108,7 +1411,7 @@ Sentences (the [N] is the correct image index to place inside the in-image numbe
             )
         ordered_prompts.append(valid_prompts[idx])
 
-    # ---- فحص نهائي صارم قبل الإرجاع ----
+    # ---- 6) فحص نهائي صارم قبل الإرجاع ----
     _validate_batch_prompts(batch_idx, start_idx, ordered_prompts)
 
     logger.info(
@@ -1127,10 +1430,11 @@ def generate_stage2_prompts_batches(
 
     كل دفعة:
     - تُولَّد.
-    - تُفحص بالكامل (شروط صارمة + جودة إبداعية مرنة).
-    - تُصنَّف إلى صحيحة ومخالفة.
+    - تُفحص بالشروط الحاكمة الصارمة.
+    - تُراجع إبداعياً بواسطة AI على دفعة كاملة (طلب واحد) مع فهارس حقيقية.
+    - تُصنَّف إلى صحيحة ومخالفة (فشل hard OR score < 80 OR decision=repair).
     - تُصلَح المخالفة فقط في طلبات مستقلة (حتى MAX_PROMPT_REPAIR_ATTEMPTS).
-    - لا تُرجَع إلا بعد نجاح كل برومبت في التحقق.
+    - لا تُرجَع إلا بعد نجاح كل برومبت في الشروط الحاكمة.
 
     أي دفعة يفشل إصلاحها بالكامل تُرفع كـValueError ولا تُحفظ.
     """
@@ -1154,12 +1458,14 @@ def generate_stage2_prompts_batches(
 
     if not has_stage1_context:
         logger.info(
-            "ℹ️ لا يوجد scene_plan / visual_bible / creative_brief — سيتم استخدام السلوك القديم (fallback)."
+            "ℹ️ لا يوجد scene_plan / visual_bible / creative_brief — "
+            "سيتم استخدام السلوك القديم (fallback)."
         )
 
     # خريطة الجملة -> المشهد (1-based sentence index -> scene dict)
     scene_map = (
-        _map_sentences_to_scenes(sentences, scene_plan) if has_stage1_context else {}
+        _map_sentences_to_scenes(sentences, scene_plan)
+        if has_stage1_context else {}
     )
 
     # تجهيز بيانات الدفعات
@@ -1195,7 +1501,6 @@ def generate_stage2_prompts_batches(
         for future in as_completed(future_to_batch):
             batch_num, prompts = future.result()
 
-            # تحقق نهائي على عدد الـPrompts في الدفعة (تكرار أمان)
             expected = len(batch_tasks[batch_num - 1][1])
             _validate_batch(batch_num, expected, prompts)
 
@@ -1207,7 +1512,6 @@ def generate_stage2_prompts_batches(
     # تجميع النتائج بالترتيب المتسلسل السليم
     sorted_batches = [completed_results[k] for k in sorted(completed_results.keys())]
 
-    # تحقق نهائي إضافي: الطول الكلي مطابق
     total_generated = sum(len(b) for b in sorted_batches)
     if total_generated != total_sentences:
         raise ValueError(
