@@ -1,7 +1,24 @@
+# ============================================
+# VOT Project - Requirements
+# ============================================
+
+# --- HTTP & Environment ---
 requests>=2.31.0
 python-dotenv>=1.0.0
+
+# --- Media / Audio ---
+pydub>=0.25.1
+
+# --- Vision / Image ---
 pillow>=10.0.0
 opencv-python>=4.8.0
 numpy>=1.24.0
+
+# --- Speech Recognition ---
 faster-whisper>=1.0.0
+
+# --- Telegram Bot ---
 python-telegram-bot>=20.7
+
+# --- AI Engines ---
+google-generativeai>=0.7.0
