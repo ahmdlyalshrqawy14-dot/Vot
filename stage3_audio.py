@@ -14,12 +14,21 @@ from xml.sax.saxutils import escape as xml_escape
 
 import requests
 
+# =============================================================
+# استيراد pydub بشكل واضح وآمن مع تسجيل سبب الفشل
+# =============================================================
+PYDUB_AVAILABLE = False
+PYDUB_IMPORT_ERROR: Optional[str] = None
+
 try:
     from pydub import AudioSegment  # type: ignore
     PYDUB_AVAILABLE = True
-except Exception:
+except ImportError as _imp_err:
     AudioSegment = None  # type: ignore
-    PYDUB_AVAILABLE = False
+    PYDUB_IMPORT_ERROR = f"ImportError: {_imp_err}"
+except Exception as _any_err:
+    AudioSegment = None  # type: ignore
+    PYDUB_IMPORT_ERROR = f"{type(_any_err).__name__}: {_any_err}"
 
 from config import (
     GEMINI_KEYS,
@@ -32,6 +41,14 @@ from config import (
 from gemini_engine import call_gemini_with_fallback
 
 logger = logging.getLogger("Stage3Audio")
+
+if not PYDUB_AVAILABLE:
+    logger.warning(
+        "⚠️ [Dependency Missing] مكتبة pydub غير متوفرة أو غير قابلة للاستيراد. "
+        "هذه مشكلة اعتمادية وليست خطأً من Azure Speech. "
+        f"التفاصيل: {PYDUB_IMPORT_ERROR or 'غير معروف'}. "
+        "للتثبيت: python -m pip install pydub"
+    )
 
 # =============================================================
 # VOT VOICE BIBLE (ثابت على مستوى القناة)
@@ -726,45 +743,129 @@ def _merge_clips_with_pauses(
     clips_dir: Path,
     output_file: Path,
 ) -> None:
-    """دمج الـClips بالترتيب مع احترام الفواصل الزمنية."""
+    """
+    دمج الـClips بالترتيب مع احترام الفواصل الزمنية.
+
+    - يتحقق أولاً من توفر مكتبة pydub (وإلا يرفض العمل برسالة تثبيت واضحة).
+    - يتحقق من وجود كل ملف صوت وغير فارغ قبل بدء الدمج.
+    - عند أي فشل: يقوم بـRollback ويحذف أي ملف ناتج ناقص/جزئي.
+    """
+
+    # ============ 1) فحص اعتمادية pydub ============
+    if not PYDUB_AVAILABLE or AudioSegment is None:
+        detail = PYDUB_IMPORT_ERROR or "سبب غير معروف"
+        raise RuntimeError(
+            "❌ [Dependency Missing] مكتبة pydub غير مثبتة أو غير قابلة للاستيراد، "
+            "ولا يمكن دمج مقاطع الصوت دونها.\n"
+            f"   التفاصيل: {detail}\n"
+            "   هذا ليس خطأً من Azure Speech — بل مشكلة اعتمادية ناقصة.\n"
+            "   للتثبيت، نفّذ الأمر التالي:\n"
+            "       python -m pip install pydub\n"
+            "   ملاحظة: pydub تحتاج أيضاً إلى ffmpeg على PATH لفك ترميز MP3."
+        )
+
+    # ============ 2) فحص المدخلات ============
     if not clips_meta:
         raise RuntimeError("لا توجد Clips للدمج!")
-    if not PYDUB_AVAILABLE:
+
+    if not clips_dir.exists() or not clips_dir.is_dir():
+        raise RuntimeError(f"مجلد الـClips غير موجود أو ليس مجلداً: {clips_dir}")
+
+    # ============ 3) فحص وجود وحجم كل ملف صوت قبل بدء الدمج ============
+    missing: List[str] = []
+    empty: List[str] = []
+    for meta in clips_meta:
+        clip_name = meta.get("filename")
+        if not clip_name:
+            raise RuntimeError(f"عنصر Clip بدون filename في Metadata: {meta}")
+        clip_path = clips_dir / clip_name
+        if not clip_path.exists() or not clip_path.is_file():
+            missing.append(clip_name)
+            continue
+        if clip_path.stat().st_size == 0:
+            empty.append(clip_name)
+
+    if missing:
         raise RuntimeError(
-            "مكتبة pydub غير متوفرة — لا يمكن دمج الصوت دون إنتاج ملف ناقص. "
-            "الرجاء التأكد من تثبيت المتطلبات."
+            "❌ ملفات Clips مفقودة قبل الدمج، لا يمكن المتابعة:\n- " + "\n- ".join(missing)
         )
+    if empty:
+        raise RuntimeError(
+            "❌ ملفات Clips فارغة قبل الدمج، لا يمكن المتابعة:\n- " + "\n- ".join(empty)
+        )
+
+    # ============ 4) الدمج الفعلي مع Rollback عند أي فشل ============
+    output_file.parent.mkdir(parents=True, exist_ok=True)
 
     combined = AudioSegment.empty()
     prev_meta: Optional[Dict[str, Any]] = None
 
-    for meta in clips_meta:
-        clip_path = clips_dir / meta["filename"]
-        if not clip_path.exists() or clip_path.stat().st_size == 0:
-            raise RuntimeError(f"ملف الـClip مفقود أو فارغ أثناء الدمج: {clip_path}")
+    try:
+        for meta in clips_meta:
+            clip_path = clips_dir / meta["filename"]
 
-        segment = AudioSegment.from_mp3(str(clip_path))
+            try:
+                segment = AudioSegment.from_mp3(str(clip_path))
+            except Exception as read_err:
+                raise RuntimeError(
+                    f"فشل قراءة ملف الصوت '{clip_path.name}': {read_err}. "
+                    "قد يكون الملف تالفاً أو أن ffmpeg غير مثبت/غير متاح على PATH."
+                )
 
-        if prev_meta is None:
-            gap = _clamp(meta.get("pause_before_ms", 0), 0, MAX_MERGE_GAP_MS, 0)
-            if gap > 0:
-                combined += AudioSegment.silent(duration=gap, frame_rate=segment.frame_rate)
-        else:
-            gap_raw = int(prev_meta.get("pause_after_ms", 0)) + int(meta.get("pause_before_ms", 0))
-            gap = _clamp(gap_raw, 0, MAX_MERGE_GAP_MS, 0)
-            if gap > 0:
-                combined += AudioSegment.silent(duration=gap, frame_rate=segment.frame_rate)
+            if segment is None or len(segment) == 0:
+                raise RuntimeError(
+                    f"ملف الصوت '{clip_path.name}' مقروء لكن مدته صفر — غير صالح للدمج."
+                )
 
-        combined += segment
-        prev_meta = meta
+            if prev_meta is None:
+                gap = _clamp(meta.get("pause_before_ms", 0), 0, MAX_MERGE_GAP_MS, 0)
+                if gap > 0:
+                    combined += AudioSegment.silent(duration=gap, frame_rate=segment.frame_rate)
+            else:
+                gap_raw = int(prev_meta.get("pause_after_ms", 0)) + int(meta.get("pause_before_ms", 0))
+                gap = _clamp(gap_raw, 0, MAX_MERGE_GAP_MS, 0)
+                if gap > 0:
+                    combined += AudioSegment.silent(duration=gap, frame_rate=segment.frame_rate)
 
-    if prev_meta is not None:
-        tail = _clamp(prev_meta.get("pause_after_ms", 0), 0, MAX_MERGE_GAP_MS, 0)
-        if tail > 0:
-            combined += AudioSegment.silent(duration=tail, frame_rate=combined.frame_rate)
+            combined += segment
+            prev_meta = meta
 
-    output_file.parent.mkdir(parents=True, exist_ok=True)
-    combined.export(str(output_file), format="mp3")
+        if prev_meta is not None:
+            tail = _clamp(prev_meta.get("pause_after_ms", 0), 0, MAX_MERGE_GAP_MS, 0)
+            if tail > 0:
+                combined += AudioSegment.silent(duration=tail, frame_rate=combined.frame_rate)
+
+        if len(combined) == 0:
+            raise RuntimeError("ناتج الدمج فارغ — لا يمكن اعتماده كملف نهائي.")
+
+        combined.export(str(output_file), format="mp3")
+
+        if not output_file.exists() or output_file.stat().st_size == 0:
+            raise RuntimeError(
+                f"فشل التصدير: الملف الناتج مفقود أو فارغ بعد الدمج: {output_file}"
+            )
+
+    except Exception as merge_err:
+        # ============ 5) Rollback: حذف أي ملف ناتج ناقص/جزئي ============
+        if output_file.exists():
+            try:
+                output_file.unlink()
+                logger.warning(
+                    f"🧹 تم حذف الملف الصوتي الناتج غير المكتمل بعد فشل الدمج: "
+                    f"{output_file.name}"
+                )
+            except Exception as cleanup_err:
+                logger.error(
+                    f"❌ فشل حذف الملف الناتج غير المكتمل '{output_file}' — "
+                    f"يتطلب تنظيفاً يدوياً: {cleanup_err}"
+                )
+
+        if isinstance(merge_err, RuntimeError):
+            raise
+        raise RuntimeError(
+            f"فشل دمج مقاطع الصوت (Dependency/Merge Error، وليس من Azure): {merge_err}"
+        ) from merge_err
+
     logger.info(f"🎧 تم دمج {len(clips_meta)} Clips في الملف: {output_file}")
 
 
@@ -1072,6 +1173,17 @@ def generate_stage3_audio(
 
     if not isinstance(sentences, list) or not sentences:
         raise ValueError("قائمة الجمل فارغة أو غير صالحة!")
+
+    # --- فحص اعتمادية pydub قبل أي استدعاء Azure (Fail-Fast) ---
+    if not PYDUB_AVAILABLE or AudioSegment is None:
+        detail = PYDUB_IMPORT_ERROR or "سبب غير معروف"
+        raise RuntimeError(
+            "❌ لا يمكن بدء المرحلة الثالثة: مكتبة pydub غير مثبتة أو غير قابلة للاستيراد "
+            "(Dependency Missing)، وهي ضرورية لدمج مقاطع الصوت.\n"
+            f"   التفاصيل: {detail}\n"
+            "   هذا ليس خطأً من Azure Speech.\n"
+            "   للتثبيت: python -m pip install pydub"
+        )
 
     logger.info(f"🎙️ بدء المرحلة الثالثة (Azure) | الحلقة={episode_id} | الصوت={voice}")
 
