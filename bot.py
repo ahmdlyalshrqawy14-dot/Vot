@@ -874,7 +874,9 @@ async def present_audio_engine_choice(bot_or_query, chat_id=None):
 
 
 # =================================================================
-# 5. المرحلة 3 — تمرير stage1_result لـ Voice Director (مع Disk Fallback)
+# 5. المرحلة 3 — تمرير stage1_result لـ Voice Director
+#    ✅ تعديل: منع أي تنفيذ إذا تعذّر الحصول على نتيجة المرحلة الأولى
+#       + تحقق صارم من تطابق جمل الجلسة مع full_script_sentences
 # =================================================================
 
 async def run_stage3(query, context):
@@ -884,21 +886,6 @@ async def run_stage3(query, context):
     sentences = session.get("sentences", [])
     engine = "azure"
     voice = session.get("voice", "en-US-GuyNeural")
-
-    # ✅ استرجاع مخرجات المرحلة الأولى الكاملة لدعم Voice Director
-    episode_context = session.get("stage1_result")
-    if not isinstance(episode_context, dict):
-        s1_file = OUTPUTS_DIR / f"stage1_episode_{ep_id}.json"
-        if s1_file.exists():
-            try:
-                with open(s1_file, "r", encoding="utf-8") as f:
-                    episode_context = json.load(f)
-                session["stage1_result"] = episode_context
-            except Exception as e:
-                logger.error(f"فشل قراءة سياق المرحلة الأولى من القرص: {e}")
-                episode_context = session.get("episode_data")
-        else:
-            episode_context = session.get("episode_data")
 
     if _is_stale(chat_id, session):
         return
@@ -914,6 +901,65 @@ async def run_stage3(query, context):
         return
 
     try:
+        # ✅ استرجاع مخرجات المرحلة الأولى الكاملة (إلزامي لدعم Voice Director)
+        episode_context = session.get("stage1_result")
+
+        if not isinstance(episode_context, dict):
+            s1_file = OUTPUTS_DIR / f"stage1_episode_{ep_id}.json"
+
+            if not s1_file.exists():
+                raise RuntimeError(
+                    f"لم يتم العثور على نتيجة المرحلة الأولى للحلقة {ep_id}. "
+                    "لا يمكن توليد الصوت بدون الخطة الإبداعية المعتمدة."
+                )
+
+            try:
+                with open(s1_file, "r", encoding="utf-8") as f:
+                    episode_context = json.load(f)
+            except Exception as e:
+                raise RuntimeError(
+                    f"تعذر قراءة نتيجة المرحلة الأولى للحلقة {ep_id}: {e}"
+                )
+
+            if not isinstance(episode_context, dict):
+                raise RuntimeError(
+                    f"نتيجة المرحلة الأولى المخزّنة للحلقة {ep_id} تالفة أو ليست كائن JSON صالحًا."
+                )
+
+            session["stage1_result"] = episode_context
+
+        # =========================================================
+        # تحقق صارم من تطابق جمل الجلسة مع نتيجة المرحلة الأولى
+        # =========================================================
+
+        if not isinstance(episode_context, dict):
+            raise RuntimeError(
+                f"نتيجة المرحلة الأولى للحلقة {ep_id} ليست كائنًا صالحًا."
+            )
+
+        context_sentences = episode_context.get("full_script_sentences")
+
+        if not isinstance(context_sentences, list) or not context_sentences:
+            raise RuntimeError(
+                f"نتيجة المرحلة الأولى للحلقة {ep_id} "
+                "لا تحتوي على full_script_sentences صالحة."
+            )
+
+        if not isinstance(sentences, list) or not sentences:
+            raise RuntimeError(
+                f"لا توجد جمل صالحة في جلسة الحلقة {ep_id}."
+            )
+
+        if sentences != context_sentences:
+            raise RuntimeError(
+                f"جمل الجلسة لا تطابق full_script_sentences "
+                f"في نتيجة المرحلة الأولى للحلقة {ep_id}. "
+                "تم إيقاف المرحلة الثالثة لمنع إنتاج صوت بسياق غير متطابق."
+            )
+
+        if _is_stale(chat_id, session):
+            return
+
         audio_path = await asyncio.to_thread(
             generate_stage3_audio,
             episode_id=ep_id,
@@ -955,10 +1001,14 @@ async def run_stage3(query, context):
     except Exception as e:
         if _is_stale(chat_id, session):
             return
-        await wait_msg.edit_text(
-            f"❌ <b>خطأ أثناء توليد الصوت:</b>\n<code>{_esc(str(e))}</code>",
-            parse_mode=ParseMode.HTML,
-        )
+        logger.exception(f"خطأ في المرحلة الثالثة للحلقة {ep_id}")
+        try:
+            await wait_msg.edit_text(
+                f"❌ <b>خطأ أثناء توليد الصوت:</b>\n<code>{_esc(str(e))}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
 
 
 # =================================================================
