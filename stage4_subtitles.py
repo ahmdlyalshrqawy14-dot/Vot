@@ -36,6 +36,124 @@ def get_audio_duration_wave(audio_path: Path) -> float:
         return float(res.stdout.strip())
 
 
+def _build_proportional_timings(sentences: List[str], total_duration: float) -> List[Dict[str, Any]]:
+    """
+    خوارزمية الحل الاحتياطي: توزيع الزمن تناسبياً بناءً على عدد حروف كل جملة.
+    تُستخدم عند فشل Whisper أو عند إرجاعه صفر كلمات.
+    """
+    non_empty = [s for s in sentences if s and s.strip()]
+    total_chars = sum(len(s) for s in non_empty)
+    if total_chars <= 0 or total_duration <= 0:
+        return []
+    timings: List[Dict[str, Any]] = []
+    curr_t = 0.0
+    for s in sentences:
+        if not s or not s.strip():
+            continue
+        s_dur = (len(s) / total_chars) * total_duration
+        words = s.split()
+        w_dur = s_dur / max(len(words), 1)
+        for w in words:
+            timings.append({"word": w, "start": curr_t, "end": curr_t + w_dur})
+            curr_t += w_dur
+    return timings
+
+
+def _validate_and_align_word_timings(
+    sentences: List[str],
+    word_timings: List[Dict[str, Any]],
+    total_duration: float,
+) -> List[Dict[str, Any]]:
+    """
+    يوائم بين كلمات النص الأصلي وكلمات Whisper بأمان.
+
+    الحالات:
+    1) Whisper أعاد عدد كلمات قريب من النص (±15%): نأخذ توقيتاته ونوزع الفرق.
+    2) Whisper أعاد عدداً مختلفاً كثيراً: نرفضه ونستخدم المزامنة التناسبية.
+    3) Whisper أعاد كلمات أكثر من النص: نقتصر على أول n_text كلمة.
+    """
+    # استخراج كل كلمات النص الأصلي كقائمة مسطحة
+    text_words: List[str] = []
+    for s in sentences:
+        if s and s.strip():
+            text_words.extend(s.split())
+
+    n_text = len(text_words)
+    if n_text == 0:
+        return []
+
+    n_whisper = len(word_timings)
+    if n_whisper == 0:
+        return _build_proportional_timings(sentences, total_duration)
+
+    ratio = n_whisper / n_text
+
+    # --- الحالة 2: اختلاف كبير ⇒ رفض Whisper كلياً ---
+    if ratio < 0.85 or ratio > 1.15:
+        logger.warning(
+            f"⚠️ عدم تطابق كبير بين Whisper ({n_whisper}) "
+            f"والنص ({n_text}) بنسبة {ratio:.2f}. "
+            f"التحوّل إلى المزامنة التناسبية."
+        )
+        return _build_proportional_timings(sentences, total_duration)
+
+    # --- الحالة 3: Whisper أكثر ⇒ نقتصر على النص ---
+    if n_whisper >= n_text:
+        logger.info(f"ℹ️ Whisper أعاد {n_whisper} كلمة، النص {n_text}. اقتطاع الفائض.")
+        return [
+            {
+                "word": text_words[i],
+                "start": float(word_timings[i]["start"]),
+                "end": float(word_timings[i]["end"]),
+            }
+            for i in range(n_text)
+        ]
+
+    # --- الحالة 1: Whisper أقل ⇒ نوزّع الزمن المتبقي بعد آخر كلمة موثوقة ---
+    logger.warning(
+        f"⚠️ Whisper أعاد {n_whisper} كلمة مقابل {n_text} في النص. "
+        f"توزيع {n_text - n_whisper} كلمة على الزمن المتبقي."
+    )
+
+    last_end = float(word_timings[-1]["end"])
+    last_start = float(word_timings[-1]["start"])
+
+    # نضمن أن لدينا وقتاً كافياً حتى لا نقع في per_word = 0
+    remaining_time = max(total_duration - last_end, 0.0)
+    remaining_words = n_text - n_whisper
+
+    if remaining_time < 0.05 * remaining_words:
+        # لا يوجد وقت كافٍ فعلي (قد يكون Whisper تجاوز المدة)
+        # نمدّد بمعدل معقول: 0.35 ثانية/كلمة
+        per_word = 0.35
+        base_end = max(last_end, last_start + 0.1)
+    else:
+        per_word = remaining_time / remaining_words
+        base_end = last_end
+
+    aligned: List[Dict[str, Any]] = []
+
+    # الكلمات المطابقة من Whisper
+    for i in range(n_whisper):
+        aligned.append({
+            "word": text_words[i],
+            "start": float(word_timings[i]["start"]),
+            "end": float(word_timings[i]["end"]),
+        })
+
+    # الكلمات المتبقية بتوزيع تناسبي على الوقت المتبقي
+    curr_t = base_end
+    for i in range(n_whisper, n_text):
+        aligned.append({
+            "word": text_words[i],
+            "start": curr_t,
+            "end": curr_t + per_word,
+        })
+        curr_t += per_word
+
+    return aligned
+
+
 def align_audio_and_generate_ass(
     audio_path: Path,
     sentences: List[str],
@@ -47,32 +165,52 @@ def align_audio_and_generate_ass(
     - بدون شريط أو صندوق خلفي
     - إضاءة الكلمات بالتزامن مع النطق (Word-by-Word Highlight)
     """
+    # --- تحقق مبكر من المدخلات ---
+    if not sentences:
+        raise ValueError("قائمة الجمل فارغة.")
+
+    valid_sentences = [s for s in sentences if s and s.strip()]
+    if not valid_sentences:
+        raise ValueError("كل الجمل فارغة، لا يوجد نص صالح للمزامنة.")
+
     duration = get_audio_duration_wave(audio_path)
     logger.info(f"🎙️ إجمالي مدة الصوت: {duration:.2f} ثانية لعدد {len(sentences)} جملة.")
 
-    # محاولة استخدام faster-whisper للحصول على أدق توقيت للكلمات بالمللي ثانية
-    word_timings = []
+    # --- محاولة استخدام faster-whisper للحصول على أدق توقيت للكلمات ---
+    word_timings: List[Dict[str, Any]] = []
+    whisper_ok = False
     try:
         from faster_whisper import WhisperModel
         model = WhisperModel("base", device="cpu", compute_type="int8")
         segments, _ = model.transcribe(str(audio_path), word_timestamps=True)
         for seg in segments:
             for w in seg.words:
-                word_timings.append({"word": w.word.strip(), "start": w.start, "end": w.end})
+                if w.word and w.word.strip():
+                    word_timings.append({
+                        "word": w.word.strip(),
+                        "start": float(w.start),
+                        "end": float(w.end),
+                    })
+        whisper_ok = len(word_timings) > 0
     except Exception as e:
-        logger.warning(f"⚠️ تعذر تشغيل Whisper ({e}). تفعيل المزامنة التناسبية الذكية المبنية على أطوال الجمل...")
-        # خوارزمية صمام الأمان: توزيع الزمن تناسبياً بناءً على عدد حروف كل جملة
-        total_chars = sum(len(s) for s in sentences)
-        curr_t = 0.0
-        for s in sentences:
-            s_dur = (len(s) / total_chars) * duration
-            words = s.split()
-            w_dur = s_dur / max(len(words), 1)
-            for w in words:
-                word_timings.append({"word": w, "start": curr_t, "end": curr_t + w_dur})
-                curr_t += w_dur
+        logger.warning(f"⚠️ تعذر تشغيل Whisper ({e}).")
 
-    # ترويسة ملف الترجمة ASS المضبوطة بدقة
+    # --- تفعيل الحل الاحتياطي عند فشل Whisper أو إرجاعه صفر كلمات ---
+    if not whisper_ok:
+        logger.warning("⚠️ تفعيل المزامنة التناسبية الذكية المبنية على أطوال الجمل...")
+        word_timings = _build_proportional_timings(sentences, duration)
+    else:
+        # ✅ الحماية الجديدة: مطابقة عدد كلمات Whisper مع النص قبل بناء الأحداث
+        word_timings = _validate_and_align_word_timings(
+            sentences, word_timings, duration
+        )
+
+    # --- صمام أمان أخير: لا يمكن إنتاج أي توقيت ---
+    if not word_timings:
+        logger.error("❌ لا يمكن إنتاج أي توقيت: لا Whisper ولا الخوارزمية التناسبية أنتجت بيانات.")
+        raise RuntimeError("فشل توليد توقيتات الكلمات (word_timings فارغ).")
+
+    # --- ترويسة ملف الترجمة ASS المضبوطة بدقة ---
     ass_header = f"""[Script Info]
 ScriptType: v4.00+
 PlayResX: 1920
@@ -87,30 +225,39 @@ Style: Default,Arial,64,&H0047E0FD,&H0000FFFF,&H00101010,&H80000000,-1,0,0,0,100
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
 
-    # تقسيم الطوابع الزمنية للجمل
-    sentence_timeline = []
+    # --- تقسيم الطوابع الزمنية للجمل ---
+    sentence_timeline: List[Dict[str, Any]] = []
     w_idx = 0
     total_words_stream = len(word_timings)
 
-    ass_events = []
+    ass_events: List[str] = []
 
     for s_idx, sentence in enumerate(sentences):
-        s_words = sentence.split()
+        s_words = (sentence or "").split()
         if not s_words:
+            # نضيف مدخلاً فارغاً للحفاظ على تطابق الفهارس مع القائمة الأصلية
+            sentence_timeline.append({
+                "index": s_idx + 1,
+                "text": sentence or "",
+                "start": None,
+                "end": None,
+                "duration": 0.0,
+                "empty": True,
+            })
             continue
 
-        start_word = word_timings[min(w_idx, total_words_stream - 1)] if total_words_stream > 0 else {"start": 0}
+        start_word = word_timings[min(w_idx, total_words_stream - 1)]
         sent_start = start_word.get("start", 0.0)
 
         end_w_idx = min(w_idx + len(s_words) - 1, total_words_stream - 1)
-        end_word = word_timings[end_w_idx] if total_words_stream > 0 else {"end": sent_start + 2.0}
+        end_word = word_timings[end_w_idx]
         sent_end = max(end_word.get("end", sent_start + 1.5), sent_start + 0.8)
 
-        # بناء وسم الكاريوكي الحركي {\k duration_in_centiseconds} لإضاءة الكلمات
+        # --- بناء وسم الكاريوكي الحركي {\k duration_in_centiseconds} لإضاءة الكلمات ---
         karaoke_text = ""
         for i in range(len(s_words)):
             curr_pos = min(w_idx + i, total_words_stream - 1)
-            w_info = word_timings[curr_pos] if total_words_stream > 0 else {}
+            w_info = word_timings[curr_pos]
             w_start = w_info.get("start", sent_start)
             w_end = w_info.get("end", w_start + 0.3)
             w_duration_cs = max(int((w_end - w_start) * 100), 10)
@@ -127,12 +274,25 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             "text": sentence,
             "start": sent_start,
             "end": sent_end,
-            "duration": sent_end - sent_start
+            "duration": sent_end - sent_start,
+            "empty": False,
         })
 
         w_idx += len(s_words)
 
-    # حفظ ملف الـ .ass
+    # --- تحقق نهائي: عدد عناصر الـ timeline يجب أن يطابق عدد الجمل الأصلية ---
+    if len(sentence_timeline) != len(sentences):
+        logger.error(
+            f"❌ عدم تطابق: sentences={len(sentences)} "
+            f"لكن sentence_timeline={len(sentence_timeline)}"
+        )
+        raise RuntimeError("عدم تطابق بين الجمل الأصلية والخط الزمني الناتج.")
+
+    if not ass_events:
+        logger.error("❌ لم يتم توليد أي حدث ASS (ass_events فارغ).")
+        raise RuntimeError("لا يمكن حفظ ملف ترجمة فارغ.")
+
+    # --- حفظ ملف الـ .ass ---
     output_ass_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_ass_path, "w", encoding="utf-8") as f:
         f.write(ass_header + "\n".join(ass_events) + "\n")
