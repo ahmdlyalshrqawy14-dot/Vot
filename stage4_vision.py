@@ -136,18 +136,34 @@ def _scan_single_image(img_path: Path) -> Tuple[Path, Optional[int]]:
 def rename_images_with_detected_numbers(
     uploaded_images_dir: Path,
     output_frames_dir: Path,
-    expected_total: int
+    expected_total: int,
+    skip_paths: Optional[set] = None,
 ) -> Tuple[Dict[int, Path], List[Path], List[Tuple[int, Path, Path]]]:
     """
     يقرأ كل الصور، يكتشف الرقم من الركن الأيمن، ويعيد قاموساً بالأرقام المكتشفة.
+
+    [FIX-MANUAL-SKIP] أي مسار موجود في skip_paths (تعيين يدوي نهائي للمستخدم)
+    لا يُمرَّر إلى Gemini إطلاقًا، وبذلك لا يُسجَّل كفشل OCR ولا يُعاد فحصه.
     """
-    uploaded_files = [
-        p for p in uploaded_images_dir.iterdir()
-        if p.is_file() and p.suffix.lower() in VALID_EXTENSIONS
-    ]
+    skip_paths = skip_paths or set()
+
+    uploaded_files: List[Path] = []
+    for p in uploaded_images_dir.iterdir():
+        if not p.is_file() or p.suffix.lower() not in VALID_EXTENSIONS:
+            continue
+        # تخطّي أي صورة المستخدم عيّنها يدويًا — لا OCR عليها أبدًا
+        try:
+            if p.resolve() in skip_paths:
+                logger.info(f"🔒 تخطّي OCR (تعيين يدوي نهائي): {p.name}")
+                continue
+        except Exception:
+            pass
+        uploaded_files.append(p)
 
     if not uploaded_files:
-        raise FileNotFoundError("لم يتم العثور على أي صور في مجلد الرفع!")
+        # قد يكون كل شيء معيَّنًا يدويًا — لا نرفع استثناء، نعيد قوائم فارغة
+        logger.info("ℹ️ لا توجد صور بحاجة إلى OCR (كل الملفات معيَّنة يدويًا أو لا ملفات صالحة).")
+        return {}, [], []
 
     indexed_images: Dict[int, Path] = {}
     unindexed_files: List[Path] = []
@@ -198,36 +214,81 @@ def process_and_verify_images(
     Forward/Backward-Fill للخانات الناقصة. الدالة ترجع فقط الكادرات المؤكدة
     (Gemini + تخصيص يدوي)، وتترك النواقص لنظام المراجعة اليدوي في bot.py.
 
+    [FIX-MANUAL-FINAL] أي مسار موجود في manual_assignments يُعتبر اختيارًا نهائيًا
+    من المستخدم:
+      - يُستبعد من OCR تمامًا (لا يُمرَّر إلى Gemini).
+      - لا يظهر مطلقًا في unindexed_files.
+      - رقمه ثابت ولا يُعاد فحصه حتى مع إعادة التشغيل.
+
     Args:
         manual_assignments: تخصيصات يدوية من المستخدم {رقم: مسار_الصورة}
     """
     if not uploaded_images_dir.exists():
         raise FileNotFoundError(f"المجلد غير موجود: {uploaded_images_dir}")
 
+    # ---- 1) تطبيع التعيين اليدوي كمصدر نهائي ----
+    manual_assignments = manual_assignments or {}
+    manual_final: Dict[int, Path] = {}
+    manual_paths_skip: set = set()  # مسارات لا تُمرَّر إلى Gemini أبدًا
+
+    for raw_idx, raw_path in manual_assignments.items():
+        try:
+            idx = int(raw_idx)
+        except (TypeError, ValueError):
+            logger.warning(f"⚠️ مفتاح تعيين يدوي غير صالح: {raw_idx!r}")
+            continue
+        if not (1 <= idx <= expected_total):
+            logger.warning(f"⚠️ رقم تعيين يدوي خارج النطاق ({idx}) — تم تجاهله")
+            continue
+        p = Path(raw_path)
+        if not p.exists() or not p.is_file():
+            logger.warning(f"⚠️ مسار تعيين يدوي غير موجود: {p}")
+            continue
+        manual_final[idx] = p
+        try:
+            manual_paths_skip.add(p.resolve())
+        except Exception:
+            pass
+
+    # ---- 2) OCR فقط للصور غير المعيَّنة يدويًا ----
     indexed_images, unindexed_files, conflicts = rename_images_with_detected_numbers(
-        uploaded_images_dir, output_frames_dir, expected_total
+        uploaded_images_dir,
+        output_frames_dir,
+        expected_total,
+        skip_paths=manual_paths_skip,
     )
+
+    # أي ملف ظهر في unindexed وهو أصلًا معيَّن يدويًا → احذفه من قائمة الفشل
+    # (احتياط مزدوج؛ القائمة أساسًا لا تحتوي عليها بفضل skip_paths)
+    def _safe_resolve(x: Path) -> Optional[Path]:
+        try:
+            return x.resolve()
+        except Exception:
+            return None
+
+    unindexed_files = [
+        p for p in unindexed_files
+        if _safe_resolve(p) not in manual_paths_skip
+    ]
 
     # عزل مجلد renamed لكل حلقة على حدة
     renamed_dir = output_frames_dir.parent / f"{output_frames_dir.name}_renamed"
+    renamed_dir.mkdir(parents=True, exist_ok=True)
 
-    # دمج التخصيصات اليدوية إن وجدت (مؤكدة من المستخدم، ليست تخمينًا)
-    if manual_assignments:
-        for idx, img_path in manual_assignments.items():
-            if 1 <= idx <= expected_total:
-                new_path = renamed_dir / f"img_{idx:03d}.png"
-                img = read_image_safe(img_path)
-                if img is not None:
-                    write_image_safe(new_path, img)
-                    indexed_images[idx] = new_path
-                    logger.info(f"🔧 تم إضافة تخصيص يدوي: {img_path.name} → رقم {idx}")
+    # ---- 3) تثبيت التعيين اليدوي فوق نتيجة Gemini (أولوية المستخدم) ----
+    for idx, img_path in manual_final.items():
+        new_path = renamed_dir / f"img_{idx:03d}.png"
+        img = read_image_safe(img_path)
+        if img is not None:
+            write_image_safe(new_path, img)
+            indexed_images[idx] = new_path
+            logger.info(f"🔒 تعيين يدوي نهائي: {img_path.name} → رقم {idx}")
+        else:
+            # حتى لو القراءة فشلت، نحتفظ بالمسار الأصلي كاختيار مستخدم
+            indexed_images[idx] = img_path
+            logger.warning(f"⚠️ تعيين يدوي بدون إعادة ترميز: {img_path.name} → {idx}")
 
-                    if img_path in unindexed_files:
-                        unindexed_files.remove(img_path)
-
-    # [FIX-GUESSING-1] تم حذف التسكين التلقائي بالكامل.
-    # الصور التي فشل Gemini في قراءتها تبقى في unindexed_files ولا تُسكَّن
-    # في أي خانة تلقائيًا. قرارها يعود لنظام المراجعة اليدوي في bot.py.
+    # [FIX-GUESSING-1] لا تسكين تلقائي. النواقص تُترك لنظام المراجعة اليدوي.
 
     found_count = len(indexed_images)
     missing_numbers = [i for i in range(1, expected_total + 1) if i not in indexed_images]
@@ -260,8 +321,7 @@ def process_and_verify_images(
         logger.info(f"💾 تم توليد الكادر النهائي: {final_frame_path.name}")
         verified_frames.append(final_frame_path)
 
-    # [FIX-GUESSING-2] تم حذف Forward/Backward-Fill بالكامل.
-    # لن يتم نسخ صورة إلى خانة ناقصة. النواقص تُترك صراحةً لنظام المراجعة.
+    # [FIX-GUESSING-2] لا Forward/Backward-Fill. النواقص تُترك لنظام المراجعة.
 
     if missing_numbers:
         logger.warning(
