@@ -542,11 +542,29 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             await query.answer("لا توجد صور بحاجة لتعيين يدوي.", show_alert=True)
             return
 
-        session["manual_map"] = {}
-        session["manual_queue"] = list(unindexed)
+        # لا تمسح manual_map — اختيارات المستخدم السابقة نهائية
+        if not isinstance(session.get("manual_map"), dict):
+            session["manual_map"] = {}
+
+        # صفّ فقط الملفات التي لم تُعيَّن بعد
+        already = set()
+        for p in session["manual_map"].values():
+            try:
+                already.add(Path(p).resolve())
+            except Exception:
+                continue
+
+        session["manual_queue"] = [
+            p for p in unindexed
+            if Path(p).resolve() not in already
+        ]
         session["manual_missing"] = list(missing_idx)
         session["manual_current"] = None
         session["state"] = "MANUAL_ASSIGN"
+
+        if not session["manual_queue"]:
+            await query.answer("كل الصور غير المفهرسة تم تعيينها يدويًا مسبقًا.", show_alert=True)
+            return
 
         try:
             await query.edit_message_reply_markup(reply_markup=None)
