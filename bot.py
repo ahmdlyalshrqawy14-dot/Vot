@@ -506,6 +506,11 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             run_image_verification(query.message, context, allow_partial=True)
         )
 
+    elif data == "btn_proceed_with_ocr":
+        # اعتماد نتيجة OCR الحالية مباشرة بدون فحص تاني
+        session["image_review_allow_partial"] = True
+        await _finalize_after_manual(context, chat_id)
+
     # -------------------------------------------------------------
     # الوضع اليدوي (يبقى كما هو)
     # -------------------------------------------------------------
@@ -563,7 +568,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         session["state"] = "MANUAL_ASSIGN"
 
         if not session["manual_queue"]:
-            await query.answer("كل الصور غير المفهرسة تم تعيينها يدويًا مسبقًا.", show_alert=True)
+            await query.answer("كل الصور تم تعيينها يدويًا.", show_alert=True)
+            await _finalize_after_manual(context, chat_id)
             return
 
         try:
@@ -1205,6 +1211,109 @@ async def handle_manual_assign(query, context, slot):
     await show_next_manual_image(context, chat_id)
 
 
+
+async def _build_map_from_ocr_and_manual(session) -> dict:
+    """يدمج نتيجة OCR + التعيين اليدوي. اختيار المستخدم يطغى."""
+    merged = {}
+    for k, v in (session.get("ocr_indexed_map") or {}).items():
+        try:
+            merged[int(k)] = str(v)
+        except (TypeError, ValueError):
+            continue
+    for k, v in (session.get("manual_map") or {}).items():
+        try:
+            merged[int(k)] = str(v)
+        except (TypeError, ValueError):
+            continue
+    return merged
+
+
+async def _finalize_after_manual(context, chat_id):
+    """
+    بعد ما المستخدم يخلص التعيين اليدوي:
+    - نعتمد على كلامه كمصدر نهائي
+    - مفيش فحص OCR تاني
+    - نبني خريطة المراجعة ونقول له: تم التأكد، تحب تبدأ مونتاج؟
+    """
+    session = get_session(chat_id)
+    if _is_stale(chat_id, session):
+        return
+
+    total_expected = len(session.get("sentences", []) or [])
+    review_map = await _build_map_from_ocr_and_manual(session)
+
+    session["image_review_map"] = dict(review_map)
+    session["image_review_original"] = dict(review_map)
+    session["image_review_confirmed"] = {int(s): True for s in review_map}
+    session["image_review_confirmed_flag"] = True
+    session["image_review_summary"] = None
+    session["image_review_excluded"] = []
+    session["image_review_manual_edits"] = []
+    session["image_review_duplicates"] = []
+    session["image_review_mode"] = None
+    session["image_review_index"] = 0
+    session["image_review_items"] = []
+    session["image_review_missing"] = [
+        s for s in range(1, total_expected + 1) if s not in review_map
+    ]
+    session["final_image_map"] = dict(review_map)
+    session["state"] = "IMAGE_REVIEW_SUMMARY"
+
+    found = len(review_map)
+    missing = session["image_review_missing"]
+    missing_txt = _format_missing_indices(missing) if missing else "—"
+    manual_count = len(session.get("manual_map") or {})
+
+    fully = (found == total_expected) and (not missing)
+
+    if fully:
+        header = "✅ <b>تم التأكد من الصور بالكامل</b>"
+        note = "كل الأرقام اتعيّنت (OCR + يدوي). اختيارك نهائي — مش هنعمل فحص تاني."
+    else:
+        header = f"✅ <b>تم اعتماد {found} صورة</b>"
+        note = (
+            f"لسه فيه <code>{len(missing)}</code> رقم ناقص. "
+            "تقدر تبدأ مونتاج باللي موجود، أو ترفع الناقص وتعيد الفحص."
+        )
+
+    keyboard = []
+    if fully:
+        keyboard.append([
+            InlineKeyboardButton(
+                "🎬 ابدأ المونتاج / الرندرة الآن",
+                callback_data="review_summary_approve",
+            )
+        ])
+    else:
+        keyboard.append([
+            InlineKeyboardButton(
+                f"🎬 ابدأ المونتاج بالـ {found} صورة المتوفرة",
+                callback_data="review_summary_force_partial",
+            )
+        ])
+        keyboard.append([
+            InlineKeyboardButton(
+                "🔄 إعادة الفحص بعد رفع النواقص",
+                callback_data="btn_start_render",
+            )
+        ])
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"{header}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📸 <b>الصور المعتمدة:</b> <code>{found}</code> / <code>{total_expected}</code>\n"
+            f"🧩 <b>تعيين يدوي:</b> <code>{manual_count}</code>\n"
+            f"⚠️ <b>الناقص:</b> <code>{_esc(missing_txt)}</code>\n\n"
+            f"<i>{note}</i>\n\n"
+            f"👇 تحب تبدأ المونتاج دلوقتي؟"
+        ),
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode=ParseMode.HTML,
+    )
+
+
 async def show_next_manual_image(context, chat_id):
     session = get_session(chat_id)
     if _is_stale(chat_id, session):
@@ -1214,23 +1323,8 @@ async def show_next_manual_image(context, chat_id):
 
     if not queue:
         session["manual_current"] = None
-        session["state"] = "IDLE"
-        keyboard = [
-            [InlineKeyboardButton(
-                "🎬 بدء الفحص والمراجعة بعد التعيين اليدوي",
-                callback_data="btn_start_render"
-            )],
-        ]
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                "✅ <b>اكتمل التعيين اليدوي بنجاح!</b>\n"
-                f"عدد الصور المعيَّنة: <code>{len(session.get('manual_map', {}))}</code>\n"
-                "اضغط الزر أدناه لبدء الفحص والمراجعة."
-            ),
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode=ParseMode.HTML,
-        )
+        # اختيار المستخدم نهائي — مفيش OCR تاني
+        await _finalize_after_manual(context, chat_id)
         return
 
     current_path = queue.pop(0)
@@ -1345,18 +1439,26 @@ async def run_image_verification(msg_obj, context, allow_partial: bool = False):
         session["manual_missing_indices"] = list(m_err.missing_indices)
         session["image_review_missing"] = [int(x) for x in m_err.missing_indices]
 
+        # حفظ خريطة OCR الناجحة — اختيار المستخدم بعد كده نهائي ومش هنعيد الفحص
+        ocr_map = getattr(m_err, "indexed_images", None) or {}
+        session["ocr_indexed_map"] = {
+            int(k): str(v) for k, v in ocr_map.items()
+        }
+
         keyboard = []
         if unindexed_files:
+            # فيه صور زيادة / فشل OCR → الوضع اليدوي
             keyboard.append([
                 InlineKeyboardButton(
-                    f"🧩 تعيين يدوي لـ {len(unindexed_files)} صورة غير مُفهرسة",
+                    f"🧩 تعيين يدوي لـ {len(unindexed_files)} صورة",
                     callback_data="btn_manual_assign",
                 )
             ])
+        # دايمًا نقدر نكمل باللي اتقرا
         keyboard.append([
             InlineKeyboardButton(
-                f"⚡ متابعة وفحص الصور المتوفرة ({m_err.found_count} صورة) ومراجعتها",
-                callback_data="btn_force_render",
+                f"🎬 ابدأ المونتاج بالـ {m_err.found_count} صورة المتوفرة",
+                callback_data="btn_proceed_with_ocr",
             )
         ])
         keyboard.append([
@@ -1367,20 +1469,20 @@ async def run_image_verification(msg_obj, context, allow_partial: bool = False):
         ])
 
         extra_note = (
-            f"\n🧩 <b>صور غير مُفهرسة (فشل قراءة الـ OCR):</b> <code>{len(unindexed_files)}</code>"
+            f"\n🧩 <b>صور فشل قراءة رقمها (تحتاج تعيين يدوي):</b> <code>{len(unindexed_files)}</code>"
             if unindexed_files else ""
         )
 
         await progress_msg.edit_text(
-            f"🚨 <b>تنبيه: أصول مفقودة (Missing Images)</b>\n"
+            f"📊 <b>جرد الصور</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"تم التحقق بنجاح من <b>{m_err.found_count}</b> صورة من أصل <b>{m_err.total_expected}</b>.{extra_note}\n\n"
-            f"⚠️ <b>الصور المفقودة المطلوب رفعها:</b>\n"
+            f"✅ تم التحقق من <b>{m_err.found_count}</b> صورة من أصل <b>{m_err.total_expected}</b>.{extra_note}\n\n"
+            f"⚠️ <b>الأرقام الناقصة:</b>\n"
             f"<code>{_esc(missing_preview)}</code>\n\n"
-            f"👇 <b>الخيارات المتاحة:</b>\n"
-            f"• <b>تعيين يدوي</b>: اربط الصور التي فشل قراءة رقمها بكادراتها يدوياً.\n"
-            f"• <b>متابعة ومراجعة</b>: انتقل لمراجعة الصور المتوفرة (بدون رندرة تلقائية).\n"
-            f"• <b>إعادة الفحص</b>: بعد رفع النواقص للحصول على الحلقة الكاملة.",
+            f"👇 <b>اختار:</b>\n"
+            f"• <b>تعيين يدوي</b>: لو فيه صور زيادة أو فشل الـ OCR — هتشوف الصورة وتختار رقمها.\n"
+            f"• <b>ابدأ المونتاج</b>: بالموجود دلوقتي ({m_err.found_count} صورة) من غير فحص تاني.\n"
+            f"• <b>إعادة الفحص</b>: بعد ما ترفع الناقص.",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode=ParseMode.HTML,
         )
