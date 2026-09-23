@@ -59,7 +59,6 @@ OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 user_sessions = {}
 user_tasks = {}
 
-# جملة العينة الثابتة لمعاينة الأصوات
 VOICE_PREVIEW_TEXT = "Hello, this is a sample of my voice. How do I sound to you?"
 
 
@@ -76,11 +75,9 @@ def _fresh_session():
         "voice": None,
         "cancelled": False,
         "token": object(),
-        # ── حالة المرحلة الأولى (تدفق جديد بمرحلتين) ──
         "stage1_result": None,
         "stage1_approved": False,
         "stage1_plan_message_id": None,
-        # ── حالة التعيين اليدوي (Manual Assignment) ──
         "manual_map": {},                 # {int(slot): Path}
         "manual_queue": [],               # [Path, ...]
         "manual_missing": [],             # [int, ...]
@@ -122,9 +119,6 @@ def _cancel_user_task(chat_id):
     return False
 
 
-# =================================================================
-# ✅ [جديد] أدوات التنسيق الآمن لرسائل Telegram (HTML-Safe)
-# =================================================================
 def _esc(val, fallback: str = "—") -> str:
     """يهرّب أي قيمة قادمة من النموذج قبل وضعها في رسائل HTML."""
     if val is None:
@@ -201,22 +195,18 @@ def _build_stage1_summary(ep_id, episode, stage1_res) -> str:
     return "\n".join(lines)
 
 
-# =================================================================
-# ✅ [FIX #4] تنظيف شامل يشمل مجلد _clean_frames_renamed
-# =================================================================
 def _cleanup_episode_temp_files(ep_id):
-    """يحذف كل المجلدات المؤقتة للحلقة (يشمل renamed لتفادي تسريب السيرفر)."""
+    """يحذف كل المجلدات المؤقتة للحلقة لتفادي استهلاك المساحة."""
     if not ep_id:
         return
     targets = [
         OUTPUTS_DIR / f"episode_{ep_id}_prompts",
         OUTPUTS_DIR / f"episode_{ep_id}_raw_images",
         OUTPUTS_DIR / f"episode_{ep_id}_clean_frames",
-        OUTPUTS_DIR / f"episode_{ep_id}_clean_frames_renamed",   # 👈 إلزامي
+        OUTPUTS_DIR / f"episode_{ep_id}_clean_frames_renamed",
         OUTPUTS_DIR / f"episode_{ep_id}_temp_segments",
         OUTPUTS_DIR / f"episode_{ep_id}_temp_segments_audio",
         OUTPUTS_DIR / "temp_segments",
-        # ✅ [FIX-Q4] تنظيف أي مجلدات temp خاصة بالحلقات (نمط _temp_segments_ep)
         *OUTPUTS_DIR.glob("episode_*_temp_segments_ep*"),
     ]
     for t in targets:
@@ -328,7 +318,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     if session.get("cancelled"):
         return
 
-    # ── 1) بدء الحلقة المجدولة التالية ──
     if data == "btn_start_next":
         ep = get_episode(target_id=None)
         if not ep:
@@ -336,7 +325,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             return
         await show_episode_confirmation(query, ep)
 
-    # ── 2) إدخال رقم ID مخصص ──
     elif data == "btn_choose_id":
         session["state"] = "WAITING_EPISODE_ID"
         await query.edit_message_text(
@@ -345,7 +333,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             parse_mode=ParseMode.HTML,
         )
 
-    # ── 3) استعراض قائمة الحلقات ──
     elif data == "btn_list_episodes":
         episodes = load_all_episodes()
         if not episodes:
@@ -368,7 +355,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     elif data == "btn_back_main":
         await start_command(query, context)
 
-    # ── 4) تأكيد بدء إنتاج حلقة معينة → الآن يشغّل المرحلة الأولى فقط ──
     elif data.startswith("confirm_ep_"):
         target_id = data.replace("confirm_ep_", "")
         ep = get_episode(target_id)
@@ -378,21 +364,16 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 run_stage1_only(query, context, ep)
             )
 
-    # ── 4.b) ✅ جديد: اعتماد المرحلة الأولى → تشغيل المرحلة الثانية (مع تحقق آمن) ──
     elif data.startswith("approve_stage1_"):
         target_id = data.replace("approve_stage1_", "")
         active_id = session.get("episode_id")
 
-        # (1) تحقق أن الزر يخص الحلقة النشطة حالياً
         if not active_id or str(active_id) != str(target_id):
             logger.warning(
                 f"⚠️ approve_stage1 قديم/غير مطابق | target={target_id} | active={active_id}"
             )
             try:
-                await query.answer(
-                    "⚠️ هذا الزر لا يخص الحلقة النشطة الحالية.",
-                    show_alert=True,
-                )
+                await query.answer("⚠️ هذا الزر لا يخص الحلقة النشطة الحالية.", show_alert=True)
             except Exception:
                 pass
             try:
@@ -406,19 +387,14 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 pass
             return
 
-        # (2) تحقق أن المرحلة الثانية ليست معتمدة/قيد التنفيذ مسبقاً
         if session.get("stage1_approved") is True:
             logger.info(f"⏩ تم اعتماد المرحلة مسبقاً للحلقة {target_id}")
             try:
-                await query.answer(
-                    "ℹ️ تم اعتماد هذه المرحلة مسبقاً بالفعل.",
-                    show_alert=True,
-                )
+                await query.answer("ℹ️ تم اعتماد هذه المرحلة مسبقاً بالفعل.", show_alert=True)
             except Exception:
                 pass
             return
 
-        # (3) تحقق من وجود بيانات المرحلة الأولى (dict في الجلسة أو ملف على القرص)
         stage1_res = session.get("stage1_result")
         has_stage1_in_session = isinstance(stage1_res, dict)
         s1_file = OUTPUTS_DIR / f"stage1_episode_{target_id}.json"
@@ -430,10 +406,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 f"(session={has_stage1_in_session}, disk={has_stage1_on_disk})"
             )
             try:
-                await query.answer(
-                    "⚠️ لا توجد بيانات مرحلة أولى معتمدة لهذه الحلقة.",
-                    show_alert=True,
-                )
+                await query.answer("⚠️ لا توجد بيانات مرحلة أولى معتمدة لهذه الحلقة.", show_alert=True)
             except Exception:
                 pass
             try:
@@ -446,13 +419,11 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 pass
             return
 
-        # ✅ بعد نجاح التحقق الكامل: شغّل المرحلة الثانية
         _cancel_user_task(chat_id)
         user_tasks[chat_id] = asyncio.create_task(
             run_stage2_after_approval(query, context)
         )
 
-    # ── 4.c) ✅ جديد: إعادة توليد المرحلة الأولى ──
     elif data.startswith("regenerate_stage1_"):
         target_id = data.replace("regenerate_stage1_", "")
         ep = session.get("episode_data") or get_episode(target_id)
@@ -462,7 +433,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 run_stage1_only(query, context, ep)
             )
 
-    # ── 5) معاينة صوت (Voice Preview) — لا تغيّر حالة الجلسة ──
     elif data.startswith("preview_voice_"):
         preview_voice = data.replace("preview_voice_", "")
         try:
@@ -491,7 +461,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 pass
         return
 
-    # ── 6) اختيار الصوت النهائي وبدء المرحلة الثالثة (Azure فقط) ──
     elif data.startswith("voice_"):
         selected_voice = data.replace("voice_", "")
         session["voice"] = selected_voice
@@ -500,21 +469,16 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             run_stage3(query, context)
         )
 
-    # ── 7) بدء الرندرة بعد رفع الصور ──
     elif data == "btn_start_render":
         user_tasks[chat_id] = asyncio.create_task(
             run_stage4_and_5(query.message, context, allow_partial=False)
         )
 
-    # ── 8) الرندرة القسرية بالصور المتوفرة ──
     elif data == "btn_force_render":
         user_tasks[chat_id] = asyncio.create_task(
             run_stage4_and_5(query.message, context, allow_partial=True)
         )
 
-    # ══════════════════════════════════════════════════════════════
-    # ✅ [FIX #2]  زر إلغاء الوضع اليدوي — عبر edit_message_caption
-    # ══════════════════════════════════════════════════════════════
     elif data == "manual_cancel":
         session["state"] = "IDLE"
         session["manual_map"] = {}
@@ -541,7 +505,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             )
         return
 
-    # ── زر بدء الوضع اليدوي ──
     elif data == "btn_manual_assign":
         unindexed = session.get("manual_unindexed_files", []) or []
         missing_idx = session.get("manual_missing_indices", []) or []
@@ -562,12 +525,10 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
         await show_next_manual_image(context, chat_id)
 
-    # ── زر تعيين الصورة إلى Slot معيّن ──
     elif data.startswith("manual_assign_"):
         slot = data.replace("manual_assign_", "")
         await handle_manual_assign(query, context, slot)
 
-    # ── زر تخطي الصورة الحالية ──
     elif data == "manual_skip":
         session["manual_current"] = None
         try:
@@ -654,20 +615,14 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 # =================================================================
-# 4. ✅ [معدّل] المرحلة الأولى فقط + عرض الخطة واعتماد المستخدم
+# 4. المرحلة الأولى فقط + عرض الخطة واعتماد المستخدم
 # =================================================================
 
 async def run_stage1_only(query, context, episode):
-    """
-    ✅ يشغّل المرحلة الأولى فقط (سكربت + خطة إبداعية)،
-    يحفظ JSON، يخزّن النتيجة في الجلسة، ثم يعرض الملخص + أزرار الاعتماد.
-    لا يشغّل المرحلة الثانية تلقائيًا.
-    """
     chat_id = query.message.chat_id
     session = get_session(chat_id)
     ep_id = str(episode.get("id", "201"))
 
-    # تحديث الجلسة وتصفير حقول المرحلة الأولى
     session["episode_id"] = ep_id
     session["episode_data"] = episode
     session["uploaded_count"] = 0
@@ -698,7 +653,6 @@ async def run_stage1_only(query, context, episode):
             logger.info(f"⛔ تم إيقاف المرحلة 1 للحلقة {ep_id} بسبب /start")
             return
 
-        # حفظ JSON بنفس المسار والاسم
         s1_file = OUTPUTS_DIR / f"stage1_episode_{ep_id}.json"
         with open(s1_file, "w", encoding="utf-8") as f:
             json.dump(stage1_res, f, ensure_ascii=False, indent=2)
@@ -743,22 +697,13 @@ async def run_stage1_only(query, context, episode):
             )
         except Exception:
             pass
-        return
 
 
 # =================================================================
-# 4.b ✅ [معدّل] المرحلة الثانية — تُشغّل فقط بعد اعتماد المستخدم
+# 4.b المرحلة الثانية — تُشغّل فقط بعد اعتماد المستخدم
 # =================================================================
 
 async def run_stage2_after_approval(query, context):
-    """
-    ✅ تعمل عند ضغط زر approve_stage1_{ep_id}.
-    - تقرأ stage1_res من الجلسة أو من الملف.
-    - تستخرج full_script_sentences.
-    - تشغّل generate_stage2_prompts_batches مع تمرير stage1_result كاملًا.
-    - تحفظ المراسلات وترسل نفس ملفات prompts (بدون أي تغيير).
-    - ثم تستمر لواجهة اختيار الصوت (كما كان).
-    """
     chat_id = query.message.chat_id
     session = get_session(chat_id)
     ep_id = session.get("episode_id")
@@ -773,7 +718,6 @@ async def run_stage2_after_approval(query, context):
             pass
         return
 
-    # ── استرجاع نتيجة المرحلة الأولى من الجلسة أو من الملف ──
     stage1_res = session.get("stage1_result")
     if not isinstance(stage1_res, dict):
         s1_file = OUTPUTS_DIR / f"stage1_episode_{ep_id}.json"
@@ -831,7 +775,6 @@ async def run_stage2_after_approval(query, context):
         prompts_dir = OUTPUTS_DIR / f"episode_{ep_id}_prompts"
         prompts_dir.mkdir(parents=True, exist_ok=True)
 
-        # ✅ التعديل الجوهري: تمرير stage1_result كاملًا إلى المرحلة الثانية
         batches = await asyncio.to_thread(
             generate_stage2_prompts_batches,
             sentences,
@@ -842,7 +785,6 @@ async def run_stage2_after_approval(query, context):
             logger.info(f"⛔ تم إيقاف المرحلة 2 للحلقة {ep_id} بسبب /start")
             return
 
-        # ── حفظ وإرسال نفس ملفات prompts (نفس المنطق) ──
         for idx, batch in enumerate(batches, start=1):
             if _is_stale(chat_id, session):
                 return
@@ -877,7 +819,6 @@ async def run_stage2_after_approval(query, context):
         except Exception:
             await context.bot.send_message(chat_id=chat_id, text=done_card, parse_mode=ParseMode.HTML)
 
-        # ── الاستمرار إلى واجهة اختيار الصوت كما هو ──
         await present_audio_engine_choice(context.bot, chat_id=chat_id)
 
     except asyncio.CancelledError:
@@ -897,9 +838,6 @@ async def run_stage2_after_approval(query, context):
 
 
 async def present_audio_engine_choice(bot_or_query, chat_id=None):
-    """
-    ✅ [معدّل]: لم يعد هناك سؤال عن المحرك — نعرض قائمة أصوات Azure مباشرة.
-    """
     text = (
         "🎙️ <b>المرحلة 3: اختيار الصوت التعبيري (Microsoft Azure)</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -936,7 +874,7 @@ async def present_audio_engine_choice(bot_or_query, chat_id=None):
 
 
 # =================================================================
-# 5. المرحلة 3
+# 5. المرحلة 3 — تمرير stage1_result لـ Voice Director (مع Disk Fallback)
 # =================================================================
 
 async def run_stage3(query, context):
@@ -946,6 +884,21 @@ async def run_stage3(query, context):
     sentences = session.get("sentences", [])
     engine = "azure"
     voice = session.get("voice", "en-US-GuyNeural")
+
+    # ✅ استرجاع مخرجات المرحلة الأولى الكاملة لدعم Voice Director
+    episode_context = session.get("stage1_result")
+    if not isinstance(episode_context, dict):
+        s1_file = OUTPUTS_DIR / f"stage1_episode_{ep_id}.json"
+        if s1_file.exists():
+            try:
+                with open(s1_file, "r", encoding="utf-8") as f:
+                    episode_context = json.load(f)
+                session["stage1_result"] = episode_context
+            except Exception as e:
+                logger.error(f"فشل قراءة سياق المرحلة الأولى من القرص: {e}")
+                episode_context = session.get("episode_data")
+        else:
+            episode_context = session.get("episode_data")
 
     if _is_stale(chat_id, session):
         return
@@ -968,6 +921,7 @@ async def run_stage3(query, context):
             engine=engine,
             voice=voice,
             output_dir=OUTPUTS_DIR,
+            episode_context=episode_context,
         )
 
         if _is_stale(chat_id, session):
@@ -1055,8 +1009,9 @@ async def handle_media_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 # =================================================================
-# ✅ [FIX #3 + #6]  دالة المعالجة اليدوية + حماية Anti-Spam + توحيد نوع المفتاح
+# دالة المعالجة اليدوية + حماية Anti-Spam + توحيد نوع المفتاح
 # =================================================================
+
 async def handle_manual_assign(query, context, slot):
     chat_id = query.message.chat_id
     session = get_session(chat_id)
@@ -1064,9 +1019,6 @@ async def handle_manual_assign(query, context, slot):
     if not current:
         return
 
-    # ══════════════════════════════════════════════════════════════
-    # ✅ [FIX #6]  تخزين المفتاح كـ int لتوافقه مع stage4_vision.py
-    # ══════════════════════════════════════════════════════════════
     try:
         slot_int = int(slot)
     except (ValueError, TypeError):
@@ -1081,7 +1033,6 @@ async def handle_manual_assign(query, context, slot):
     except Exception:
         pass
 
-    # 👈 سحب لوحة الأزرار فوراً لمنع التكرار (Anti-Spam Guard)
     try:
         await query.edit_message_reply_markup(reply_markup=None)
     except Exception:
@@ -1123,9 +1074,6 @@ async def show_next_manual_image(context, chat_id):
     session["manual_queue"] = queue
     session["manual_current"] = current_path
 
-    # ══════════════════════════════════════════════════════════════
-    # ✅ [FIX #7]  التصفية بمفاتيح int متوافقة مع manual_map الجديد
-    # ══════════════════════════════════════════════════════════════
     assigned_keys = set(session.get("manual_map", {}).keys())
     remaining_slots = sorted([
         s for s in session.get("manual_missing", [])
@@ -1199,10 +1147,7 @@ async def run_stage4_and_5(msg_obj, context, allow_partial: bool = False):
     except Exception:
         return
 
-    # ── 1) فحص الصور ──
     try:
-        # ✅ [FIX #1]  اسم المعامل موحّد: manual_assignments
-        # ✅ [FIX #6]  المفاتيح الآن int → متوافقة مع stage4_vision
         frames = await asyncio.to_thread(
             process_and_verify_images,
             uploaded_images_dir=raw_dir,
@@ -1219,8 +1164,6 @@ async def run_stage4_and_5(msg_obj, context, allow_partial: bool = False):
             return
 
         missing_preview = _format_missing_indices(m_err.missing_indices)
-
-        # defensive: بعض الإصدارات قد لا تُرجع unindexed_files
         unindexed_files = list(getattr(m_err, "unindexed_files", []) or [])
         session["manual_unindexed_files"] = unindexed_files
         session["manual_missing_indices"] = list(m_err.missing_indices)
@@ -1276,7 +1219,6 @@ async def run_stage4_and_5(msg_obj, context, allow_partial: bool = False):
         )
         return
 
-    # ── 2) المزامنة + الرندرة ──
     partial_note = (
         "⚡ <b>الوضع القسري:</b> سيتم إنتاج فيديو بالصور المتوفرة فقط وتخطي الجمل المفقودة.\n"
         if allow_partial else ""
@@ -1347,7 +1289,6 @@ async def run_stage4_and_5(msg_obj, context, allow_partial: bool = False):
         )
         return
 
-    # ── 3) حزمة النشر الرقمي ──
     await context.bot.send_message(
         chat_id=chat_id,
         text="📦 <b>جاري إرسال حزمة النشر الرقمي (العناوين، الغلاف، الوصف، والتاجز)...</b>",
