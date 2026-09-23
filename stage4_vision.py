@@ -70,8 +70,6 @@ def extract_index_using_gemini_vision(image_path: Path) -> Optional[int]:
         corner_crop = img[crop_y:h, crop_x:w]
 
         # [FIX 1] تكبير 3x فقط بدون تحويل للرمادي أو رفع تباين حاد
-        # Gemini Vision شبكة بصرية تفهم الألوان والظلال الطبيعية، والفلتر الكلاسيكي
-        # (cvtColor + convertScaleAbs) يمحو ملامح الأرقام الباهتة ويحولها لتشويش رقمي.
         corner_crop = cv2.resize(corner_crop, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
 
         _, buffer = cv2.imencode(".jpg", corner_crop, [cv2.IMWRITE_JPEG_QUALITY, 95])
@@ -93,7 +91,6 @@ def extract_index_using_gemini_vision(image_path: Path) -> Optional[int]:
         numbers = re.findall(r"\b\d+\b", response_text)
         if numbers:
             detected = int(numbers[0])
-            # التحقق من أن الرقم في النطاق المنطقي (1-500)
             if 1 <= detected <= 500:
                 return detected
         return None
@@ -143,15 +140,6 @@ def rename_images_with_detected_numbers(
 ) -> Tuple[Dict[int, Path], List[Path], List[Tuple[int, Path, Path]]]:
     """
     يقرأ كل الصور، يكتشف الرقم من الركن الأيمن، ويعيد قاموساً بالأرقام المكتشفة.
-
-    [FIX 4] لم يعد يتم نسخ الصور إلى مجلد renamed_images؛ بل نحتفظ بالمسارات
-    الأصلية في الذاكرة ليطبق عليها الـ Inpainting لاحقاً مباشرة داخل الكادر
-    المستهدف، مما يلغي عملية كتابة قرص كاملة (60% توفير في I/O).
-
-    Returns:
-        - Dict[int, Path]: صور مرتبة بالأرقام المكتشفة (مسارات أصلية)
-        - List[Path]: صور لم يتم التعرف على رقمها
-        - List[Tuple[int, Path, Path]]: أرقام متكررة (الرقم، الصورة الأولى، الصورة الثانية)
     """
     uploaded_files = [
         p for p in uploaded_images_dir.iterdir()
@@ -167,7 +155,6 @@ def rename_images_with_detected_numbers(
 
     logger.info(f"🔍 بدء فحص {len(uploaded_files)} صورة بالتوازي...")
 
-    # OCR متوازي عبر 5 مسارات
     with ThreadPoolExecutor(max_workers=5) as executor:
         futures = {executor.submit(_scan_single_image, p): p for p in uploaded_files}
 
@@ -178,7 +165,6 @@ def rename_images_with_detected_numbers(
 
                 if detected_index is not None and 1 <= detected_index <= expected_total:
                     if detected_index in indexed_images:
-                        # رقم متكرر - نحتفظ بالأولى ونضيف الثانية للـ conflicts + unindexed
                         conflicts.append((detected_index, indexed_images[detected_index], img_path))
                         unindexed_files.append(img_path)
                         logger.warning(f"⚠️ رقم متكرر {detected_index}: {img_path.name} → أُرسلت للتعيين اليدوي")
@@ -193,12 +179,9 @@ def rename_images_with_detected_numbers(
                 logger.error(f"خطأ في معالجة {img_path.name}: {e}")
                 unindexed_files.append(img_path)
 
-    # [FIX 4] الاحتفاظ بالمسارات الأصلية مباشرة - لا كتابة قرص مكررة
-    final_indexed: Dict[int, Path] = indexed_images
+    logger.info(f"📊 النتائج: {len(indexed_images)} مكتشفة | {len(unindexed_files)} غير مكتشفة | {len(conflicts)} متكررة")
 
-    logger.info(f"📊 النتائج: {len(final_indexed)} مكتشفة | {len(unindexed_files)} غير مكتشفة | {len(conflicts)} متكررة")
-
-    return final_indexed, unindexed_files, conflicts
+    return indexed_images, unindexed_files, conflicts
 
 
 def process_and_verify_images(
@@ -211,22 +194,24 @@ def process_and_verify_images(
     """
     المعالجة الرئيسية مع دعم الوضع اليدوي.
 
+    [FIX-GUESSING] تم إلغاء التسكين التلقائي للصور غير المقروءة، وإلغاء
+    Forward/Backward-Fill للخانات الناقصة. الدالة ترجع فقط الكادرات المؤكدة
+    (Gemini + تخصيص يدوي)، وتترك النواقص لنظام المراجعة اليدوي في bot.py.
+
     Args:
         manual_assignments: تخصيصات يدوية من المستخدم {رقم: مسار_الصورة}
     """
     if not uploaded_images_dir.exists():
         raise FileNotFoundError(f"المجلد غير موجود: {uploaded_images_dir}")
 
-    # استخدام الدالة الجديدة لإعادة التسمية
     indexed_images, unindexed_files, conflicts = rename_images_with_detected_numbers(
         uploaded_images_dir, output_frames_dir, expected_total
     )
 
-    # [FIX 2] عزل مجلد renamed لكل حلقة على حدة لتفادي التداخل مع الحلقات الأخرى
-    # وتسهيل حذفه تلقائياً عند (/start) عبر bot.py
+    # عزل مجلد renamed لكل حلقة على حدة
     renamed_dir = output_frames_dir.parent / f"{output_frames_dir.name}_renamed"
 
-    # دمج التخصيصات اليدوية إن وجدت
+    # دمج التخصيصات اليدوية إن وجدت (مؤكدة من المستخدم، ليست تخمينًا)
     if manual_assignments:
         for idx, img_path in manual_assignments.items():
             if 1 <= idx <= expected_total:
@@ -237,25 +222,16 @@ def process_and_verify_images(
                     indexed_images[idx] = new_path
                     logger.info(f"🔧 تم إضافة تخصيص يدوي: {img_path.name} → رقم {idx}")
 
-                    # إزالة من غير المكتشفة لو موجودة
                     if img_path in unindexed_files:
                         unindexed_files.remove(img_path)
 
-    # تسكين الصور غير المقروءة في الأماكن الفارغة (تلقائياً)
-    if unindexed_files and not manual_assignments:
-        empty_slots = [i for i in range(1, expected_total + 1) if i not in indexed_images]
-        for slot, fallback_img in zip(empty_slots, unindexed_files):
-            new_path = renamed_dir / f"img_{slot:03d}.png"
-            img = read_image_safe(fallback_img)
-            if img is not None:
-                write_image_safe(new_path, img)
-                indexed_images[slot] = new_path
-                logger.info(f"📥 تم تسكين {fallback_img.name} في المكان الفارغ {slot}")
+    # [FIX-GUESSING-1] تم حذف التسكين التلقائي بالكامل.
+    # الصور التي فشل Gemini في قراءتها تبقى في unindexed_files ولا تُسكَّن
+    # في أي خانة تلقائيًا. قرارها يعود لنظام المراجعة اليدوي في bot.py.
 
     found_count = len(indexed_images)
     missing_numbers = [i for i in range(1, expected_total + 1) if i not in indexed_images]
 
-    # لو في صور ناقصة ولم يُطلب التجاوز
     if missing_numbers and not allow_partial:
         raise MissingAssetsError(
             missing_indices=missing_numbers,
@@ -270,33 +246,32 @@ def process_and_verify_images(
     output_frames_dir.mkdir(parents=True, exist_ok=True)
     verified_frames: List[Path] = []
 
-    first_available_idx = min(indexed_images.keys())
-
-    # كتابة الكادرات الحقيقية بترتيب ثابت (بدون رقعة)
+    # كتابة الكادرات المؤكدة فقط (بدون رقعة)
     for idx in sorted(indexed_images.keys()):
         raw_p = indexed_images[idx]
         final_frame_path = output_frames_dir / f"frame_{idx:03d}.png"
 
-        # ← إزالة الرقعة تماماً: نسخ الصورة كما هي
         img = read_image_safe(raw_p)
         if img is not None:
             write_image_safe(final_frame_path, img)
         else:
             shutil.copyfile(raw_p, final_frame_path)
 
-        logger.info(f"💾 تم توليد الكادر النهائي (بدون رقعة): {final_frame_path.name}")
-
-    # تطبيق ملء الفراغات التلقائي (Forward/Backward-Fill)
-    for frame_idx in range(1, expected_total + 1):
-        final_frame_path = output_frames_dir / f"frame_{frame_idx:03d}.png"
-
-        if frame_idx not in indexed_images:
-            candidates_before = [i for i in indexed_images if i < frame_idx]
-            source_idx = max(candidates_before) if candidates_before else first_available_idx
-            source_path = output_frames_dir / f"frame_{source_idx:03d}.png"
-            shutil.copyfile(source_path, final_frame_path)
-            logger.info(f"🔄 تم ملء الكادر {frame_idx:03d} من الكادر {source_idx:03d}")
-
+        logger.info(f"💾 تم توليد الكادر النهائي: {final_frame_path.name}")
         verified_frames.append(final_frame_path)
+
+    # [FIX-GUESSING-2] تم حذف Forward/Backward-Fill بالكامل.
+    # لن يتم نسخ صورة إلى خانة ناقصة. النواقص تُترك صراحةً لنظام المراجعة.
+
+    if missing_numbers:
+        logger.warning(
+            f"⚠️ كادرات ناقصة متروكة للمراجعة اليدوية (لم تُملأ تلقائيًا): {missing_numbers}"
+        )
+
+    if unindexed_files:
+        logger.warning(
+            f"⚠️ صور فشل قراءة رقمها ولم تُسكَّن تلقائيًا: "
+            f"{[p.name for p in unindexed_files]}"
+        )
 
     return verified_frames
