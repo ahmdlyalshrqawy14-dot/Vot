@@ -21,12 +21,15 @@ class MissingAssetsError(Exception):
         missing_indices: List[int],
         total_expected: int,
         found_count: int,
-        unindexed_files: Optional[List[Path]] = None
+        unindexed_files: Optional[List[Path]] = None,
+        indexed_images: Optional[Dict[int, Path]] = None,
     ):
         self.missing_indices = missing_indices
         self.total_expected = total_expected
         self.found_count = found_count
         self.unindexed_files = unindexed_files or []
+        # خريطة الصور اللي OCR نجح فيها — عشان ما نضيعها لما نرفع الاستثناء
+        self.indexed_images = indexed_images or {}
         msg = f"⚠️ تم التحقق من {found_count} صورة من أصل {total_expected}."
         super().__init__(msg)
 
@@ -298,7 +301,8 @@ def process_and_verify_images(
             missing_indices=missing_numbers,
             total_expected=expected_total,
             found_count=found_count,
-            unindexed_files=unindexed_files
+            unindexed_files=unindexed_files,
+            indexed_images=dict(indexed_images),  # نحفظ الخريطة عشان bot ما يضيعها
         )
 
     if not indexed_images:
