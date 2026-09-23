@@ -122,7 +122,65 @@ def render_final_video(
     - مؤثرات Ken Burns فقط (بدون Vignette)
     - انتقالات صوتية Soft Whoosh عند كل قطع
     - خلو تام بنسبة 100% من الموسيقى الخلفية
+
+    الحمايات المُضافة:
+    1) استبعاد العناصر الفارغة (empty=True) قبل المقارنة.
+    2) رفض أي duration <= 0 بدل تمريره إلى FFmpeg.
+    3) التحقق من وجود ملفات الصور وأنها ملفات فعلية قبل الرندرة.
     """
+
+    # ============================================================
+    # [حماية 1] استبعاد العناصر الفارغة + التحقق من تناسق الأعداد
+    # ============================================================
+    renderable_timeline = [it for it in timeline if not it.get("empty")]
+
+    if not renderable_timeline:
+        raise ValueError(
+            "قائمة التوقيت لا تحتوي على أي عنصر قابل للرندرة "
+            "(كل العناصر فارغة أو القائمة فارغة أصلًا)."
+        )
+
+    # حالتان مسموحتان فقط:
+    #   A) frames يطابق عدد العناصر غير الفارغة مباشرةً (الأكثر شيوعًا).
+    #   B) frames يطابق الـ timeline الكامل (بما فيها placeholder للعناصر الفارغة).
+    if len(frames) == len(renderable_timeline):
+        raw_pairs = list(zip(frames, renderable_timeline))
+    elif len(frames) == len(timeline):
+        raw_pairs = [
+            (f, it) for f, it in zip(frames, timeline)
+            if not it.get("empty")
+        ]
+    else:
+        raise ValueError(
+            f"عدم تناسق: عدد الصور ({len(frames)}) لا يطابق عدد العناصر القابلة "
+            f"للرندرة ({len(renderable_timeline)}) ولا العدد الكامل للـ timeline "
+            f"({len(timeline)})."
+        )
+
+    # ============================================================
+    # [حماية 2 + 3] التحقق من المدة الموجبة ومن سلامة ملفات الصور
+    # ============================================================
+    validated_pairs: List[tuple] = []
+    for idx, (frame_path, item) in enumerate(raw_pairs):
+        duration = float(item.get("duration", 0.0) or 0.0)
+        if duration <= 0:
+            preview = str(item.get("text", ""))[:40]
+            raise ValueError(
+                f"مدة غير صالحة ({duration}) للعنصر رقم {idx} "
+                f"(النص: {preview!r}). كل عنصر قابل للرندرة يجب أن تكون مدته > 0."
+            )
+
+        fp = Path(frame_path)
+        if not fp.exists():
+            raise FileNotFoundError(f"[{idx}] ملف الصورة غير موجود: {fp}")
+        if not fp.is_file():
+            raise ValueError(f"[{idx}] المسار ليس ملفًا عاديًا: {fp}")
+
+        validated_pairs.append((fp, item, duration))
+
+    # ============================================================
+    # من هذه النقطة نعمل حصريًا على validated_pairs
+    # ============================================================
     temp_dir = output_video_path.parent / "temp_segments"
     temp_dir.mkdir(parents=True, exist_ok=True)
 
@@ -132,21 +190,18 @@ def render_final_video(
     segment_files = []
     fps = 60
 
-    logger.info("🎬 جاري بناء المقاطع الحركية للقطات (Ken Burns)...")
+    logger.info(f"🎬 جاري بناء {len(validated_pairs)} مقطع Ken Burns...")
 
-    # 1. رندرة مقطع فيديو مستقل لكل لقطة بحسب مدتها وحركتها الخاصة
+    # 1. رندرة مقطع مستقل لكل لقطة
     #    [إصلاح 4]: حذف "-loop 1" لتفادي تقطيع zoompan واستهلاك الرام
-    for idx, (frame_path, item) in enumerate(zip(frames, timeline)):
-        duration = item["duration"]
+    for idx, (frame_path, _item, duration) in enumerate(validated_pairs):
         kb_filter = get_ken_burns_filter(idx, duration, fps=fps)
-        # ← تم إزالة الـ Vignette نهائياً — الصورة تظهر بطبيعتها
-        full_filter = kb_filter
 
         seg_output = temp_dir / f"seg_{idx:03d}.mp4"
         cmd = [
             "ffmpeg", "-y", "-v", "error",
             "-i", str(frame_path),
-            "-vf", full_filter,
+            "-vf", kb_filter,
             "-t", str(duration),
             "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", str(fps),
             str(seg_output)
@@ -178,13 +233,14 @@ def render_final_video(
     # 4. [إصلاح 1 + 3]: توليد مسار whoosh موحد في الذاكرة بدلاً من 80 مدخل FFmpeg
     logger.info("✨ حرق الترجمة الحركية الصفراء الباهتة وتطبيق مؤثرات الانتقال الصوتية...")
 
+    # بناء انتقالات whoosh من العناصر المُتحققة فقط (وليس من timeline الكامل)
     transition_times = []
     current_time = 0.0
-    for item in timeline[:-1]:
-        current_time += item["duration"]
+    for _, _, duration in validated_pairs[:-1]:
+        current_time += duration
         transition_times.append(current_time)
 
-    total_duration = sum(item["duration"] for item in timeline)
+    total_duration = sum(d for _, _, d in validated_pairs)
 
     whoosh_timeline = output_video_path.parent / "whoosh_timeline.wav"
     build_whoosh_timeline(
