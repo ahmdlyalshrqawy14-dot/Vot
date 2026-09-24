@@ -253,7 +253,15 @@ def _call_voice_director(
     cleaned = re.sub(r"^```(?:json)?\s*", "", str(raw).strip())
     cleaned = re.sub(r"\s*```$", "", cleaned).strip()
 
-    data = json.loads(cleaned)
+    try:
+        data = json.loads(cleaned)
+    except json.JSONDecodeError as e:
+        prefix = str(raw)[:200]
+        raise ValueError(
+            f"فشل تحويل رد Voice Director إلى JSON: {e}. "
+            f"أول 200 حرف من الرد الخام: {prefix!r}"
+        )
+
     if isinstance(data, dict) and "directions" in data:
         return data["directions"]
     elif isinstance(data, list):
@@ -484,10 +492,63 @@ def validate_audio_outputs(
     metadata_file: Path,
     expected_voice: Optional[str] = None,
 ) -> None:
+    # 1) الملف الصوتي النهائي
     if not final_audio_file.exists() or final_audio_file.stat().st_size == 0:
         raise ValueError("الملف الصوتي النهائي غير موجود أو فارغ!")
+
+    # 2) ملف البيانات الوصفية موجود
     if not metadata_file.exists():
         raise ValueError("ملف البيانات الوصفية غير موجود!")
+
+    # 3) البيانات الوصفية JSON صالح وهي dict
+    try:
+        with open(metadata_file, "r", encoding="utf-8") as f:
+            metadata = json.load(f)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"ملف البيانات الوصفية ليس JSON صالحاً: {e}")
+    except OSError as e:
+        raise ValueError(f"تعذر قراءة ملف البيانات الوصفية: {e}")
+
+    if not isinstance(metadata, dict):
+        raise ValueError("ملف البيانات الوصفية ليس كائن JSON (dict)!")
+
+    # 4) مطابقة عدد الجمل
+    sentence_count = metadata.get("sentence_count")
+    if sentence_count is not None and int(sentence_count) != len(sentences):
+        raise ValueError(
+            f"عدد الجمل في البيانات الوصفية ({sentence_count}) "
+            f"لا يطابق العدد الفعلي ({len(sentences)})"
+        )
+
+    # 5) قائمة المقاطع
+    clips = metadata.get("clips")
+    if not isinstance(clips, list):
+        raise ValueError("حقل 'clips' مفقود أو ليس قائمة في البيانات الوصفية!")
+    if len(clips) != len(sentences):
+        raise ValueError(
+            f"عدد المقاطع في البيانات الوصفية ({len(clips)}) "
+            f"لا يطابق عدد الجمل ({len(sentences)})"
+        )
+
+    # 6) كل ملف مقطع موجود وحجمه > 0
+    for idx, clip in enumerate(clips, start=1):
+        if not isinstance(clip, dict):
+            raise ValueError(f"المقطع رقم {idx} في البيانات الوصفية ليس كائن JSON!")
+        filename = clip.get("filename")
+        if not filename or not isinstance(filename, str):
+            raise ValueError(f"المقطع رقم {idx}: اسم الملف مفقود أو غير صالح!")
+        clip_path = clips_dir / filename
+        if not clip_path.exists() or clip_path.stat().st_size == 0:
+            raise ValueError(f"المقطع رقم {idx} ({filename}) غير موجود أو فارغ!")
+
+    # 7) مطابقة الصوت
+    if expected_voice is not None:
+        meta_voice = metadata.get("voice_name")
+        if meta_voice is not None and meta_voice != expected_voice:
+            raise ValueError(
+                f"الصوت في البيانات الوصفية '{meta_voice}' "
+                f"لا يطابق الصوت المتوقع '{expected_voice}'"
+            )
 
 def _safe_cleanup_staging(staging_clips_dir: Path, staging_audio_file: Path, staging_metadata_file: Path):
     if staging_clips_dir.exists():
@@ -508,6 +569,42 @@ def generate_stage3_audio(
     output_dir: Path = Path("outputs"),
     episode_context: Optional[Dict[str, Any]] = None,
 ) -> Path:
+    # =========================================================
+    # HARD GUARDS — قبل أي استدعاء مدفوع (Azure / Gemini)
+    # =========================================================
+
+    # A) المحرك: azure فقط
+    engine_norm = str(engine).lower().strip()
+    if engine_norm != "azure":
+        raise ValueError(
+            f"المحرك '{engine}' غير مدعوم. المحرك الوحيد المتاح هو 'azure'."
+        )
+
+    # B) الصوت: يجب أن يكون ضمن الأصوات الذكورية المعتمدة
+    if not isinstance(AZURE_MALE_VOICES, (set, list, tuple, dict)) or voice not in AZURE_MALE_VOICES:
+        try:
+            allowed = ", ".join(sorted(AZURE_MALE_VOICES)) if AZURE_MALE_VOICES else "(لا يوجد)"
+        except Exception:
+            allowed = str(AZURE_MALE_VOICES)
+        raise ValueError(
+            f"الصوت '{voice}' غير مسموح. الأصوات المتاحة: {allowed}"
+        )
+
+    # C) الجمل: قائمة غير فارغة من نصوص غير فارغة
+    if not isinstance(sentences, list) or not sentences:
+        raise ValueError("قائمة الجمل فارغة أو غير صالحة!")
+    for i, s in enumerate(sentences, start=1):
+        if not isinstance(s, str) or not s.strip():
+            raise ValueError(f"الجملة رقم {i} فارغة أو ليست نصاً صالحاً!")
+
+    # D) pydub إلزامي للدمج — قبل أي استدعاء Azure
+    if not PYDUB_AVAILABLE or AudioSegment is None:
+        raise RuntimeError(
+            "مكتبة pydub مطلوبة لدمج المقاطع الصوتية ولا يمكن المتابعة بدونها. "
+            f"التفاصيل: {PYDUB_IMPORT_ERROR or 'غير معروف'}. "
+            "للتثبيت: python -m pip install pydub"
+        )
+
     output_dir.mkdir(parents=True, exist_ok=True)
     final_audio_file = output_dir / f"episode_{episode_id}_audio.mp3"
     clips_dir = output_dir / f"episode_{episode_id}_clips"
@@ -574,20 +671,49 @@ def generate_stage3_audio(
         with open(staging_metadata_file, "w", encoding="utf-8") as f:
             json.dump(metadata, f, ensure_ascii=False, indent=2)
 
-        validate_audio_outputs(sentences, staging_clips_dir, staging_audio_file, staging_metadata_file, expected_voice=voice)
+        # تحقق شامل على مسارات الـ staging قبل أي التزام نهائي
+        validate_audio_outputs(
+            sentences,
+            staging_clips_dir,
+            staging_audio_file,
+            staging_metadata_file,
+            expected_voice=voice,
+        )
 
-        # النقل النهائي الآمن
-        if clips_dir.exists():
-            shutil.rmtree(clips_dir)
-        staging_clips_dir.rename(clips_dir)
+        # =====================================================
+        # SAFE COMMIT — لا نحذف النهائيات إلا بعد نجاح التحقق
+        # =====================================================
+
+        # 1) الصوت والبيانات الوصفية: Path.replace ذرّي على نفس نظام الملفات
         staging_audio_file.replace(final_audio_file)
         staging_metadata_file.replace(metadata_file)
+
+        # 2) مجلد المقاطع: نُزيح القديم جانباً، نُدخل الجديد، ثم نحذف القديم
+        old_clips_backup = output_dir / f"episode_{episode_id}_clips__old_{run_id}"
+        had_old_clips = clips_dir.exists()
+        if had_old_clips:
+            clips_dir.rename(old_clips_backup)
+
+        try:
+            staging_clips_dir.rename(clips_dir)
+        except Exception:
+            # استرجاع النسخة القديمة إن فشل نقل الـ staging
+            if had_old_clips and old_clips_backup.exists() and not clips_dir.exists():
+                try:
+                    old_clips_backup.rename(clips_dir)
+                except Exception:
+                    logger.error("⚠️ فشل استرجاع مجلد المقاطع القديم بعد فشل الالتزام.")
+            raise
+
+        if old_clips_backup.exists():
+            shutil.rmtree(old_clips_backup, ignore_errors=True)
 
         logger.info(f"✅ تم إنتاج صوت حلقة Vot بالهوية الجديدة بنجاح: {final_audio_file}")
         return final_audio_file
 
     except Exception as err:
         logger.error(f"❌ خطأ أثناء توليد الصوت: {err}")
+        # تنظيف الـ staging فقط. لا نحذف ملفات نهائية من تشغيل سابق ناجح.
         _safe_cleanup_staging(staging_clips_dir, staging_audio_file, staging_metadata_file)
         raise err
 
@@ -600,7 +726,7 @@ def generate_voice_preview(
     final_voice = voice_name or voice
     output_dir.mkdir(parents=True, exist_ok=True)
     preview_file = output_dir / f"preview_{final_voice}.mp3"
-    
+
     direction = {"azure_style": "calm", "energy": 2, "rate_percent": -4, "pitch_percent": -1}
     ssml_payload = build_sentence_ssml(text, direction, final_voice)
     call_azure_tts_api(ssml_payload, preview_file)
