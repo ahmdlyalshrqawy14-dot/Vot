@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import shutil
 import asyncio
@@ -78,6 +79,7 @@ def _fresh_session():
         "stage1_result": None,
         "stage1_approved": False,
         "stage1_plan_message_id": None,
+        "awaiting_script_edit": False,    # NEW: وضع تعديل السكريبت اليدوي
         "manual_map": {},                 # {int(slot): Path}
         "manual_queue": [],               # [Path, ...]
         "manual_missing": [],             # [int, ...]
@@ -157,6 +159,78 @@ def _as_list(val):
 
 def _as_dict(val):
     return val if isinstance(val, dict) else {}
+
+
+# =================================================================
+# FORMAT-ONLY NORMALIZER (NEW)
+# =================================================================
+
+def normalize_script_sentences(raw_text: str) -> list[str]:
+    """
+    تنظيف تنسيقي فقط للسكريبت — لا إعادة صياغة ولا ترجمة ولا تغيير معنى.
+    - يقسم النص على الفواصل: أسطر جديدة + علامات نهاية الجملة (. ? !)
+    - يزيل المسافات الطرفية
+    - يسقط القطع الفارغة
+    - يضيف نقطة واحدة إن لم تكن الجملة منتهية بـ . ? !
+    - يدمج المسافات الداخلية المتعددة إلى مسافة واحدة
+    - يرفع ValueError لو لم تُستخرج أي جملة صالحة
+    """
+    if raw_text is None or not isinstance(raw_text, str):
+        raise ValueError("النص المُرسل فارغ أو غير صالح.")
+
+    text = raw_text.replace("\r\n", "\n").replace("\r", "\n")
+
+    # تقسيم على نهايات الجمل متبوعة بمسافة/سطر جديد، وعلى الأسطر الجديدة.
+    parts = re.split(r'(?<=[.!?])(?=\s)|\n+', text)
+
+    sentences: list[str] = []
+    for part in parts:
+        s = part.strip()
+        if not s:
+            continue
+        s = re.sub(r'\s+', ' ', s)
+        if s[-1] not in '.!?':
+            s = s + '.'
+        sentences.append(s)
+
+    if not sentences:
+        raise ValueError("لم يتم العثور على أي جمل صالحة في النص المُرسل.")
+
+    return sentences
+
+
+def _save_normalized_sentences(ep_id, session, normalized: list[str]) -> None:
+    """
+    يحفظ الجمل المُنسّقة داخل stage1_result + session + stage1_episode_{id}.json
+    """
+    stage1_res = session.get("stage1_result")
+    if not isinstance(stage1_res, dict):
+        stage1_res = {}
+
+    stage1_res["full_script_sentences"] = list(normalized)
+
+    # إعادة حساب عدد الكلمات إن كان الحقل موجوداً أو لإضافته دائماً
+    try:
+        stage1_res["total_word_count"] = int(
+            sum(len(s.split()) for s in normalized)
+        )
+    except Exception:
+        pass
+
+    session["stage1_result"] = stage1_res
+    session["sentences"] = list(normalized)
+
+    if not ep_id:
+        return
+    s1_file = OUTPUTS_DIR / f"stage1_episode_{ep_id}.json"
+    try:
+        with open(s1_file, "w", encoding="utf-8") as f:
+            json.dump(stage1_res, f, ensure_ascii=False, indent=2)
+        logger.info(
+            f"💾 تم حفظ السكريبت المُنسّق للحلقة {ep_id} ({len(normalized)} جملة)"
+        )
+    except Exception as e:
+        logger.error(f"فشل حفظ stage1_episode_{ep_id}.json بعد التعديل اليدوي: {e}")
 
 
 def _build_stage1_summary(ep_id, episode, stage1_res) -> str:
@@ -273,10 +347,21 @@ def _format_missing_indices(missing, limit=15):
 
 # =================================================================
 # 1. /start → إعادة تشغيل كاملة (Hard Reset)
+# يدعم الاستدعاء من Update (CommandHandler) و CallbackQuery (btn_back_main)
 # =================================================================
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
+async def start_command(update_or_query, context: ContextTypes.DEFAULT_TYPE):
+    # يدعم الاستدعاء من:
+    #   - Update        (CommandHandler: /start)
+    #   - CallbackQuery (btn_back_main)
+    if isinstance(update_or_query, Update):
+        chat_id = update_or_query.effective_chat.id
+        reply_message = update_or_query.message
+    else:
+        # CallbackQuery
+        chat_id = update_or_query.message.chat_id
+        reply_message = update_or_query.message
+
     cancelled = _cancel_user_task(chat_id)
 
     old_session = user_sessions.get(chat_id)
@@ -316,7 +401,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ],
     ]
 
-    await update.message.reply_text(
+    await reply_message.reply_text(
         welcome_text,
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode=ParseMode.HTML,
@@ -444,6 +529,46 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         _cancel_user_task(chat_id)
         user_tasks[chat_id] = asyncio.create_task(
             run_stage2_after_approval(query, context)
+        )
+
+    # =============================================================
+    # NEW: تعديل السكريبت يدوياً بعد المرحلة الأولى
+    # =============================================================
+    elif data.startswith("edit_stage1_"):
+        target_id = data.replace("edit_stage1_", "")
+        active_id = session.get("episode_id")
+
+        if not active_id or str(active_id) != str(target_id):
+            logger.warning(
+                f"⚠️ edit_stage1 قديم/غير مطابق | target={target_id} | active={active_id}"
+            )
+            try:
+                await query.answer("⚠️ هذا الزر لا يخص الحلقة النشطة الحالية.", show_alert=True)
+            except Exception:
+                pass
+            return
+
+        if session.get("stage1_approved") is True:
+            try:
+                await query.answer("ℹ️ تم اعتماد هذه المرحلة بالفعل.", show_alert=True)
+            except Exception:
+                pass
+            return
+
+        session["awaiting_script_edit"] = True
+        session["state"] = "WAITING_SCRIPT_EDIT"
+
+        await query.edit_message_text(
+            "✏️ <b>وضع تعديل السكريبت اليدوي</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "الصق الآن <b>السكريبت الكامل</b> كنص عادي:\n"
+            "• <b>جملة واحدة لكل سطر</b> (مُفضّل) — أو نص متصل.\n"
+            "• سيقوم البوت <b>فقط</b> بتصحيح علامات الترقيم والتنسيق — "
+            "<b>بدون</b> إعادة صياغة أو ترجمة أو تغيير للمعنى.\n"
+            "• بعد التأكيد ستظهر لك معاينة، وسيتبقى عليك الضغط على "
+            "<b>✅ اعتماد</b> للانتقال إلى المرحلة الثانية.\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            parse_mode=ParseMode.HTML,
         )
 
     elif data.startswith("regenerate_stage1_"):
@@ -730,6 +855,90 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
         return
 
+    # =============================================================
+    # NEW: استقبال السكريبت المُعدَّل يدوياً (WAITING_SCRIPT_EDIT)
+    # =============================================================
+    if state == "WAITING_SCRIPT_EDIT":
+        if _is_stale(chat_id, session):
+            return
+
+        raw = update.message.text or ""
+        try:
+            normalized = normalize_script_sentences(raw)
+        except ValueError as ve:
+            await update.message.reply_text(
+                f"⚠️ <b>لم أتمكن من قراءة أي جمل صالحة من النص.</b>\n"
+                f"<i>{_esc(str(ve))}</i>\n\n"
+                f"أرسل النص مرة أخرى (يُفضّل جملة واحدة لكل سطر).",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        except Exception as e:
+            logger.exception("خطأ غير متوقع أثناء تنسيق السكريبت اليدوي")
+            await update.message.reply_text(
+                f"❌ <b>خطأ أثناء التنسيق:</b>\n<code>{_esc(str(e))}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        ep_id = session.get("episode_id")
+        _save_normalized_sentences(ep_id, session, normalized)
+
+        # لا يُعتبر معتمداً حتى يضغط زر الاعتماد
+        session["awaiting_script_edit"] = False
+        session["state"] = "IDLE"
+        session["stage1_approved"] = False
+
+        n = len(normalized)
+        first_three = normalized[:3]
+        last_two = normalized[-2:] if n > 3 else []
+
+        def _fmt(lst):
+            if not lst:
+                return "  —"
+            return "\n".join(f"  • {_esc(s)}" for s in lst)
+
+        preview_lines = [
+            "<b>✅ تم تنسيق السكريبت بنجاح</b>",
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            f"🧩 <b>عدد الجمل:</b> <code>{n}</code>",
+            "",
+            "<b>أول 3 جمل:</b>",
+            _fmt(first_three),
+        ]
+        if last_two:
+            preview_lines.append("")
+            preview_lines.append("<b>آخر جملتين:</b>")
+            preview_lines.append(_fmt(last_two))
+        preview_lines.extend([
+            "",
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            "<i>⚠️ لم يتم الاعتماد بعد — اضغط الزر أدناه للانتقال للمرحلة الثانية.</i>",
+        ])
+
+        keyboard = [
+            [InlineKeyboardButton(
+                "✅ اعتماد السكريبت المعدّل والانتقال للمرحلة الثانية",
+                callback_data=f"approve_stage1_{ep_id}",
+            )],
+            [InlineKeyboardButton(
+                "✏️ تعديل مرة أخرى",
+                callback_data=f"edit_stage1_{ep_id}",
+            )],
+            [InlineKeyboardButton(
+                "🔄 إعادة توليد من الصفر",
+                callback_data=f"regenerate_stage1_{ep_id}",
+            )],
+            [InlineKeyboardButton("❌ إلغاء", callback_data="btn_back_main")],
+        ]
+
+        await update.message.reply_text(
+            "\n".join(preview_lines),
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
     if state == "WAITING_IMAGE_CORRECTION":
         await handle_image_correction_text(update, context)
         return
@@ -749,6 +958,7 @@ async def run_stage1_only(query, context, episode):
     session["uploaded_count"] = 0
     session["stage1_approved"] = False
     session["stage1_result"] = None
+    session["awaiting_script_edit"] = False
 
     if _is_stale(chat_id, session):
         return
@@ -788,6 +998,10 @@ async def run_stage1_only(query, context, episode):
             [InlineKeyboardButton(
                 "✅ اعتماد الخطة والانتقال للمرحلة الثانية",
                 callback_data=f"approve_stage1_{ep_id}",
+            )],
+            [InlineKeyboardButton(
+                "✏️ تعديل السكريبت يدويًا",
+                callback_data=f"edit_stage1_{ep_id}",
             )],
             [InlineKeyboardButton(
                 "🔄 إعادة توليد المرحلة الأولى",
@@ -967,7 +1181,9 @@ async def present_audio_engine_choice(bot_or_query, chat_id=None):
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     )
 
+    # Brian هو الصوت المُعتمد والموصى به لقناة VOT
     descriptions = {
+        "en-US-BrianMultilingualNeural": "الصوت المعتمد لقناة VOT — سرد هادئ وإنساني ⭐",
         "en-US-GuyNeural": "تلوين انفعالي كامل وشامل 🌟",
         "en-US-DavisNeural": "سرد ناضج وهادئ وقوي 📖",
         "en-US-TonyNeural": "صوت حماسي وواثق وعالي الطاقة ⚡",
@@ -1004,7 +1220,7 @@ async def run_stage3(query, context):
     ep_id = session.get("episode_id")
     sentences = session.get("sentences", [])
     engine = "azure"
-    voice = session.get("voice", "en-US-GuyNeural")
+    voice = session.get("voice", "en-US-BrianMultilingualNeural")
 
     if _is_stale(chat_id, session):
         return
@@ -2307,7 +2523,7 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_media_upload))
 
     print("=" * 60)
-    print("🚀 محرك Vot Studio Pro يعمل الآن — Stage1 Approval + Image Review System")
+    print("🚀 محرك Vot Studio Pro يعمل الآن — Stage1 Approval + Manual Script Edit + Image Review System")
     print("=" * 60)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
