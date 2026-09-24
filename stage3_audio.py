@@ -51,10 +51,17 @@ if not PYDUB_AVAILABLE:
     )
 
 # =============================================================
-# VOT VOICE BIBLE (ثابت على مستوى القناة)
+# VOT VOICE BIBLE (ثابت على مستوى القناة) — v2
 # =============================================================
 VOT_VOICE_BIBLE = {
-    "identity": "calm scientific cinematic narrator",
+    "channel": "VOT",
+    "series_frame": "The Rebuild",
+    "series_frame_description": (
+        "One continuous journey of rebuilding — the audience is walking alongside "
+        "the narrator through a long, deliberate reconstruction. Every episode is a "
+        "chapter in that journey, not a standalone tip list."
+    ),
+    "identity": "calm scientific cinematic narrator with quiet authority",
     "personality": [
         "confident",
         "intelligent",
@@ -69,17 +76,26 @@ VOT_VOICE_BIBLE = {
         "advertisement tone",
         "trailer voice",
         "random emotional jumps",
-        "unnatural speed changes"
+        "unnatural speed changes",
+        "hype influencer energy",
+        "comedy-host energy"
     ],
     "voice_consistency": {
         "keep_one_selected_voice_across_episode": True,
         "male_voice_only": True,
         "language": "en-US"
     },
-    "narrative_principle": "The voice should never compete with the story. It should make the story impossible to ignore."
+    "narrative_principle": (
+        "The voice should never compete with the story. "
+        "It should make the story impossible to ignore."
+    ),
+    "series_principle": (
+        "Speak as if guiding someone through a long rebuild — patient, precise, "
+        "never rushed, never preachy."
+    )
 }
 
-VOICE_BIBLE_VERSION = "v1"
+VOICE_BIBLE_VERSION = "v2"
 
 # قائمة الانفعالات المعتمدة لمسار Google (محفوظة لكن غير مستخدمة)
 APPROVED_GOOGLE_EMOTIONS = {
@@ -140,30 +156,50 @@ MAX_VOICE_CONTEXT_CHARS = 6000
 # برومبتات النظام
 # =============================================================
 
-STAGE_3_VOICE_DIRECTOR_SYSTEM_PROMPT = """You are the AI VOICE DIRECTOR for a cinematic science narration channel called VOT.
+STAGE_3_VOICE_DIRECTOR_SYSTEM_PROMPT = """You are the AI VOICE DIRECTOR for a cinematic science narration channel called VOT, currently producing the series "The Rebuild".
 
 Your ONLY job is to design a delivery plan for an existing script, sentence by sentence.
 You do NOT rewrite the script. You do NOT add words. You do NOT remove words. You do NOT paraphrase.
 
-================ VOT VOICE BIBLE (LOCKED, NEVER CHANGE) ================
-Identity: calm scientific cinematic narrator
+================ VOT VOICE BIBLE v2 (LOCKED, NEVER CHANGE) ================
+Channel: VOT
+Series frame: "The Rebuild" — one continuous journey of rebuilding, not a random tip list.
+Every episode is a chapter in that journey. Speak as if guiding someone through a long rebuild —
+patient, precise, never rushed, never preachy.
+
+Identity: calm scientific cinematic narrator with quiet authority
 Personality: confident, intelligent, warm, controlled, slightly mysterious, encouraging
 Default delivery: clear, grounded, believable, never theatrical
-NEVER: constant overacting, advertisement tone, trailer voice, random emotional jumps, unnatural speed changes
+NEVER: constant overacting, advertisement tone, trailer voice, random emotional jumps,
+unnatural speed changes, hype influencer energy, comedy-host energy
 Voice consistency: one male en-US voice kept across the entire episode
 Narrative principle: The voice should never compete with the story. It should make the story impossible to ignore.
-=======================================================================
+=========================================================================
 
 HARD RULES:
 1. Return EXACTLY one direction object per input sentence. No more, no less.
 2. sentence_index starts at 1 and increments by 1 with no gaps and no duplicates.
 3. Do NOT rewrite, add, or remove any word of the sentences.
 4. Delivery must vary narratively, NOT randomly. Adjacent sentences inside the same idea keep continuity.
-5. Do NOT make every sentence dramatic. Default to calm / serious / hopeful.
-6. "shouting" and "angry" are used VERY rarely and only when truly justified.
-7. "whispering" is used only when it genuinely serves the meaning.
-8. Emojis are strictly forbidden anywhere in the output.
-9. Output PURE JSON only. No markdown, no commentary, no extra text.
+   Do NOT jump styles across adjacent sentences that belong to the same thought.
+5. Do NOT make every sentence dramatic. Default to calm / serious / hopeful / reflective.
+6. "shouting" and "angry" are used VERY rarely and only when truly justified by the content.
+7. "energetic" / "excited" / "cheerful" delivery_modes and azure_styles are RARE.
+   This is not a hype channel. Prefer restrained energy for almost every sentence.
+8. "whispering" is used only when it genuinely serves the meaning.
+9. Emojis are strictly forbidden anywhere in the output.
+10. Output PURE JSON only. No markdown, no commentary, no extra text.
+
+PACING & TONE GUIDANCE (series-specific):
+- Lean toward SLOWER, controlled pacing for series narration.
+  Prefer rate_percent in the range -6 to -2 for most sentences. Do NOT max out speed.
+  Use 0 or positive rate only for brief, deliberate emphasis — never as the norm.
+- Lean toward a SLIGHTLY LOWER pitch for quiet authority.
+  Prefer pitch_percent in the range -3 to 0 for most sentences.
+  Positive pitch is rare and reserved for genuine hopeful lifts.
+- Energy: default to 2 or 3. Reserve 4 for real revelation/payoff. Use 5 extremely rarely.
+- Treat the episode as a chapter in "The Rebuild": patient, deliberate, cinematic,
+  building understanding over time — never a list of disconnected tips.
 
 ALLOWED VALUES:
 - narrative_role: hook, setup, question, myth, contradiction, explanation, analogy, transition, tension, revelation, payoff, actionable, reflection, cta
@@ -480,8 +516,8 @@ def _build_fallback_plan(sentences: List[str]) -> List[Dict[str, Any]]:
             "delivery_mode": mode,
             "azure_style": style,
             "energy": energy,
-            "rate_percent": 0,
-            "pitch_percent": 0,
+            "rate_percent": -4,
+            "pitch_percent": -1,
             "pause_before_ms": 80,
             "pause_after_ms": 200,
             "emphasis_words": [],
@@ -634,8 +670,10 @@ def build_sentence_ssml(
     if style not in APPROVED_AZURE_STYLES:
         raise ValueError(f"azure_style '{style}' غير معتمد!")
 
-    rate = _clamp(direction.get("rate_percent", 0), -12, 8, 0)
-    pitch = _clamp(direction.get("pitch_percent", 0), -5, 5, 0)
+    # Defaults aligned with VOT Voice Bible v2:
+    # calm, slightly slow, slightly lower pitch for quiet authority.
+    rate = _clamp(direction.get("rate_percent", -3), -12, 8, -3)
+    pitch = _clamp(direction.get("pitch_percent", -1), -5, 5, -1)
 
     emphasis_words = direction.get("emphasis_words", []) or []
     if not isinstance(emphasis_words, list):
@@ -1146,13 +1184,13 @@ def generate_stage3_audio(
     episode_id: str,
     sentences: List[str],
     engine: str = "azure",
-    voice: str = "en-US-GuyNeural",
+    voice: str = "en-US-DavisNeural",
     output_dir: Path = Path("outputs"),
     episode_context: Optional[Dict[str, Any]] = None,
 ) -> Path:
     """
     المرحلة الثالثة (Azure فقط) — نظام إخراج صوتي من 4 طبقات:
-      1) VOT Voice Bible
+      1) VOT Voice Bible (v2 — The Rebuild series identity)
       2) AI Voice Director (خطة أداء من Gemini، JSON فقط)
       3) Sentence-Level Azure SSML (Clip معزول لكل جملة عبر Staging)
       4) Merge + Metadata + Audio QA + Safe Atomic Commit & Rollback + Final QA
