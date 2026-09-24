@@ -109,6 +109,23 @@ def get_ken_burns_filter(pattern_index: int, duration: float, fps: int = 60) -> 
         return f"zoompan=z='1.1':x='if(lte(on,1),iw*0.1,max(0,x-1.2))':y='ih/2-(ih/zoom/2)':d={frames}:s=1920x1080:fps={fps}"
 
 
+def _probe_media_duration(path: Path) -> float:
+    """
+    قراءة المدة الفعلية لملف وسائط (صوت أو فيديو) بالثواني عبر ffprobe.
+    تُستخدم لجعل الصوت هو المرجع الزمني النهائي للمونتاج.
+    """
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(path),
+        ],
+        capture_output=True, text=True, check=True,
+    )
+    return float(result.stdout.strip())
+
+
 def render_final_video(
     frames: List[Path],
     timeline: List[Dict[str, Any]],
@@ -123,10 +140,20 @@ def render_final_video(
     - انتقالات صوتية Soft Whoosh عند كل قطع
     - خلو تام بنسبة 100% من الموسيقى الخلفية
 
-    الحمايات المُضافة:
-    1) استبعاد العناصر الفارغة (empty=True) قبل المقارنة.
-    2) رفض أي duration <= 0 بدل تمريره إلى FFmpeg.
-    3) التحقق من وجود ملفات الصور وأنها ملفات فعلية قبل الرندرة.
+    [سياسة المدة الجديدة - النسخة المُحصَّنة]
+    - الصوت (التعليق الصوتي) هو المرجع الزمني الوحيد.
+    - نقيس المدة الحقيقية للفيديو بعد الدمج الفعلي (ffprobe على الملف المُجمَّع)
+      وليس عبر مجموع النظري للمقاطع، لتجنّب فروق الإطارات الناتجة عن تقريب
+      الـ 60fps أثناء الترميز.
+    - إذا كان الفيديو أقصر من الصوت: نُمدّد آخر إطار (tpad clone) بالفرق الحقيقي.
+    - إذا كان الفيديو أطول: pad_needed=0 ويقتطع -t الزائد من الفيديو فقط.
+    - لا نمسّ مسار التعليق الصوتي إطلاقًا.
+    - حذف -shortest نهائيًا من خطوة الدمج.
+    - amix duration=first آمن لأن المدخل الأول = التعليق بطول audio_duration.
+
+    [البنية الجديدة]
+    - المرحلة A: دمج المقاطع فيديو-فقط (بدون صوت) عبر -c:v copy.
+    - المرحلة B: قياس المدة الحقيقية + tpad + mux مع التعليق الصوتي و-t audio_duration.
     """
 
     # ============================================================
@@ -193,7 +220,6 @@ def render_final_video(
     logger.info(f"🎬 جاري بناء {len(validated_pairs)} مقطع Ken Burns...")
 
     # 1. رندرة مقطع مستقل لكل لقطة
-    #    [إصلاح 4]: حذف "-loop 1" لتفادي تقطيع zoompan واستهلاك الرام
     for idx, (frame_path, _item, duration) in enumerate(validated_pairs):
         kb_filter = get_ken_burns_filter(idx, duration, fps=fps)
 
@@ -204,6 +230,7 @@ def render_final_video(
             "-vf", kb_filter,
             "-t", str(duration),
             "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", str(fps),
+            "-an",
             str(seg_output)
         ]
         subprocess.run(cmd, check=True)
@@ -215,22 +242,61 @@ def render_final_video(
         for seg in segment_files:
             f.write(f"file '{seg.resolve().as_posix()}'\n")
 
-    unsubbed_video = temp_dir / "unsubbed_assembled.mp4"
-    logger.info("🎞️ دمج مقاطع الفيديو مع المسار الصوتي الموحد...")
+    # ============================================================
+    # [المرحلة A] دمج الفيديو فقط (بدون صوت)
+    # ============================================================
+    logger.info("🧩 [A] دمج مقاطع الفيديو (فيديو-فقط) باستخدام stream copy...")
 
-    # 3. دمج المقاطع مع ملف الصوت الموحد
-    cmd_concat = [
+    concat_video_only = temp_dir / "concat_video_only.mp4"
+    cmd_concat_only = [
         "ffmpeg", "-y", "-v", "error",
         "-f", "concat", "-safe", "0", "-i", str(concat_list_file),
-        "-i", str(audio_file),
         "-c:v", "copy",
+        "-an",
+        str(concat_video_only)
+    ]
+    subprocess.run(cmd_concat_only, check=True)
+
+    # ============================================================
+    # [المرحلة B] قياس المدة الحقيقية + tpad + mux مع التعليق
+    # ============================================================
+    # الصوت هو المرجع الزمني الوحيد.
+    audio_duration = _probe_media_duration(audio_file)
+    real_video_duration = _probe_media_duration(concat_video_only)
+
+    # الفرق الحقيقي المطلوب لحشو آخر إطار (clone) ليطابق الفيديو مدة الصوت.
+    pad_needed = max(0.0, audio_duration - real_video_duration)
+
+    logger.info(
+        f"🎧 مدة التعليق الصوتي المرجعية: {audio_duration:.3f}s | "
+        f"🎞️ المدة الحقيقية للفيديو المُجمَّع: {real_video_duration:.3f}s | "
+        f"🩹 الحشو المطلوب (tpad clone): {pad_needed:.3f}s"
+    )
+
+    unsubbed_video = temp_dir / "unsubbed_assembled.mp4"
+    logger.info("🎞️ [B] تطبيق tpad clone ودمج التعليق الصوتي (الصوت هو مرجع المدة)...")
+
+    # ملاحظة: stop_duration=0 صالح في FFmpeg ولا يضيف أي إطار.
+    tpad_filter = (
+        f"[0:v]tpad=stop_mode=clone:stop_duration={pad_needed:.3f}[vpad]"
+    )
+
+    cmd_concat = [
+        "ffmpeg", "-y", "-v", "error",
+        "-i", str(concat_video_only),
+        "-i", str(audio_file),
+        "-filter_complex", tpad_filter,
+        "-map", "[vpad]",
+        "-map", "1:a",
+        "-t", f"{audio_duration:.3f}",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "22",
+        "-pix_fmt", "yuv420p", "-r", str(fps),
         "-c:a", "aac", "-b:a", "192k",
-        "-shortest",
         str(unsubbed_video)
     ]
     subprocess.run(cmd_concat, check=True)
 
-    # 4. [إصلاح 1 + 3]: توليد مسار whoosh موحد في الذاكرة بدلاً من 80 مدخل FFmpeg
+    # 4. توليد مسار whoosh موحد في الذاكرة.
     logger.info("✨ حرق الترجمة الحركية الصفراء الباهتة وتطبيق مؤثرات الانتقال الصوتية...")
 
     # بناء انتقالات whoosh من العناصر المُتحققة فقط (وليس من timeline الكامل)
@@ -240,21 +306,19 @@ def render_final_video(
         current_time += duration
         transition_times.append(current_time)
 
-    total_duration = sum(d for _, _, d in validated_pairs)
-
+    # مسار الـ whoosh يُبنى بطول audio_duration ليطابق الفيديو النهائي تمامًا.
     whoosh_timeline = output_video_path.parent / "whoosh_timeline.wav"
     build_whoosh_timeline(
         sfx_whoosh,
         transition_times,
-        total_duration,
+        audio_duration,
         whoosh_timeline,
         whoosh_volume=0.4,
     )
 
-    # 5. [إصلاح 5]: دمج الترجمة وميكس الصوت داخل filter_complex واحد موحد
+    # 5. دمج الترجمة وميكس الصوت داخل filter_complex واحد موحد.
     ass_escaped = subtitles_ass.resolve().as_posix().replace(":", "\\:")
 
-    # [إصلاح 2]: مدخلان فقط + أوزان كاملة (1 1) لمنع كتم صوت المعلق
     filter_complex = (
         f"[0:v]ass='{ass_escaped}'[vout];"
         f"[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=0:weights=1 1[aout]"
@@ -274,4 +338,7 @@ def render_final_video(
 
     subprocess.run(cmd_final, check=True)
 
-    logger.info(f"🏆 تم تصدير الفيديو النهائي بنجاح بأعلى دقة: {output_video_path}")
+    logger.info(
+        f"🏆 تم تصدير الفيديو النهائي بنجاح بأعلى دقة: {output_video_path} "
+        f"(المدة النهائية = {audio_duration:.3f}s)"
+    )
