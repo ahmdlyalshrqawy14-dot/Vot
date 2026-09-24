@@ -14,7 +14,7 @@ GEMINI_KEYS = [
 ]
 GEMINI_KEYS = [k for k in GEMINI_KEYS if k]
 
-# النماذج الرسمية بالترتيب (دون أي تعديل)
+# النماذج الرسمية بالترتيب
 GEMINI_MODELS = [
     "gemini-3.8-flash",
     "gemini-3.7-flash",
@@ -36,11 +36,11 @@ GOOGLE_MALE_VOICES = [
 ]
 
 AZURE_MALE_VOICES = [
-    "en-US-BrianMultilingualNeural",  # الصوت المعتمد لهوية VOT
     "en-US-GuyNeural",
     "en-US-DavisNeural",
     "en-US-TonyNeural",
-    "en-US-JasonNeural"
+    "en-US-JasonNeural",
+    "en-US-BrianMultilingualNeural"
 ]
 
 REQUEST_TIMEOUT = 90
