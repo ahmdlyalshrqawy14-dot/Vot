@@ -37,17 +37,22 @@ class MissingAssetsError(Exception):
 def read_image_safe(path: Path) -> Optional[np.ndarray]:
     """قراءة الصورة بأمان من الذاكرة لتفادي مشاكل رموز ويندوز مثل النقاط …"""
     try:
-        with open(path, "rb") as f:
+        p = Path(path)
+        if not p.is_file():
+            logger.error(f"المسار ليس ملفاً صالحاً: {p}")
+            return None
+        with open(p, "rb") as f:
             file_bytes = np.frombuffer(f.read(), dtype=np.uint8)
             img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
             return img
     except Exception as e:
-        logger.error(f"تعذر فتح الملف {path.name}: {e}")
+        logger.error(f"تعذر فتح الملف {Path(path).name}: {e}")
         return None
 
 
 def write_image_safe(path: Path, img: np.ndarray):
     """حفظ الصورة بأمان تام متوافق مع كافة الرموز والامتدادات"""
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     ext = path.suffix if path.suffix else ".png"
     success, encoded_img = cv2.imencode(ext, img)
@@ -66,11 +71,16 @@ def extract_index_using_gemini_vision(image_path: Path) -> Optional[int]:
             return None
 
         h, w, _ = img.shape
+        if h == 0 or w == 0:
+            return None
 
         # [FIX 3] توسيع هامش الأمان إلى 18% لضمان بقاء الرقم كاملاً داخل الكادر
         crop_y = int(h * 0.82)
         crop_x = int(w * 0.82)
         corner_crop = img[crop_y:h, crop_x:w]
+
+        if corner_crop.size == 0:
+            return None
 
         # [FIX 1] تكبير 3x فقط بدون تحويل للرمادي أو رفع تباين حاد
         corner_crop = cv2.resize(corner_crop, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
@@ -91,15 +101,19 @@ def extract_index_using_gemini_vision(image_path: Path) -> Optional[int]:
             user_prompt=prompt
         )
 
+        if not isinstance(response_text, str) or not response_text:
+            return None
+
         numbers = re.findall(r"\b\d+\b", response_text)
         if numbers:
             detected = int(numbers[0])
+            # [FIX] فحص سلامة أولي فقط؛ النطاق الحقيقي يُفحص مقابل expected_total في المستدعي
             if 1 <= detected <= 500:
                 return detected
         return None
 
     except Exception as e:
-        logger.warning(f"تعذر قراءة الصورة {image_path.name}: {e}")
+        logger.warning(f"تعذر قراءة الصورة {Path(image_path).name}: {e}")
         return None
 
 
@@ -151,8 +165,17 @@ def rename_images_with_detected_numbers(
     skip_paths = skip_paths or set()
 
     uploaded_files: List[Path] = []
-    for p in uploaded_images_dir.iterdir():
-        if not p.is_file() or p.suffix.lower() not in VALID_EXTENSIONS:
+    try:
+        entries = list(uploaded_images_dir.iterdir())
+    except Exception as e:
+        logger.error(f"تعذر قراءة مجلد الصور {uploaded_images_dir}: {e}")
+        return {}, [], []
+
+    for p in entries:
+        try:
+            if not p.is_file() or p.suffix.lower() not in VALID_EXTENSIONS:
+                continue
+        except Exception:
             continue
         # تخطّي أي صورة المستخدم عيّنها يدويًا — لا OCR عليها أبدًا
         try:
@@ -223,9 +246,23 @@ def process_and_verify_images(
       - لا يظهر مطلقًا في unindexed_files.
       - رقمه ثابت ولا يُعاد فحصه حتى مع إعادة التشغيل.
 
+    [FIX-UNREADABLE] الصورة غير القابلة للقراءة لا تُعتبر كادرًا مؤكدًا مطلقًا:
+      - لا تُنسخ كملف خام إلى مجلد الكادرات النهائية.
+      - لا تُضاف إلى verified_frames.
+      - لا تشبع فهرسًا ناقصًا حتى لو عيّنها المستخدم يدويًا؛ تُعاد إلى مسار
+        المراجعة اليدوية عبر unindexed_files / missing_indices.
+
     Args:
         manual_assignments: تخصيصات يدوية من المستخدم {رقم: مسار_الصورة}
     """
+    # ---- 0) التحقق من صحة expected_total (فحص دفاعي خفيف) ----
+    try:
+        expected_total = int(expected_total)
+    except (TypeError, ValueError):
+        raise ValueError(f"expected_total غير صالح: {expected_total!r}")
+    if expected_total <= 0:
+        raise ValueError(f"expected_total يجب أن يكون أكبر من صفر: {expected_total}")
+
     if not uploaded_images_dir.exists():
         raise FileNotFoundError(f"المجلد غير موجود: {uploaded_images_dir}")
 
@@ -243,8 +280,16 @@ def process_and_verify_images(
         if not (1 <= idx <= expected_total):
             logger.warning(f"⚠️ رقم تعيين يدوي خارج النطاق ({idx}) — تم تجاهله")
             continue
-        p = Path(raw_path)
-        if not p.exists() or not p.is_file():
+        try:
+            p = Path(raw_path)
+        except Exception:
+            logger.warning(f"⚠️ مسار تعيين يدوي غير قابل للتحويل: {raw_path!r}")
+            continue
+        try:
+            is_valid = p.exists() and p.is_file()
+        except Exception:
+            is_valid = False
+        if not is_valid:
             logger.warning(f"⚠️ مسار تعيين يدوي غير موجود: {p}")
             continue
         manual_final[idx] = p
@@ -279,17 +324,30 @@ def process_and_verify_images(
     renamed_dir.mkdir(parents=True, exist_ok=True)
 
     # ---- 3) تثبيت التعيين اليدوي فوق نتيجة Gemini (أولوية المستخدم) ----
+    # [FIX-UNREADABLE] لا نقبل صورة يدوية غير قابلة للقراءة كإشباع لفهرس ناقص.
+    # إن فشلت القراءة تُترك الصورة في مسار المراجعة اليدوية (unindexed_files)
+    # ولا تُضاف إلى indexed_images.
     for idx, img_path in manual_final.items():
         new_path = renamed_dir / f"img_{idx:03d}.png"
         img = read_image_safe(img_path)
-        if img is not None:
+        if img is None:
+            logger.warning(
+                f"⚠️ تعيين يدوي لصورة غير قابلة للقراءة — لن تُشبع الفهرس {idx} "
+                f"وستُترك للمراجعة اليدوية: {img_path.name}"
+            )
+            if img_path not in unindexed_files:
+                unindexed_files.append(img_path)
+            # لا نضيف إلى indexed_images إطلاقًا
+            continue
+        try:
             write_image_safe(new_path, img)
             indexed_images[idx] = new_path
             logger.info(f"🔒 تعيين يدوي نهائي: {img_path.name} → رقم {idx}")
-        else:
-            # حتى لو القراءة فشلت، نحتفظ بالمسار الأصلي كاختيار مستخدم
+        except Exception as e:
+            # حتى لو فشلت الكتابة، نحتفظ بالمسار الأصلي كاختيار مستخدم
+            # (الصورة قابلة للقراءة، فقط إعادة الترميز فشلت)
             indexed_images[idx] = img_path
-            logger.warning(f"⚠️ تعيين يدوي بدون إعادة ترميز: {img_path.name} → {idx}")
+            logger.warning(f"⚠️ تعيين يدوي بدون إعادة ترميز ({e}): {img_path.name} → {idx}")
 
     # [FIX-GUESSING-1] لا تسكين تلقائي. النواقص تُترك لنظام المراجعة اليدوي.
 
@@ -310,18 +368,30 @@ def process_and_verify_images(
 
     output_frames_dir.mkdir(parents=True, exist_ok=True)
     verified_frames: List[Path] = []
+    written_indices: set = set()
 
-    # كتابة الكادرات المؤكدة فقط (بدون رقعة)
+    # كتابة الكادرات المؤكدة فقط (بدون رقعة) — مرتبة تصاعدياً حسب الرقم
     for idx in sorted(indexed_images.keys()):
+        if idx in written_indices:
+            # حماية دفاعية: لا نسمح بكتابة نفس الفهرس مرتين
+            logger.warning(f"⚠️ تجاهل فهرس مكرر أثناء الكتابة: {idx}")
+            continue
+        written_indices.add(idx)
+
         raw_p = indexed_images[idx]
         final_frame_path = output_frames_dir / f"frame_{idx:03d}.png"
 
+        # [FIX-UNREADABLE] لا نسخ خام ولا اعتبار الصورة مؤكدة عند فشل القراءة.
+        # نتخطى الكادر تمامًا ونتركه للمراجعة اليدوية.
         img = read_image_safe(raw_p)
-        if img is not None:
-            write_image_safe(final_frame_path, img)
-        else:
-            shutil.copyfile(raw_p, final_frame_path)
+        if img is None:
+            logger.warning(
+                f"⚠️ فشل فك ترميز الصورة {Path(raw_p).name} — "
+                f"الكادر {idx:03d} لن يُعتبر مؤكدًا ولن يُكتب؛ سيُترك للمراجعة اليدوية"
+            )
+            continue
 
+        write_image_safe(final_frame_path, img)
         logger.info(f"💾 تم توليد الكادر النهائي: {final_frame_path.name}")
         verified_frames.append(final_frame_path)
 
@@ -338,4 +408,6 @@ def process_and_verify_images(
             f"{[p.name for p in unindexed_files]}"
         )
 
+    # ضمان ترتيب نهائي حتمي
+    verified_frames.sort(key=lambda p: p.name)
     return verified_frames
