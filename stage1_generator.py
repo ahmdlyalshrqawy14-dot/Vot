@@ -144,6 +144,12 @@ Your task: return a revised COMPLETE script that:
 - Does NOT introduce a new topic.
 - Does NOT delete an essential idea.
 - Does NOT add filler, padding, or repetition merely to hit a number.
+- The added sentences MUST read as if they were part of the original script from the start: same
+  voice, same pacing, same natural transitions (And, But, So, That's why, Here's the thing). Integrate
+  each addition into the existing flow of ideas — do NOT append a separate block of extra sentences
+  at the end, and do NOT create a list-like or disconnected passage anywhere in the script.
+- After the revision, reading the full script start to finish must feel like ONE person telling ONE
+  continuous story — a reader must NOT be able to tell which sentences were added.
 - MUST reach at least 60 sentences after a deterministic local splitter and MUST NOT exceed 80 sentences.
 - Remains one continuous, coherent piece of natural spoken English.
 - Every sentence ends with ".", "?", or "!".
@@ -171,6 +177,11 @@ Your task: return a revised COMPLETE script that:
 - Does NOT introduce a new topic.
 - Does NOT delete an essential idea.
 - Naturally merges or trims redundant sentences.
+- The trimming MUST preserve the natural flow: after merging or cutting, the transitions between
+  remaining sentences must still read smoothly (And, But, So, That's why, Here's the thing), with no
+  abrupt jumps, gaps in logic, or leftover dangling references to a removed sentence.
+- After the revision, reading the full script start to finish must feel like ONE person telling ONE
+  continuous story, exactly as coherent as the original — not a shortened list of leftovers.
 - MUST produce no more than 80 sentences after a deterministic local splitter (aim for 60-75) and MUST
   NOT fall below 60 sentences.
 - Does not create overly long, unnatural, run-on sentences merely to reduce the count.
@@ -185,9 +196,20 @@ Return a single valid JSON object ONLY, no markdown, no commentary:
 
 
 def _repair_expand_script(episode_data: Dict[str, Any], script_text: str, current_count: int) -> str:
+    deficit = max(MIN_SENTENCES - current_count, 0)
+    target_low = MIN_SENTENCES
+    target_high = min(MAX_SENTENCES, PREFERRED_MAX_SENTENCES)
     user_prompt = (
         f"The current script produced only {current_count} sentences after deterministic splitting, "
-        f"which is below the required minimum of {MIN_SENTENCES}.\n\n"
+        f"which is below the required minimum of {MIN_SENTENCES}.\n"
+        f"You must add AT LEAST {deficit} additional full sentences to the script (not just one or two), "
+        f"so the new total lands between {target_low} and {target_high} sentences.\n"
+        "Spread the new sentences across SEVERAL different points in the script — for example inside the "
+        "mechanism explanation, the examples, the escalation, and the application/solution — instead of "
+        "adding them all in one place or tacking them onto the end.\n"
+        "Every added sentence must connect naturally to the sentences immediately before and after it, "
+        "using the same conversational voice as the rest of the script. The result must read as ONE "
+        "seamless, coherent script, not an original script plus extra sentences bolted on.\n\n"
         f"Episode data (context only):\n{json.dumps(episode_data, ensure_ascii=False, indent=2)}\n\n"
         f"Frozen current script:\n{script_text}\n\n"
         "Return ONLY the revised script_text JSON object now."
@@ -206,9 +228,18 @@ def _repair_expand_script(episode_data: Dict[str, Any], script_text: str, curren
 
 
 def _repair_compress_script(episode_data: Dict[str, Any], script_text: str, current_count: int) -> str:
+    excess = max(current_count - MAX_SENTENCES, 0)
+    target_low = PREFERRED_MIN_SENTENCES
+    target_high = MAX_SENTENCES
     user_prompt = (
         f"The current script produced {current_count} sentences after deterministic splitting, "
-        f"which exceeds the maximum of {MAX_SENTENCES}.\n\n"
+        f"which exceeds the maximum of {MAX_SENTENCES}.\n"
+        f"You must remove or merge AT LEAST {excess} sentences' worth of content, "
+        f"so the new total lands between {target_low} and {target_high} sentences (aim for 60-75).\n"
+        "Prefer merging redundant or overlapping sentences over deleting ideas outright, and make sure "
+        "every remaining transition still reads smoothly — no abrupt jumps, no leftover references to "
+        "something that was cut. The result must read as ONE seamless, coherent script, exactly as "
+        "connected as the original, not a shortened list of leftover fragments.\n\n"
         f"Episode data (context only):\n{json.dumps(episode_data, ensure_ascii=False, indent=2)}\n\n"
         f"Frozen current script:\n{script_text}\n\n"
         "Return ONLY the revised script_text JSON object now."
