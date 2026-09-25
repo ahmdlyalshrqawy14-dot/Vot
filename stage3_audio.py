@@ -1,733 +1,1707 @@
-import os
 import re
 import json
-import base64
 import logging
-import hashlib
-import uuid
-import shutil
-from datetime import datetime
-import xml.etree.ElementTree as ET
-from pathlib import Path
-from typing import List, Dict, Any, Optional
-from xml.sax.saxutils import escape as xml_escape
+from typing import List, Dict, Any, Optional, Union, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import requests
-
-# =============================================================
-# استيراد pydub بشكل آمن
-# =============================================================
-PYDUB_AVAILABLE = False
-PYDUB_IMPORT_ERROR: Optional[str] = None
-
-try:
-    from pydub import AudioSegment  # type: ignore
-    PYDUB_AVAILABLE = True
-except ImportError as _imp_err:
-    AudioSegment = None  # type: ignore
-    PYDUB_IMPORT_ERROR = f"ImportError: {_imp_err}"
-except Exception as _any_err:
-    AudioSegment = None  # type: ignore
-    PYDUB_IMPORT_ERROR = f"{type(_any_err).__name__}: {_any_err}"
-
-from config import (
-    GEMINI_KEYS,
-    AZURE_SPEECH_KEY,
-    AZURE_SPEECH_REGION,
-    GOOGLE_MALE_VOICES,
-    AZURE_MALE_VOICES,
-    REQUEST_TIMEOUT
-)
 from gemini_engine import call_gemini_with_fallback
 
-logger = logging.getLogger("Stage3Audio")
+logger = logging.getLogger("Stage2Generator")
 
-if not PYDUB_AVAILABLE:
-    logger.warning(
-        "⚠️ [Dependency Missing] مكتبة pydub غير متوفرة أو غير قابلة للاستيراد. "
-        f"التفاصيل: {PYDUB_IMPORT_ERROR or 'غير معروف'}. "
-        "للتثبيت: python -m pip install pydub"
-    )
 
-# =============================================================
-# VOT VOICE BIBLE (مقفل لقناة Vot) — v3 Human Storyteller
-# =============================================================
-VOT_VOICE_BIBLE = {
-    "channel": "VOT",
-    "series_frame": "The Rebuild",
-    "identity": "intimate intelligent scientific narrator with quiet authority",
-    "personality": [
-        "confident",
-        "human",
-        "grounded",
-        "controlled",
-        "intellectually calm",
-        "conversational"
-    ],
-    "default_delivery": "clear, warm, conversational storytelling, never theatrical",
-    "never": [
-        "announcer voice",
-        "trailer hype",
-        "advertisement tone",
-        "hyper excitement",
-        "shouting",
-        "robotic perfection"
-    ],
-    "voice_consistency": {
-        "locked_voice": "en-US-BrianMultilingualNeural",
-        "male_voice_only": True,
-        "language": "en-US"
-    }
+# =========================================================
+# HARD CONSTRAINTS (STRICT — NEVER RELAXED)
+# =========================================================
+MANDATORY_PREFIX = "Create a 2D cel-shaded illustration showing"
+
+REQUIRED_CHARACTER_DNA_TOKENS = [
+    "orange",
+    "muscular",
+    "smooth head",
+    "large white oval eyes",
+    "no mouth",
+    "black shorts",
+]
+
+REQUIRED_BACKGROUND_PHRASE = "plain grey background"
+REQUIRED_CORNER_PHRASE = "bottom-right corner"
+REQUIRED_SUBTLE_TOKENS = ("subtle", "faint")
+REQUIRED_SMALL_TOKENS = ("very small", "small", "tiny")
+REQUIRED_ANTI_TEXT_TOKENS = ("no written text", "no text")
+
+
+# =========================================================
+# LEGACY FLEXIBLE GROUPS (KEPT FOR DIAGNOSTICS ONLY).
+# These must NEVER cause a prompt to be rejected or repaired.
+# They are used only to log a rough "shape" of the prompt.
+# =========================================================
+FLEXIBLE_GROUPS: Dict[str, Tuple[str, ...]] = {
+    "conceptual": (
+        "symbol", "symbolic", "symbolizing", "symbolising", "symbolizes",
+        "symbolises", "metaphor", "metaphorical", "representing", "represents",
+        "conceptual", "conceptually", "allegory", "allegorical",
+        "as if", "as though", "visually conveys", "evokes", "embodies",
+        "serves as", "stands for", "story-driven", "illustrates the idea",
+        "communicates", "conveys", "transformation", "progression", "contrast",
+    ),
+    "action": (
+        "standing", "stands", "walking", "walks", "running", "runs",
+        "stepping", "steps", "climbing", "climbs", "holding", "holds",
+        "reaching", "reaches", "gazing", "gazes", "looking", "looks",
+        "facing", "faces", "turning", "turns", "raising", "raises",
+        "lowering", "lowers", "moving", "moves", "crouching", "crouches",
+        "leaning", "leans", "pushing", "pushes", "pulling", "pulls",
+        "gesture", "gesturing", "pointing", "performing", "squatting",
+        "lifting", "observing", "watching", "touching", "pose", "posture",
+        "body language", "arms", "hands", "shoulders",
+    ),
+    "environment": (
+        "on the grey background", "over the grey background",
+        "on the background", "over the background",
+        "placed on", "placed over", "resting on", "emerging from",
+        "rising from", "in front of",
+        "door", "doors", "bridge", "path", "pathway", "stairs", "steps",
+        "wall", "floor", "ground", "platform", "structure", "barrier",
+        "threshold", "gateway", "tunnel", "ladder", "rope", "box",
+        "cage", "mirror", "clock", "mask", "chain", "chains", "rock",
+        "mountain", "river", "weight", "stone", "block", "pillar",
+        "element", "prop", "object", "surface", "environment",
+        "landscape", "scene", "hologram", "joint", "knee", "vault",
+        "statue", "room", "gym", "studio", "background", "visual element",
+        "library", "libraries", "archive", "archives", "manuscript",
+        "manuscripts", "theater", "theatre", "ancient city", "museum",
+        "museums", "classroom", "classrooms", "street", "streets",
+        "quiet room", "road", "roads", "shadow", "shadows",
+    ),
+    "emotion": (
+        "determined", "confused", "tired", "hopeful", "worried", "calm",
+        "frustrated", "curious", "focused", "confident", "anxious",
+        "relieved", "surprised", "thoughtful", "hesitant", "resigned",
+        "eager", "defeated", "proud", "ashamed", "doubtful", "serene",
+        "tense", "relaxed", "emotion", "emotional", "expression",
+        "mood", "feeling", "stance",
+    ),
+    "camera": (
+        "close-up", "close up", "medium shot", "wide shot", "long shot",
+        "side-profile", "side profile", "low-angle", "low angle",
+        "high-angle", "high angle", "overhead", "dutch angle",
+        "camera", "shot", "framing", "angle", "view",
+    ),
+    "composition": (
+        "composition", "centered", "centred", "symmetrical",
+        "character on the left", "character on the right",
+        "foreground", "background depth", "depth", "leading lines",
+        "balanced composition", "balanced", "rule of thirds",
+        "framed", "framing",
+    ),
+    "lighting": (
+        "lighting", "light", "rim light", "soft light", "directional light",
+        "high contrast", "cinematic lighting", "muted", "warm light",
+        "cool light", "color palette", "colour palette", "palette",
+        "gold", "shadow", "shadows", "glow", "glowing", "tones",
+        "color", "colour", "blue", "red", "warm", "cool", "bright",
+        "dark", "contrast", "illuminated",
+    ),
+    "continuity": (
+        "continuing", "continuation", "continuity", "matching the previous",
+        "evolving from", "preparing for the next", "preserving the same",
+        "previous shot", "previous image", "next shot", "next image",
+        "same visual world", "same environment", "next transformation",
+        "same symbol", "same setting", "same world", "preserving",
+        "evolving", "previous", "next", "transition", "transformation",
+        "progression", "sequence",
+    ),
 }
 
-VOICE_BIBLE_VERSION = "v3"
 
-APPROVED_AZURE_STYLES = {
-    "whispering", "excited", "serious", "hopeful",
-    "cheerful", "sad", "angry", "shouting", "calm"
-}
+# =========================================================
+# AI CREATIVE REVIEWER CONFIG
+# =========================================================
+MAX_AI_REVIEW_ATTEMPTS = 2
+CREATIVE_REVIEW_REPAIR_THRESHOLD = 80   # score < 80  -> add to repair list
+CREATIVE_REVIEW_ACCEPT_THRESHOLD = 90   # score >= 90 -> auto-accept
 
-APPROVED_NARRATIVE_ROLES = {
-    "hook", "setup", "question", "myth", "contradiction", "explanation", "analogy",
-    "transition", "tension", "revelation", "payoff", "actionable", "reflection", "cta"
-}
+BATCH_SIZE = 24
+MAX_PROMPT_REPAIR_ATTEMPTS = 4
+MAX_BATCH_GENERATION_ATTEMPTS = 3
 
-APPROVED_DELIVERY_MODES = {
-    "calm", "curious", "serious", "teaching", "suspense",
-    "revelation", "encouraging", "reflective", "energetic"
-}
 
-_LIMITS = {
-    "energy": (1, 5),
-    "rate_percent": (-10, 4),
-    "pitch_percent": (-4, 2),
-    "pause_before_ms": (0, 700),
-    "pause_after_ms": (0, 1000),
-}
+# =========================================================
+# SYSTEM PROMPTS
+# =========================================================
+STAGE_2_SYSTEM_PROMPT = """You are an expert AI Art Director and Visual Storyboard Artist. Your task is to generate explicit IMAGE GENERATION COMMANDS for an educational YouTube video based on a sequential list of script sentences.
 
-MAX_DIRECTOR_RETRIES = 3
-MAX_CLIP_RETRIES = 3
-MAX_MERGE_GAP_MS = 1500
-CLEANUP_BACKUPS_AFTER_SUCCESS = False
-VOICE_CONTEXT_FIELDS = ("creative_brief", "retention_plan", "scene_plan", "sections")
-MAX_VOICE_CONTEXT_CHARS = 6000
+=========================================
+CHANNEL IDENTITY (READ FIRST)
+=========================================
+This channel is about human behavior, psychology, philosophy, ethics, language, linguistics, literature, civilizations, the history of ideas, important books and references, human contradictions, willpower, courage, patience, fear, identity, meaning, and decision-making.
 
-# =============================================================
-# نظام التوجيه الصوتي (Voice Director) المحدث
-# =============================================================
-STAGE_3_VOICE_DIRECTOR_SYSTEM_PROMPT = """You are the LEAD VOICE DIRECTOR for the documentary/science channel VOT.
+This is NOT primarily a fitness channel. Do NOT default to gym scenes, workouts, muscle training, dieting, weight loss, body transformation, or sports imagery unless the sentence explicitly requires it.
 
-Your ONLY job is to direct the delivery plan sentence-by-sentence.
-You do NOT rewrite, add, or remove words.
+For psychology, philosophy, language, literature, and civilization topics, favor symbolic environments such as: libraries, archives, manuscripts, theaters, ancient cities, museums, classrooms, streets, quiet rooms, mirrors, maps, doors, bridges, shadows, clocks, masks, cages, roads, and abstract mental spaces.
 
-VOT VOICE IDENTITY:
-- A calm, intelligent friend and researcher sharing deep insights in a quiet room.
-- Energy is firmly 5/10. Controlled, human, conversational storytelling.
-- ABSOLUTELY NO trailer voice, NO hype announcer, NO loud cheerful pitch.
+If a sentence mentions or depends on a named thinker, scholar, author, philosopher, researcher, historical figure, civilization, or book, preserve that conceptual reference through safe visual representation — a manuscript, archive, statue, library, theater, map, historical setting, or symbolic artifact. Never invent or render written quotations inside the image. Never require an exact portrait unless genuinely necessary.
 
-DELIVERY RULES:
-1. Azure Style: Default to "calm" for 75%+ of the script. Use "serious" for critical facts or tension, "hopeful" for positive payoffs, and "whispering" for intimate secrets.
-2. STRICTLY FORBIDDEN: Do NOT use "excited", "cheerful", "angry", or "shouting".
-3. Rate & Pitch: Keep rate slightly slow (-5% to -2%) for deliberate clarity. Pitch should stay natural to slightly grounded (-3% to 0%).
-4. Energy: Keep between 2 and 3. Reserve 4 strictly for major revelations. Never use 5.
-5. Emphasize at most 1 key word per sentence.
+=========================================
+CORE PRINCIPLE: NARRATION ≠ LITERAL IMAGE
+=========================================
+You MUST NOT translate a sentence into a literal illustration of its words.
+Instead, internally extract:
+- The core idea
+- The mechanism or reason
+- The conflict or tension
+- The emotional state
+- The result or transformation
+Then translate THAT into a conceptual, symbolic, or story-driven visual scene.
 
-OUTPUT SCHEMA (PURE JSON ONLY):
+FORBIDDEN literal example:
+Narration: "Your brain prefers immediate rewards."
+Literal (FORBIDDEN): A brain with a reward icon next to it.
+
+REQUIRED conceptual approach:
+The orange character stands between two doors: a nearby easy door leading to a dead end, and a distant difficult door leading toward the real goal, body language showing the conflict of choice.
+
+FORBIDDEN literal example:
+Narration: "Weak knees are not caused by movement itself."
+Literal (FORBIDDEN): Character just holding their knee.
+
+REQUIRED symbolic approach:
+A bridge that grows more stable as the character walks across it step by step, symbolizing progressive loading strengthening the knee.
+
+FORBIDDEN literal example:
+Narration: "Distraction makes it hard to move forward."
+Literal (FORBIDDEN): a brain, a confused person holding their head, or a question mark.
+
+REQUIRED conceptual approach:
+The orange character standing between a nearby easy door leading to a dead end and a distant difficult door leading toward the real goal, with hesitant body language showing the conflict of choice.
+
+FORBIDDEN literal example:
+Narration: "Many philosophers questioned whether free will truly exists."
+Literal (FORBIDDEN): A philosopher character with a text bubble saying "free will?"
+
+REQUIRED conceptual approach:
+The orange character stands at a fork in an ancient stone road beneath a vast library facade, one path fading into shadow and the other into light, body language caught mid-step, symbolizing the unresolved question of free will.
+
+=========================================
+CHARACTER DNA (NEVER CHANGE)
+=========================================
+- Orange skin
+- Muscular defined body
+- Smooth head
+- Two large white oval eyes
+- NO mouth
+- Black shorts
+- Consistent proportions
+- 2D cel-shaded illustration style
+
+NEVER invent a new character. NEVER change clothing, head shape, or eyes. Keep the same visual identity across every single image.
+
+=========================================
+ABSOLUTE VISUAL CONSTRAINTS (PRESERVE ALL)
+=========================================
+- Plain grey background (dominant). If symbolic environment or objects are needed, add them ON/OVER the grey backdrop without replacing it.
+- Very small, subtle, faint image index number placed INSIDE the image in the bottom-right corner.
+- Numbering follows the sentence order, sequential, no gaps.
+- Clean, cel-shaded style.
+- Consistent proportions.
+- No mouth.
+- Black shorts.
+- No written text inside the image except the required faint index number.
+
+=========================================
+EVERY PROMPT MUST BE AN EXPLICIT, SELF-CONTAINED IMAGE GENERATION COMMAND
+=========================================
+Each prompt MUST start EXACTLY with the literal text:
+"Create a 2D cel-shaded illustration showing ..."
+
+Every prompt will be COPIED INDEPENDENTLY into Google Flow. Therefore, each prompt MUST be COMPLETE ON ITS OWN and MUST literally spell out every required element below — even if some are repeated in these instructions.
+
+=========================================
+MANDATORY LITERAL CONTENT INSIDE EVERY PROMPT
+=========================================
+Every single prompt MUST include, verbatim:
+
+1. Start with EXACTLY:
+   Create a 2D cel-shaded illustration showing
+
+2. The full character DNA spelled out literally:
+   consistent orange muscular character, smooth head, two large white oval eyes, no mouth, black shorts, consistent proportions, clean 2D cel-shaded illustration style
+
+3. The literal background phrase:
+   plain grey background as the dominant background
+   (symbolic environment/objects must be described as placed ON/OVER it, not replacing it)
+
+4. A clear in-image number instruction, using the correct sequential index for that prompt, in this exact style:
+   include the very small, subtle, faint number "N" inside the image, placed in the bottom-right corner
+   where N is replaced by the correct image index for that prompt.
+
+5. The anti-text clause (verbatim or clearly equivalent):
+   no written text, labels, captions, symbols containing letters, or extra numbers inside the image; only the required faint image index is allowed
+
+6. The prompt MUST NOT end with a bare standalone number.
+   FORBIDDEN ending: "..., plain grey background, 1"
+   REQUIRED ending: "... plain grey background as the dominant background. Include the very small, subtle, faint number "1" inside the image, placed in the bottom-right corner. No written text, labels, captions, symbols containing letters, or extra numbers inside the image; only the required faint image index is allowed."
+
+7. When a visual symbol like an X is needed, describe it NON-TEXTUALLY, e.g.:
+   a red cross-shaped visual symbol with no written text
+   NEVER write red "X" text.
+
+=========================================
+EACH PROMPT MUST CONTAIN
+=========================================
+1. The explicit command beginning EXACTLY with "Create a 2D cel-shaded illustration showing ...".
+2. Full character DNA (listed above) written literally.
+3. The NON-LITERAL visual idea (conceptual / symbolic / story-driven).
+4. Character action / dynamic pose.
+5. Environment or symbolic visual element, placed ON/OVER the grey background.
+6. Emotional state.
+7. Camera angle.
+8. Composition.
+9. Lighting / colors if relevant.
+10. Continuity with previous and upcoming scenes.
+11. Literal phrase "plain grey background as the dominant background".
+12. Anti-text clause.
+13. Instruction to place the correct faint index number inside the image in the bottom-right corner.
+
+=========================================
+STRICT GENERATION RULES
+=========================================
+- ONE COMMAND PER SENTENCE: exactly one image prompt per sentence, in chronological order.
+- INDEXING: use the correct sequential image number for each prompt, and place it inside the in-image number instruction — never as a bare trailing number.
+- POSE CUSTOMIZATION: give a clear action, posture, or physical gesture matching the emotional and physical context of that sentence. NEVER alter character physical traits or the plain grey background.
+- NO forbidden content: no literal restatement of the sentence, no extra numbers beyond the image index, no headers, no markdown, no quotes around the prompt, no explanation outside the prompts, no combining sentences, no skipping, no adding extra prompts.
+- EVERY PROMPT MUST BE SELF-CONTAINED: it must include all required literal phrases above even if that means repetition across prompts.
+
+=========================================
+OUTPUT FORMAT
+=========================================
+Return the prompts separated ONLY by a single blank line. No quotation marks, no markdown code wrappers, no sentence text, no headers, no labels."""
+
+
+STAGE_2_ENRICHED_SYSTEM_PROMPT = """You are an expert AI Art Director, Visual Storyteller, and Storyboard Artist. Your task is to generate explicit IMAGE GENERATION COMMANDS for an educational YouTube video based on a sequential list of script sentences, each mapped to a scene from an existing scene plan and visual bible.
+
+=========================================
+CHANNEL IDENTITY (READ FIRST)
+=========================================
+This channel is about human behavior, psychology, philosophy, ethics, language, linguistics, literature, civilizations, the history of ideas, important books and references, human contradictions, willpower, courage, patience, fear, identity, meaning, and decision-making.
+
+This is NOT primarily a fitness channel. Do NOT default to gym scenes, workouts, muscle training, dieting, weight loss, body transformation, or sports imagery unless the sentence or scene context explicitly requires it.
+
+For psychology, philosophy, language, literature, and civilization topics, favor symbolic environments such as: libraries, archives, manuscripts, theaters, ancient cities, museums, classrooms, streets, quiet rooms, mirrors, maps, doors, bridges, shadows, clocks, masks, cages, roads, and abstract mental spaces.
+
+If a sentence mentions or depends on a named thinker, scholar, author, philosopher, researcher, historical figure, civilization, or book, preserve that conceptual reference through safe visual representation — a manuscript, archive, statue, library, theater, map, historical setting, or symbolic artifact. Never invent or render written quotations inside the image. Never require an exact portrait unless genuinely necessary.
+
+=========================================
+ABSOLUTE RULE: NARRATION ≠ LITERAL IMAGE
+=========================================
+NEVER translate a sentence into a literal illustration of its words.
+Instead, extract:
+- The core idea
+- The mechanism or reason
+- The conflict or tension
+- The emotional state
+- The result or transformation
+Then translate THAT into a conceptual, symbolic, or story-driven visual scene.
+
+Forbidden example:
+Narration: "Your brain prefers immediate rewards."
+Literal (FORBIDDEN): A brain with a reward icon next to it.
+
+Required approach:
+The orange character stands before two doors:
+- A near, bright, easy door.
+- A far, difficult door.
+- The real goal lies behind the far door.
+- Composition emphasizes the conflict of choice and instant reward.
+
+Forbidden example:
+Narration: "Weak knees are not caused by movement itself."
+Literal (FORBIDDEN): Character just holding their knee.
+
+Required approach:
+A symbolic scene showing progressive loading strengthening the knee — e.g., a bridge that grows more stable as the character walks across it step by step.
+
+Forbidden example:
+Narration: "Distraction makes it hard to move forward."
+Literal (FORBIDDEN): a brain, a confused person holding their head, or a question mark.
+
+Required approach:
+The orange character standing between a nearby easy door leading to a dead end and a distant difficult door leading toward the real goal, with hesitant body language showing the conflict of choice.
+
+Forbidden example:
+Narration: "Many philosophers questioned whether free will truly exists."
+Literal (FORBIDDEN): A philosopher character with a text bubble saying "free will?"
+
+Required approach:
+The orange character stands at a fork in an ancient stone road beneath a vast library facade, one path fading into shadow and the other into light, body language caught mid-step, symbolizing the unresolved question of free will.
+
+=========================================
+CHARACTER DNA (NEVER CHANGE)
+=========================================
+- Orange skin
+- Muscular defined body
+- Smooth head
+- Two large white oval eyes
+- NO mouth
+- Black shorts
+- Consistent proportions
+- 2D cel-shaded illustration style
+
+NEVER invent a new character. NEVER change clothing, head shape, or eyes. The character should stay on-screen unless absolutely necessary; even then, keep the visual identity consistent.
+
+=========================================
+FIXED VISUAL CONSTRAINTS (PRESERVE ALL)
+=========================================
+- Plain grey background (dominant). If symbolic environment/objects are needed, add them ON/OVER the grey backdrop without replacing it.
+- Very small, subtle, faint image index number placed INSIDE the image in the bottom-right corner.
+- Numbering follows the sentence order.
+- Clean, cel-shaded style.
+- Consistent proportions.
+- No mouth.
+- Black shorts.
+- ONE prompt per sentence.
+- No written text inside the image except the required faint index number.
+
+=========================================
+EVERY PROMPT MUST BE AN EXPLICIT, SELF-CONTAINED IMAGE GENERATION COMMAND
+=========================================
+Each prompt MUST start EXACTLY with the literal text:
+"Create a 2D cel-shaded illustration showing ..."
+
+Every prompt will be COPIED INDEPENDENTLY into Google Flow. Therefore, each prompt MUST be COMPLETE ON ITS OWN and MUST literally spell out every required element below — even if some are repeated in these instructions.
+
+=========================================
+MANDATORY LITERAL CONTENT INSIDE EVERY PROMPT
+=========================================
+Every single prompt MUST include, verbatim:
+
+1. Start with EXACTLY:
+   Create a 2D cel-shaded illustration showing
+
+2. The full character DNA spelled out literally:
+   consistent orange muscular character, smooth head, two large white oval eyes, no mouth, black shorts, consistent proportions, clean 2D cel-shaded illustration style
+
+3. The literal background phrase:
+   plain grey background as the dominant background
+   (symbolic environment/objects must be described as placed ON/OVER it, not replacing it)
+
+4. A clear in-image number instruction, using the correct sequential index for that prompt, in this exact style:
+   include the very small, subtle, faint number "N" inside the image, placed in the bottom-right corner
+   where N is replaced by the correct image index for that prompt.
+
+5. The anti-text clause (verbatim or clearly equivalent):
+   no written text, labels, captions, symbols containing letters, or extra numbers inside the image; only the required faint image index is allowed
+
+6. The prompt MUST NOT end with a bare standalone number.
+   FORBIDDEN ending: "..., plain grey background, 1"
+   REQUIRED ending: "... plain grey background as the dominant background. Include the very small, subtle, faint number "1" inside the image, placed in the bottom-right corner. No written text, labels, captions, symbols containing letters, or extra numbers inside the image; only the required faint image index is allowed."
+
+7. When a visual symbol like an X is needed, describe it NON-TEXTUALLY, e.g.:
+   a red cross-shaped visual symbol with no written text
+   NEVER write red "X" text.
+
+=========================================
+EACH PROMPT MUST INCLUDE
+=========================================
+1. The explicit command starting EXACTLY with "Create a 2D cel-shaded illustration showing ...".
+2. Full character DNA (listed above) written literally.
+3. The non-literal visual idea (conceptual / symbolic / story-driven).
+4. Character action / dynamic pose.
+5. Environment or symbolic visual element, placed ON/OVER the grey background.
+6. Emotional state.
+7. Camera angle.
+8. Composition.
+9. Lighting / colors if relevant.
+10. Continuity with previous and upcoming scenes.
+11. Literal phrase "plain grey background as the dominant background".
+12. Anti-text clause.
+13. Instruction to place the correct faint index number inside the image in the bottom-right corner.
+
+=========================================
+FORBIDDEN IN OUTPUT
+=========================================
+- Original sentence text as a title.
+- Extra numbers beyond the image index.
+- Headers.
+- Markdown.
+- Quotes around the prompt.
+- Any explanation outside the prompts.
+- Combining two sentences into one prompt.
+- Skipping a sentence.
+- Adding an extra prompt.
+- Literal restatement of the narration.
+- Any prompt that does NOT begin with "Create a 2D cel-shaded illustration showing ...".
+- Any prompt that does NOT spell out the full character DNA, the plain grey background phrase, the anti-text clause, and the in-image number instruction.
+- Any prompt that ends with a bare standalone number instead of an in-image number instruction.
+
+=========================================
+SCENE HANDLING
+=========================================
+A scene may cover multiple sentences. Keep the same visual world within a scene, but give every sentence its own independent prompt.
+
+Example progression inside one scene:
+- Sentence 1: Establishing shot.
+- Sentence 2: Continuation of the action.
+- Sentence 3: Escalation.
+- Sentence 4: Reveal or transformation.
+
+Do NOT make all sentences in a scene identical images. Maintain:
+- Same environment.
+- Same key elements.
+- Same character identity.
+- Evolution of motion and composition from prompt to prompt.
+
+=========================================
+OUTPUT FORMAT
+=========================================
+Return prompts separated ONLY by a single blank line. No quotation marks, no markdown code wrappers, no sentence text, no headers."""
+
+
+CREATIVE_REVIEWER_SYSTEM_PROMPT = """You are a senior Visual Quality Reviewer for AI image-generation prompts used in an educational YouTube video.
+
+The recurring character is:
+- consistent orange muscular figure
+- smooth head
+- two large white oval eyes
+- no mouth
+- black shorts
+- clean 2D cel-shaded illustration style
+- plain grey background as the dominant background
+- a very small, subtle, faint in-image index number in the bottom-right corner
+- no written text inside the image except that index
+
+Your job is to score each prompt's CREATIVE AND VISUAL QUALITY, not to check word presence.
+
+IMPORTANT RULES FOR YOUR REVIEW
+================================
+- Do NOT penalize a prompt for repeating the Character DNA, the plain grey background phrase, or the in-image index number. This repetition is MANDATORY.
+- Do NOT require the literal words "composition", "continuity", "emotion", "lighting", or "camera". Judge the actual visual meaning, not the vocabulary.
+- If composition, continuity, emotion, or lighting are clearly conveyed in meaning (even without those exact words), treat them as present.
+- Judge whether the visual idea is CONCEPTUAL / SYMBOLIC rather than a literal restatement of the sentence.
+- Judge whether the action / pose is clear and drawable.
+- Judge whether the prompt is executable in Google Flow (self-contained, explicit, no contradictions).
+- Judge whether character identity and background constraints are preserved.
+- Judge camera, composition, lighting, and continuity between adjacent prompts.
+- The channel covers human behavior, psychology, philosophy, ethics, language, literature, civilizations, and the history of ideas — not primarily fitness. Do not penalize prompts for using non-fitness symbolic environments (libraries, archives, museums, theaters, ancient cities, manuscripts, mirrors, maps). Treat forced or unjustified gym/workout/fitness imagery on a clearly non-fitness topic as a MATERIAL defect: flag it in "issues" and factor it into the score.
+
+SCORING (TOTAL 100)
+===================
+1. Conceptual clarity / non-literal visual idea — 25 points.
+2. Action, scene, and image-convertibility — 20 points.
+3. Executability in Google Flow — 20 points.
+4. Character identity and visual constraints preserved — 20 points.
+5. Camera, composition, lighting, continuity — 15 points.
+
+DECISION RULES
+==============
+- score >= 90 -> "accept"
+- 80 <= score < 90 -> "accept" unless you identify a MATERIAL visual defect that would clearly harm the image -> then "repair"
+- score < 80 -> "repair"
+
+OUTPUT FORMAT
+=============
+Return ONLY valid JSON. No markdown, no code fences, no commentary outside JSON.
+
 {
-  "directions": [
+  "reviews": [
     {
-      "sentence_index": 1,
-      "narrative_role": "hook",
-      "delivery_mode": "curious",
-      "azure_style": "calm",
-      "energy": 3,
-      "rate_percent": -4,
-      "pitch_percent": -1,
-      "pause_before_ms": 100,
-      "pause_after_ms": 350,
-      "emphasis_words": ["truth"],
-      "breath_breaks": [],
-      "reason": "grounded conversational hook"
+      "image_index": 1,
+      "score": 94,
+      "decision": "accept",
+      "strengths": ["Clear conceptual metaphor", "Strong visual action"],
+      "issues": []
     }
   ]
 }
+
+Rules:
+- One review element per prompt.
+- Same order as prompts given.
+- image_index must be the integer index provided with each prompt.
+- score must be an integer 0-100.
+- decision must be "accept" or "repair".
+- issues must be a list of strings (empty if none).
+- Do NOT rewrite the prompts.
+- Do NOT add any text outside the JSON.
 """
 
-def _clean_text_for_word_match(text: str) -> str:
-    no_tags = re.sub(r"\[.*?\]", "", text)
-    no_xml = re.sub(r"<.*?>", "", no_tags)
-    clean = re.sub(r"[^\w\s]", "", no_xml).lower()
-    return " ".join(clean.split())
 
-def _find_express_elements(root):
-    for ns in ("https://www.w3.org/2001/mstts", "http://www.w3.org/2001/mstts"):
-        elems = root.findall(f".//{{{ns}}}express-as")
-        if elems:
-            return elems
-    try:
-        return root.findall(".//{*}express-as")
-    except Exception:
-        return []
+# =========================================================
+# UTILITIES
+# =========================================================
+def clean_and_parse_prompts(raw_text: str) -> List[str]:
+    cleaned = raw_text.strip()
+    cleaned = re.sub(r"^```(?:text)?\s*", "", cleaned)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    return [b.strip() for b in cleaned.split("\n\n") if b.strip()]
 
-def _validate_single_ssml(ssml_text: str, expected_voice: Optional[str] = None) -> None:
-    if not ssml_text or "<speak" not in ssml_text:
-        raise ValueError("SSML غير صالح: لا يحتوي على <speak>")
 
-    emojis = re.findall(r"[\U00010000-\U0010ffff]", ssml_text)
-    if emojis:
-        raise ValueError(f"SSML يحتوي على إيموجي: {emojis}")
+def _map_sentences_to_scenes(
+    sentences: List[str],
+    scene_plan: Optional[Union[List[Dict[str, Any]], Dict[str, Any]]],
+) -> Dict[int, Dict[str, Any]]:
+    """
+    يرجع قاموساً: index الجملة (1-based) -> بيانات المشهد الخاص بها.
+    """
+    mapping: Dict[int, Dict[str, Any]] = {}
+    if not scene_plan:
+        return mapping
 
-    try:
-        root = ET.fromstring(ssml_text)
-    except ET.ParseError as err:
-        raise ValueError(f"SSML غير صالح بنيوياً: {err}")
+    scenes: Optional[List[Dict[str, Any]]] = None
 
-    voice_elem = root.find(".//{http://www.w3.org/2001/10/synthesis}voice") or root.find(".//voice")
-    if voice_elem is None:
-        raise ValueError("SSML لا يحتوي على عنصر <voice>")
+    if isinstance(scene_plan, list):
+        scenes = scene_plan
+    elif isinstance(scene_plan, dict):
+        candidate = scene_plan.get("scenes")
+        if isinstance(candidate, list):
+            scenes = candidate
 
-    if expected_voice is not None:
-        actual = voice_elem.attrib.get("name", "")
-        if actual != expected_voice:
-            raise ValueError(f"الصوت في SSML '{actual}' لا يطابق المتوقع '{expected_voice}'")
+    if not scenes:
+        return mapping
 
-    express_elements = _find_express_elements(root)
-    if not express_elements:
-        raise ValueError("SSML لا يحتوي على mstts:express-as")
-    for elem in express_elements:
-        style = elem.attrib.get("style", "").strip().lower()
-        if style not in APPROVED_AZURE_STYLES:
-            raise ValueError(f"النمط '{style}' غير معتمد في Azure!")
+    total_sentences = len(sentences)
 
-def _build_voice_context(episode_context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    if not isinstance(episode_context, dict):
-        return {}
+    for scene in scenes:
+        if not isinstance(scene, dict):
+            continue
 
-    extracted: Dict[str, Any] = {}
-    for field in VOICE_CONTEXT_FIELDS:
-        value = episode_context.get(field)
+        s_start = scene.get("sentence_start")
+        s_end = scene.get("sentence_end")
+
+        if not isinstance(s_start, int) or not isinstance(s_end, int):
+            continue
+
+        if s_start < 0 or s_end < s_start:
+            continue
+
+        for zero_based_idx in range(s_start, s_end + 1):
+            one_based_idx = zero_based_idx + 1
+            if 1 <= one_based_idx <= total_sentences:
+                mapping[one_based_idx] = scene
+
+    return mapping
+
+
+def _format_scene_context(scene: Optional[Dict[str, Any]]) -> str:
+    if not scene:
+        return "No scene context available. Use pure narrative-driven conceptual visual storytelling."
+
+    fields = [
+        ("Scene ID", scene.get("scene_id")),
+        ("Title", scene.get("title")),
+        ("Narrative Purpose", scene.get("narrative_purpose")),
+        ("Visual Concept", scene.get("visual_concept")),
+        ("Emotion", scene.get("emotion")),
+        ("Character Action", scene.get("character_action")),
+        ("Environment", scene.get("environment")),
+        ("Camera", scene.get("camera")),
+        ("Composition", scene.get("composition")),
+        ("Motion Potential", scene.get("motion_potential")),
+        ("Transition", scene.get("transition")),
+        ("Continuity Notes", scene.get("continuity_notes")),
+    ]
+    lines = [f"- {k}: {v}" for k, v in fields if v]
+    if not lines:
+        return "No detailed scene context available."
+    return "\n".join(lines)
+
+
+def _format_visual_bible(visual_bible: Optional[Dict[str, Any]]) -> str:
+    if not visual_bible:
+        return "No visual bible provided. Rely on the fixed character DNA and constraints."
+
+    lines: List[str] = []
+    for key, value in visual_bible.items():
         if value is None:
             continue
-        candidate = dict(extracted)
-        candidate[field] = value
-        try:
-            serialized = json.dumps(candidate, ensure_ascii=False)
-            if len(serialized) <= MAX_VOICE_CONTEXT_CHARS:
-                extracted = candidate
-        except Exception:
-            continue
-    return extracted
-
-def _call_voice_director(
-    sentences: List[str],
-    episode_context: Optional[Dict[str, Any]] = None,
-    previous_error: Optional[str] = None,
-) -> List[Dict[str, Any]]:
-    user_lines = "\n".join(f"{i+1}. {s}" for i, s in enumerate(sentences))
-    safe_context = _build_voice_context(episode_context)
-
-    context_block = ""
-    if safe_context:
-        try:
-            ctx_str = json.dumps(safe_context, ensure_ascii=False)
-            context_block = f"\n\nEPISODE CONTEXT (READ-ONLY):\n{ctx_str}"
-        except Exception:
-            pass
-
-    error_block = f"\n\nPREVIOUS ERROR: {previous_error}" if previous_error else ""
-
-    user_prompt = (
-        f"Sentences to direct ({len(sentences)} total):\n"
-        f"{user_lines}"
-        f"{context_block}"
-        f"{error_block}\n\n"
-        f'Return ONLY valid JSON with a "directions" array of exactly {len(sentences)} items.'
-    )
-
-    raw = call_gemini_with_fallback(
-        system_instruction=STAGE_3_VOICE_DIRECTOR_SYSTEM_PROMPT,
-        user_prompt=user_prompt,
-        response_mime_type="application/json",
-    )
-
-    cleaned = re.sub(r"^```(?:json)?\s*", "", str(raw).strip())
-    cleaned = re.sub(r"\s*```$", "", cleaned).strip()
-
-    try:
-        data = json.loads(cleaned)
-    except json.JSONDecodeError as e:
-        prefix = str(raw)[:200]
-        raise ValueError(
-            f"فشل تحويل رد Voice Director إلى JSON: {e}. "
-            f"أول 200 حرف من الرد الخام: {prefix!r}"
-        )
-
-    if isinstance(data, dict) and "directions" in data:
-        return data["directions"]
-    elif isinstance(data, list):
-        return data
-    raise ValueError("صيغة غير صالحة من Voice Director")
-
-def generate_voice_direction_plan(
-    sentences: List[str],
-    episode_context: Optional[Dict[str, Any]] = None,
-) -> List[Dict[str, Any]]:
-    if not isinstance(sentences, list) or not sentences:
-        raise ValueError("قائمة الجمل فارغة!")
-
-    safe_context = _build_voice_context(episode_context)
-    last_error = None
-
-    for attempt in range(1, MAX_DIRECTOR_RETRIES + 1):
-        try:
-            directions = _call_voice_director(sentences, safe_context, previous_error=last_error)
-            validate_voice_direction_plan(directions, sentences)
-            return directions
-        except Exception as e:
-            last_error = str(e)
-            logger.warning(f"محاولة {attempt} لتوليد خطة الصوت فشلت: {last_error}")
-
-    return _build_fallback_plan(sentences)
-
-def _build_fallback_plan(sentences: List[str]) -> List[Dict[str, Any]]:
-    total = len(sentences)
-    plan = []
-    for i in range(1, total + 1):
-        ratio = i / total
-        style = "calm"
-        energy = 2
-        role = "explanation"
-        mode = "teaching"
-
-        if i <= 2:
-            role, mode, style, energy = "hook", "curious", "calm", 3
-        elif ratio >= 0.70 and ratio <= 0.85:
-            role, mode, style, energy = "revelation", "serious", "serious", 3
-        elif ratio > 0.85:
-            role, mode, style, energy = "actionable", "encouraging", "hopeful", 3
-
-        plan.append({
-            "sentence_index": i,
-            "narrative_role": role,
-            "delivery_mode": mode,
-            "azure_style": style,
-            "energy": energy,
-            "rate_percent": -4,
-            "pitch_percent": -1,
-            "pause_before_ms": 100,
-            "pause_after_ms": 300,
-            "emphasis_words": [],
-            "breath_breaks": [],
-            "reason": "fallback quiet storytelling plan",
-        })
-    return plan
-
-def validate_voice_direction_plan(directions: List[Dict[str, Any]], sentences: List[str]) -> None:
-    if len(directions) != len(sentences):
-        raise ValueError(f"عدد التوجيهات ({len(directions)}) لا يطابق الجمل ({len(sentences)})")
-
-    for i, d in enumerate(directions, start=1):
-        if d.get("sentence_index") != i:
-            raise ValueError(f"العنصر {i}: الفهرسة غير متطابقة")
-        if d.get("azure_style") not in APPROVED_AZURE_STYLES:
-            raise ValueError(f"العنصر {i}: النمط غير معتمد")
-
-# =============================================================
-# بناء SSML المطور مع خاصية StyleDegree المخففة للنبرة
-# =============================================================
-def _clamp(value: Any, lo: int, hi: int, default: int = 0) -> int:
-    try:
-        v = int(round(float(value)))
-    except Exception:
-        return default
-    return max(lo, min(hi, v))
-
-def build_sentence_ssml(
-    sentence: str,
-    direction: Dict[str, Any],
-    voice_name: str,
-) -> str:
-    """بناء SSML مع ضبط styledegree تلقائياً لضمان النبرة الهادئة المتزنة"""
-    if not isinstance(sentence, str) or not sentence.strip():
-        raise ValueError("الجملة فارغة!")
-
-    style = str(direction.get("azure_style", "calm")).strip().lower()
-    if style not in APPROVED_AZURE_STYLES:
-        style = "calm"
-
-    rate = _clamp(direction.get("rate_percent", -4), -10, 4, -4)
-    pitch = _clamp(direction.get("pitch_percent", -1), -4, 2, -1)
-    energy = _clamp(direction.get("energy", 3), 1, 5, 3)
-
-    # حساب الـ styledegree لتهدئة الأداء:
-    # طاقة 1 تعطي 0.40، وطاقة 5 لا تتجاوز 0.75 لمنع التصنع الصوتي
-    style_degree = round(0.40 + (energy - 1) * 0.08, 2)
-
-    emphasis_words = direction.get("emphasis_words", []) or []
-    working = sentence
-    placeholders: List[str] = []
-
-    for w in emphasis_words:
-        if not isinstance(w, str) or not w.strip():
-            continue
-        word = w.strip()
-        pattern = re.compile(r"(?<!\w)" + re.escape(word) + r"(?!\w)", re.IGNORECASE)
-        def _repl(m):
-            idx = len(placeholders)
-            placeholders.append(m.group(0))
-            return f"\x00EMPH{idx}\x00"
-        working, n = pattern.subn(_repl, working, count=1)
-
-    escaped = xml_escape(working)
-    for idx, original in enumerate(placeholders):
-        tag = f'<emphasis level="moderate">{xml_escape(original)}</emphasis>'
-        escaped = escaped.replace(f"\x00EMPH{idx}\x00", tag)
-
-    rate_str = f"{rate:+d}%"
-    pitch_str = f"{pitch:+d}%"
-
-    ssml = (
-        '<speak version="1.0" '
-        'xmlns="http://www.w3.org/2001/10/synthesis" '
-        'xmlns:mstts="https://www.w3.org/2001/mstts" '
-        'xml:lang="en-US">\n'
-        f'<voice name="{voice_name}">\n'
-        f'<mstts:express-as style="{style}" styledegree="{style_degree}">\n'
-        f'<prosody rate="{rate_str}" pitch="{pitch_str}">\n'
-        f'{escaped}\n'
-        '</prosody>\n'
-        '</mstts:express-as>\n'
-        '</voice>\n'
-        '</speak>'
-    )
-    return ssml
-
-# =============================================================
-# استدعاء Azure TTS API
-# =============================================================
-def call_azure_tts_api(ssml_payload: str, output_filepath: Path):
-    if not AZURE_SPEECH_KEY:
-        raise ValueError("AZURE_SPEECH_KEY مفقود في ملف الإعدادات!")
-
-    url = f"https://{AZURE_SPEECH_REGION}.tts.speech.microsoft.com/cognitiveservices/v1"
-    headers = {
-        "Ocp-Apim-Subscription-Key": AZURE_SPEECH_KEY,
-        "Content-Type": "application/ssml+xml",
-        "X-Microsoft-OutputFormat": "audio-24khz-160kbitrate-mono-mp3",
-        "User-Agent": "VotExpressiveAudioEngine"
-    }
-
-    response = requests.post(
-        url, headers=headers, data=ssml_payload.encode("utf-8"), timeout=REQUEST_TIMEOUT
-    )
-
-    if response.status_code != 200:
-        raise RuntimeError(
-            f"فشل استدعاء Azure TTS API (HTTP {response.status_code}): {response.text[:300]}"
-        )
-
-    output_filepath.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_filepath, "wb") as f:
-        f.write(response.content)
-
-# =============================================================
-# الدمج والمعاينة
-# =============================================================
-def _estimate_mp3_duration_ms(file_path: Path, bitrate_kbps: int = 160) -> int:
-    try:
-        size = file_path.stat().st_size
-    except OSError:
-        return 0
-    return int(size / (bitrate_kbps * 1000 / 8 / 1000)) if size > 0 else 0
-
-def _get_mp3_duration_ms(file_path: Path) -> Optional[int]:
-    if not PYDUB_AVAILABLE:
-        return None
-    try:
-        seg = AudioSegment.from_mp3(str(file_path))
-        return int(len(seg))
-    except Exception:
-        return None
-
-def _merge_clips_with_pauses(
-    clips_meta: List[Dict[str, Any]],
-    clips_dir: Path,
-    output_file: Path,
-) -> None:
-    if not PYDUB_AVAILABLE or AudioSegment is None:
-        raise RuntimeError("pydub غير متوفرة لدمج المقاطع.")
-
-    output_file.parent.mkdir(parents=True, exist_ok=True)
-    combined = AudioSegment.empty()
-    prev_meta = None
-
-    for meta in clips_meta:
-        clip_path = clips_dir / meta["filename"]
-        segment = AudioSegment.from_mp3(str(clip_path))
-
-        if prev_meta is None:
-            gap = _clamp(meta.get("pause_before_ms", 0), 0, MAX_MERGE_GAP_MS, 0)
-            if gap > 0:
-                combined += AudioSegment.silent(duration=gap, frame_rate=segment.frame_rate)
+        if isinstance(value, (list, tuple)):
+            joined = "; ".join(str(v) for v in value if v)
+            if joined:
+                lines.append(f"- {key}: {joined}")
+        elif isinstance(value, dict):
+            sub = "; ".join(f"{k}={v}" for k, v in value.items() if v)
+            if sub:
+                lines.append(f"- {key}: {sub}")
         else:
-            gap_raw = int(prev_meta.get("pause_after_ms", 0)) + int(meta.get("pause_before_ms", 0))
-            gap = _clamp(gap_raw, 0, MAX_MERGE_GAP_MS, 0)
-            if gap > 0:
-                combined += AudioSegment.silent(duration=gap, frame_rate=segment.frame_rate)
+            lines.append(f"- {key}: {value}")
+    if not lines:
+        return "No visual bible details available."
+    return "\n".join(lines)
 
-        combined += segment
-        prev_meta = meta
 
-    if prev_meta is not None:
-        tail = _clamp(prev_meta.get("pause_after_ms", 0), 0, MAX_MERGE_GAP_MS, 0)
-        if tail > 0:
-            combined += AudioSegment.silent(duration=tail, frame_rate=combined.frame_rate)
+def _format_creative_brief(creative_brief: Optional[Any]) -> str:
+    if not creative_brief:
+        return "No creative brief provided. Anchor on the scene-level context and character DNA."
 
-    combined.export(str(output_file), format="mp3")
+    if isinstance(creative_brief, dict):
+        priority_keys = [
+            "core_idea",
+            "unique_angle",
+            "central_conflict",
+            "unexpected_insight",
+            "episode_concept",
+            "tone",
+            "emotional_arc",
+        ]
+        lines: List[str] = []
+        used_keys = set()
 
-def validate_audio_outputs(
+        for key in priority_keys:
+            if key in creative_brief and creative_brief.get(key):
+                value = creative_brief[key]
+                if isinstance(value, (list, tuple)):
+                    value = "; ".join(str(v) for v in value if v)
+                elif isinstance(value, dict):
+                    value = "; ".join(f"{k}={v}" for k, v in value.items() if v)
+                lines.append(f"- {key}: {value}")
+                used_keys.add(key)
+
+        for key, value in creative_brief.items():
+            if key in used_keys or value is None or value == "":
+                continue
+            if isinstance(value, (list, tuple)):
+                value = "; ".join(str(v) for v in value if v)
+            elif isinstance(value, dict):
+                value = "; ".join(f"{k}={v}" for k, v in value.items() if v)
+            lines.append(f"- {key}: {value}")
+
+        if not lines:
+            return "No creative brief details available."
+        return "\n".join(lines)
+
+    if isinstance(creative_brief, (list, tuple)):
+        joined = "; ".join(str(v) for v in creative_brief if v)
+        return joined or "No creative brief details available."
+
+    return str(creative_brief)
+
+
+# =========================================================
+# HARD CONSTRAINT CHECK (STRICT — 100%, NO RELAXATION)
+# =========================================================
+def _check_hard_constraints(prompt: str, expected_index: int) -> List[str]:
+    """
+    فحص الشروط الحاكمة الصارمة فقط.
+    أي فشل هنا يعني رفض الـPrompt مباشرة (بدون مساحة إبداعية).
+    """
+    issues: List[str] = []
+    lower = prompt.lower()
+
+    # 1) Mandatory literal prefix
+    if not prompt.startswith(MANDATORY_PREFIX):
+        issues.append(
+            f"does not start with the mandatory literal prefix '{MANDATORY_PREFIX}'"
+        )
+
+    # 2) Character DNA tokens
+    for token in REQUIRED_CHARACTER_DNA_TOKENS:
+        if token.lower() not in lower:
+            issues.append(f"missing required character DNA token '{token}'")
+
+    # 3) Background phrase
+    if REQUIRED_BACKGROUND_PHRASE.lower() not in lower:
+        issues.append(
+            f"missing required background phrase '{REQUIRED_BACKGROUND_PHRASE}'"
+        )
+
+    # 4) Corner phrase
+    if REQUIRED_CORNER_PHRASE.lower() not in lower:
+        issues.append(
+            f"missing required corner phrase '{REQUIRED_CORNER_PHRASE}'"
+        )
+
+    # 5) Small descriptor for the in-image index ("very small")
+    if not any(tok in lower for tok in REQUIRED_SMALL_TOKENS):
+        issues.append(
+            "missing 'very small' descriptor for the in-image index number"
+        )
+
+    # 6) Subtle / faint descriptor
+    if not any(tok in lower for tok in REQUIRED_SUBTLE_TOKENS):
+        issues.append(
+            "missing 'faint' or 'subtle' descriptor for the in-image index number"
+        )
+
+    # 7) Correct index inside the in-image number instruction
+    if f'"{expected_index}"' not in prompt:
+        issues.append(
+            f"does not contain the correct image index '\"{expected_index}\"' "
+            "inside the in-image number instruction"
+        )
+
+    # 8) Forbidden bare trailing number
+    if re.search(r"[\s,;]\d+\s*[.!]?\s*$", prompt):
+        issues.append(
+            "ends with a bare standalone number instead of an in-image number instruction"
+        )
+
+    # 9) Anti-text clause
+    if not any(tok in lower for tok in REQUIRED_ANTI_TEXT_TOKENS):
+        issues.append(
+            "missing explicit anti-text clause "
+            "('no written text, labels, captions, symbols containing letters, or extra numbers inside the image; "
+            "only the required faint image index is allowed')"
+        )
+
+    return issues
+
+
+# =========================================================
+# DIAGNOSTIC ONLY: LEGACY FLEXIBLE GROUPS (never used to reject)
+# =========================================================
+def _diagnose_flexible_groups(prompt: str) -> Tuple[int, List[str], List[str]]:
+    """
+    تُرجع فقط معلومات تشخيصية لعدد المجموعات الإبداعية المكتشفة بالكلمات.
+    لا تُستخدم أبدًا لقبول أو رفض.
+    """
+    lower = prompt.lower()
+    matched: List[str] = []
+    missing: List[str] = []
+    for group_name, keywords in FLEXIBLE_GROUPS.items():
+        if any(kw in lower for kw in keywords):
+            matched.append(group_name)
+        else:
+            missing.append(group_name)
+    return len(matched), matched, missing
+
+
+# =========================================================
+# AI CREATIVE REVIEWER
+# =========================================================
+def _build_creative_review_request(
+    prompts: List[str],
     sentences: List[str],
-    clips_dir: Path,
-    final_audio_file: Path,
-    metadata_file: Path,
-    expected_voice: Optional[str] = None,
-) -> None:
-    # 1) الملف الصوتي النهائي
-    if not final_audio_file.exists() or final_audio_file.stat().st_size == 0:
-        raise ValueError("الملف الصوتي النهائي غير موجود أو فارغ!")
+    prompt_indices: List[int],
+    scene_map: Dict[int, Dict[str, Any]],
+    visual_bible: Any,
+    creative_brief: Any,
+) -> str:
+    body = "Review the following batch of image-generation prompts.\n\n"
+    body += "CREATIVE BRIEF (narrative anchor):\n"
+    body += _format_creative_brief(creative_brief) + "\n\n"
+    body += "VISUAL BIBLE (style anchor):\n"
+    body += _format_visual_bible(visual_bible) + "\n\n"
+    body += "PROMPTS TO REVIEW (each is self-contained):\n"
 
-    # 2) ملف البيانات الوصفية موجود
-    if not metadata_file.exists():
-        raise ValueError("ملف البيانات الوصفية غير موجود!")
+    for i, prompt in enumerate(prompts):
+        abs_idx = prompt_indices[i]
+        sentence = sentences[i] if i < len(sentences) else ""
+        scene = scene_map.get(abs_idx) if scene_map else None
+        body += "\n---\n"
+        body += f"image_index: {abs_idx}\n"
+        body += f"narration sentence: {sentence}\n"
+        body += f"scene context:\n{_format_scene_context(scene)}\n"
+        body += f"prompt:\n{prompt}\n"
 
-    # 3) البيانات الوصفية JSON صالح وهي dict
+    body += "\nReturn ONLY the JSON object described in the system instructions."
+    return body
+
+
+def _parse_creative_review_response(
+    raw: str,
+    expected_count: int,
+    expected_indices: List[int],
+) -> Optional[List[Dict[str, Any]]]:
+    if not raw:
+        return None
+
+    text = raw.strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
+
+    data: Optional[Any] = None
     try:
-        with open(metadata_file, "r", encoding="utf-8") as f:
-            metadata = json.load(f)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"ملف البيانات الوصفية ليس JSON صالحاً: {e}")
-    except OSError as e:
-        raise ValueError(f"تعذر قراءة ملف البيانات الوصفية: {e}")
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        m = re.search(r"\{[\s\S]*\}", text)
+        if not m:
+            return None
+        try:
+            data = json.loads(m.group(0))
+        except json.JSONDecodeError:
+            return None
 
-    if not isinstance(metadata, dict):
-        raise ValueError("ملف البيانات الوصفية ليس كائن JSON (dict)!")
+    if not isinstance(data, dict):
+        return None
 
-    # 4) مطابقة عدد الجمل
-    sentence_count = metadata.get("sentence_count")
-    if sentence_count is not None and int(sentence_count) != len(sentences):
+    reviews = data.get("reviews")
+    if not isinstance(reviews, list):
+        return None
+    if len(reviews) != expected_count:
+        return None
+
+    validated: List[Dict[str, Any]] = []
+    for i, r in enumerate(reviews):
+        if not isinstance(r, dict):
+            return None
+        idx = r.get("image_index")
+        score = r.get("score")
+        decision = r.get("decision")
+        # image_index must be a plain int (not bool)
+        if not isinstance(idx, int) or isinstance(idx, bool):
+            return None
+        if idx != expected_indices[i]:
+            return None
+        # score must be a real number in [0, 100] — reject bool explicitly
+        if isinstance(score, bool) or not isinstance(score, (int, float)):
+            return None
+        if not (0 <= score <= 100):
+            return None
+        if decision not in ("accept", "repair"):
+            return None
+
+        strengths = r.get("strengths", [])
+        issues = r.get("issues", [])
+        if not isinstance(strengths, list):
+            strengths = []
+        if not isinstance(issues, list):
+            issues = []
+
+        validated.append({
+            "image_index": int(idx),
+            "score": int(score),
+            "decision": decision,
+            "strengths": [str(s) for s in strengths],
+            "issues": [str(s) for s in issues],
+        })
+
+    return validated
+
+
+def _review_batch_creatively(
+    prompts: List[str],
+    sentences: List[str],
+    prompt_indices: List[int],
+    scene_map: Dict[int, Dict[str, Any]],
+    visual_bible: Any,
+    creative_brief: Any,
+) -> Optional[List[Dict[str, Any]]]:
+    """
+    يستدعي مراجع الذكاء الاصطناعي على الدفعة كاملة في طلب واحد.
+    يرجع قائمة reviews بنفس ترتيب prompts، أو None إذا فشل المراجع
+    بعد MAX_AI_REVIEW_ATTEMPTS (وهذا لا يُعد فشلًا للمرحلة).
+
+    prompt_indices: قائمة الفهارس الحقيقية (absolute indices) المقابلة لكل prompt
+                    بنفس الترتيب. قد تكون غير متتابعة (مثل [1,3,4,7]).
+    """
+    if not prompts:
+        return []
+
+    expected_count = len(prompts)
+    expected_indices = list(prompt_indices)
+
+    if len(expected_indices) != expected_count:
         raise ValueError(
-            f"عدد الجمل في البيانات الوصفية ({sentence_count}) "
-            f"لا يطابق العدد الفعلي ({len(sentences)})"
+            "_review_batch_creatively: prompt_indices length "
+            f"({len(expected_indices)}) must match prompts length ({expected_count})."
         )
 
-    # 5) قائمة المقاطع
-    clips = metadata.get("clips")
-    if not isinstance(clips, list):
-        raise ValueError("حقل 'clips' مفقود أو ليس قائمة في البيانات الوصفية!")
-    if len(clips) != len(sentences):
-        raise ValueError(
-            f"عدد المقاطع في البيانات الوصفية ({len(clips)}) "
-            f"لا يطابق عدد الجمل ({len(sentences)})"
+    user_prompt = _build_creative_review_request(
+        prompts=prompts,
+        sentences=sentences,
+        prompt_indices=prompt_indices,
+        scene_map=scene_map,
+        visual_bible=visual_bible,
+        creative_brief=creative_brief,
+    )
+
+    for attempt in range(1, MAX_AI_REVIEW_ATTEMPTS + 1):
+        try:
+            raw = call_gemini_with_fallback(
+                system_instruction=CREATIVE_REVIEWER_SYSTEM_PROMPT,
+                user_prompt=user_prompt,
+                response_mime_type="application/json",
+            )
+        except Exception as exc:
+            logger.warning(
+                f"⚠️ AI creative review attempt {attempt}/{MAX_AI_REVIEW_ATTEMPTS} "
+                f"failed to call Gemini: {exc}"
+            )
+            continue
+
+        parsed = _parse_creative_review_response(
+            raw=raw,
+            expected_count=expected_count,
+            expected_indices=expected_indices,
+        )
+        if parsed is not None:
+            return parsed
+
+        logger.warning(
+            f"⚠️ AI creative review attempt {attempt}/{MAX_AI_REVIEW_ATTEMPTS} "
+            "returned invalid JSON. Retrying."
         )
 
-    # 6) كل ملف مقطع موجود وحجمه > 0
-    for idx, clip in enumerate(clips, start=1):
-        if not isinstance(clip, dict):
-            raise ValueError(f"المقطع رقم {idx} في البيانات الوصفية ليس كائن JSON!")
-        filename = clip.get("filename")
-        if not filename or not isinstance(filename, str):
-            raise ValueError(f"المقطع رقم {idx}: اسم الملف مفقود أو غير صالح!")
-        clip_path = clips_dir / filename
-        if not clip_path.exists() or clip_path.stat().st_size == 0:
-            raise ValueError(f"المقطع رقم {idx} ({filename}) غير موجود أو فارغ!")
+    logger.warning(
+        "⚠️ AI creative review unavailable after "
+        f"{MAX_AI_REVIEW_ATTEMPTS} attempts. "
+        "Falling back to hard-constraints-only acceptance for this batch."
+    )
+    return None
 
-    # 7) مطابقة الصوت
-    if expected_voice is not None:
-        meta_voice = metadata.get("voice_name")
-        if meta_voice is not None and meta_voice != expected_voice:
+
+# =========================================================
+# BATCH VALIDATION HELPERS
+# =========================================================
+def _validate_single_prompt(
+    prompt: str,
+    expected_index: int,
+    position_in_batch: int,
+    batch_num: int,
+) -> None:
+    issues = _check_hard_constraints(prompt, expected_index)
+    if issues:
+        raise ValueError(
+            f"Batch [{batch_num}] prompt #{position_in_batch} "
+            f"(expected image index {expected_index}) failed strict validation: "
+            + " | ".join(issues)
+            + "\n--- INVALID PROMPT ---\n"
+            + prompt
+            + "\n----------------------"
+        )
+
+
+def _validate_batch_prompts(
+    batch_num: int,
+    start_idx: int,
+    prompts: List[str],
+) -> None:
+    for offset, prompt in enumerate(prompts):
+        expected_index = start_idx + offset
+        position_in_batch = offset + 1
+        _validate_single_prompt(
+            prompt=prompt,
+            expected_index=expected_index,
+            position_in_batch=position_in_batch,
+            batch_num=batch_num,
+        )
+
+
+def _validate_batch(batch_idx: int, expected_count: int, prompts: List[str]) -> None:
+    if len(prompts) != expected_count:
+        raise ValueError(
+            f"Batch [{batch_idx}] returned {len(prompts)} prompts, "
+            f"expected exactly {expected_count}. Refusing partial/inflated batch."
+        )
+
+
+def _validate_final_prompts(sentences: List[str], batches: List[List[str]]) -> None:
+    """
+    فحص نهائي شامل عبر كل الدفعات المدمجة (بعد الدمج بالترتيب الصحيح)، للتأكد من:
+      - القائمة النهائية list حقيقية.
+      - عدد البرومبتات النهائي = N بالضبط (N = عدد الجمل).
+      - كل برومبت نص غير فارغ.
+      - كل برومبت يبدأ بالبادئة الإلزامية.
+      - كل برومبت يحتوي فهرسه الصحيح المتسلسل (بدون فجوات أو تكرار،
+        لأن الفهارس هنا مبنية على ترتيب الدمج نفسه: 1..N).
+    هذا الفحص لا يعيد كتابة أي برومبت؛ فقط يرفع خطأ واضح عند وجود عطل حقيقي
+    (وهو خط دفاع أخير بعد الفحوص الداخلية لكل دفعة).
+    """
+    if not isinstance(batches, list):
+        raise ValueError(
+            "Final validation failure category: invalid_internal_structure — "
+            "merged batches result is not a list."
+        )
+
+    flat: List[str] = []
+    for b in batches:
+        if not isinstance(b, list):
             raise ValueError(
-                f"الصوت في البيانات الوصفية '{meta_voice}' "
-                f"لا يطابق الصوت المتوقع '{expected_voice}'"
+                "Final validation failure category: invalid_internal_structure — "
+                "a batch result is not a list."
+            )
+        flat.extend(b)
+
+    n = len(sentences)
+    if len(flat) != n:
+        raise ValueError(
+            "Final validation failure category: final_count_mismatch — "
+            f"got {len(flat)} prompts for {n} sentences."
+        )
+
+    for i, prompt in enumerate(flat, start=1):
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError(
+                "Final validation failure category: empty_or_invalid_prompt — "
+                f"prompt at image index {i} is empty or not a string."
+            )
+        if not prompt.startswith(MANDATORY_PREFIX):
+            raise ValueError(
+                "Final validation failure category: invalid_prompt_prefix — "
+                f"prompt at image index {i} does not start with the mandatory prefix."
+            )
+        if f'"{i}"' not in prompt:
+            raise ValueError(
+                "Final validation failure category: missing_or_wrong_index — "
+                f"prompt at image index {i} does not contain its correct in-image index."
             )
 
-def _safe_cleanup_staging(staging_clips_dir: Path, staging_audio_file: Path, staging_metadata_file: Path):
-    if staging_clips_dir.exists():
-        shutil.rmtree(staging_clips_dir, ignore_errors=True)
-    if staging_audio_file.exists():
-        staging_audio_file.unlink(missing_ok=True)
-    if staging_metadata_file.exists():
-        staging_metadata_file.unlink(missing_ok=True)
 
-# =============================================================
-# الدالة الرئيسية لتوليد الصوت (Default Voice = Brian)
-# =============================================================
-def generate_stage3_audio(
-    episode_id: str,
-    sentences: List[str],
-    engine: str = "azure",
-    voice: str = "en-US-BrianMultilingualNeural",  # الصوت المعتمد الجديد لقناة Vot
-    output_dir: Path = Path("outputs"),
-    episode_context: Optional[Dict[str, Any]] = None,
-) -> Path:
-    # =========================================================
-    # HARD GUARDS — قبل أي استدعاء مدفوع (Azure / Gemini)
-    # =========================================================
+# =========================================================
+# PARTIAL REPAIR FOR INVALID PROMPTS ONLY
+# =========================================================
+def _build_repair_request(
+    invalid_items: List[Dict[str, Any]],
+    visual_bible: Any,
+    creative_brief: Any,
+    start_idx: int,
+    end_idx: int,
+) -> str:
+    header = (
+        "This is a fresh independent repair request.\n\n"
+        "Repair ONLY the invalid image-generation prompts listed below.\n"
+        "Do not rewrite, replace, or return any valid prompt.\n"
+        "Return exactly one repaired prompt for each invalid item.\n"
+        "Return the repaired prompts in the same order.\n"
+        "Return prompts separated ONLY by a single blank line.\n"
+        "No JSON.\n"
+        "No markdown.\n"
+        "No headers.\n"
+        "No explanations.\n\n"
+        "Every repaired prompt MUST start EXACTLY with:\n"
+        "Create a 2D cel-shaded illustration showing\n\n"
+    )
 
-    # A) المحرك: azure فقط
-    engine_norm = str(engine).lower().strip()
-    if engine_norm != "azure":
-        raise ValueError(
-            f"المحرك '{engine}' غير مدعوم. المحرك الوحيد المتاح هو 'azure'."
+    body = f"Batch index range: {start_idx} .. {end_idx}\n\n"
+
+    body += "CREATIVE BRIEF (global narrative anchor):\n"
+    body += _format_creative_brief(creative_brief) + "\n\n"
+
+    body += "VISUAL BIBLE (global style anchor):\n"
+    body += _format_visual_bible(visual_bible) + "\n\n"
+
+    body += "MANDATORY LITERAL CONTENT inside every repaired prompt:\n"
+    body += "- Start with EXACTLY: Create a 2D cel-shaded illustration showing\n"
+    body += (
+        "- Full character DNA spelled out literally: consistent orange muscular character, "
+        "smooth head, two large white oval eyes, no mouth, black shorts, consistent proportions, "
+        "clean 2D cel-shaded illustration style\n"
+    )
+    body += (
+        "- Literal background phrase: plain grey background as the dominant background "
+        "(symbolic elements placed ON/OVER it, not replacing it)\n"
+    )
+    body += (
+        "- In-image number instruction with the CORRECT index for that prompt: "
+        "include the very small, subtle, faint number \"N\" inside the image, "
+        "placed in the bottom-right corner\n"
+    )
+    body += (
+        "- Anti-text clause: no written text, labels, captions, symbols containing letters, "
+        "or extra numbers inside the image; only the required faint image index is allowed\n"
+    )
+    body += "- Conceptual / symbolic (NON-literal) visual idea\n"
+    body += "- Clear character action / pose / body language\n"
+    body += "- Symbolic environment or visual element placed ON/OVER the grey background\n"
+    body += (
+        "- Favor non-fitness symbolic environments (library, archive, manuscript, theater, "
+        "museum, mirror, map, door, bridge, abstract mental space) unless the sentence "
+        "explicitly requires fitness/gym imagery\n"
+    )
+    body += "- Emotional state / expression\n"
+    body += "- Camera angle / shot type\n"
+    body += "- Composition\n"
+    body += "- Lighting / colors when relevant\n"
+    body += "- Continuity with the previous and next scenes\n"
+    body += "- Do NOT end with a bare standalone number.\n\n"
+
+    body += "INVALID PROMPTS TO REPAIR (in order):\n"
+
+    for item in invalid_items:
+        body += "\n---\n"
+        body += f"Image index: {item['absolute_index']}\n"
+        body += f"Sentence: {item['sentence']}\n"
+        body += f"Scene context:\n{item['scene_context']}\n"
+        if item.get("previous_prompt"):
+            body += f"Previous valid prompt (for continuity): {item['previous_prompt']}\n"
+        if item.get("next_prompt"):
+            body += f"Next valid prompt (for continuity): {item['next_prompt']}\n"
+        body += "Issues to fix: " + " | ".join(item["issues"]) + "\n"
+        body += f"Rejected prompt:\n{item['invalid_prompt']}\n"
+
+    body += (
+        "\nReturn ONLY the repaired prompts separated by a single blank line, in order, "
+        "with no headers, no labels, no markdown, no quotes, no JSON, and no commentary."
+    )
+    return header + body
+
+
+def _repair_invalid_prompts(
+    invalid_items: List[Dict[str, Any]],
+    valid_prompts: Dict[int, str],
+    batch_sentences: List[str],
+    start_idx: int,
+    end_idx: int,
+    scene_map: Dict[int, Dict[str, Any]],
+    visual_bible: Any,
+    creative_brief: Any,
+    batch_num: int,
+) -> Dict[int, str]:
+    """
+    تصلح فقط الـPrompts المخالفة عبر طلبات مستقلة، مع إعادة المحاولة حتى
+    MAX_PROMPT_REPAIR_ATTEMPTS. تُرجع قاموساً: absolute_index -> repaired prompt.
+
+    الفحص داخل الحلقة: الشروط الحاكمة فقط.
+    المراجعة الإبداعية بعد الإصلاح تُنفَّذ على مستوى _process_single_batch.
+    """
+    if not invalid_items:
+        return {}
+
+    repaired: Dict[int, str] = {}
+    remaining: List[Dict[str, Any]] = list(invalid_items)
+    attempts = 0
+
+    while remaining and attempts < MAX_PROMPT_REPAIR_ATTEMPTS:
+        attempts += 1
+        logger.info(
+            f"🔧 الدفعة [{batch_num}] محاولة إصلاح {attempts}/{MAX_PROMPT_REPAIR_ATTEMPTS} "
+            f"لـ {len(remaining)} برومبت مخالف."
         )
 
-    # B) الصوت: يجب أن يكون ضمن الأصوات الذكورية المعتمدة
-    if not isinstance(AZURE_MALE_VOICES, (set, list, tuple, dict)) or voice not in AZURE_MALE_VOICES:
+        enriched_items: List[Dict[str, Any]] = []
+        for item in remaining:
+            new_item = dict(item)
+            idx = new_item["absolute_index"]
+            if idx - 1 in valid_prompts:
+                new_item["previous_prompt"] = valid_prompts[idx - 1]
+            if idx + 1 in valid_prompts:
+                new_item["next_prompt"] = valid_prompts[idx + 1]
+            enriched_items.append(new_item)
+
+        user_prompt = _build_repair_request(
+            invalid_items=enriched_items,
+            visual_bible=visual_bible,
+            creative_brief=creative_brief,
+            start_idx=start_idx,
+            end_idx=end_idx,
+        )
+
+        raw = call_gemini_with_fallback(
+            system_instruction=STAGE_2_ENRICHED_SYSTEM_PROMPT,
+            user_prompt=user_prompt,
+            response_mime_type="text/plain",
+        )
+        parsed = clean_and_parse_prompts(raw)
+
+        if len(parsed) != len(enriched_items):
+            logger.warning(
+                f"⚠️ الدفعة [{batch_num}] محاولة إصلاح {attempts}: "
+                f"عدد البرومبتات المُعادة ({len(parsed)}) لا يطابق المطلوب "
+                f"({len(enriched_items)}). سيتم إعادة المحاولة."
+            )
+            continue
+
+        still_invalid: List[Dict[str, Any]] = []
+        for i, item in enumerate(enriched_items):
+            candidate = parsed[i]
+            expected_index = item["absolute_index"]
+            hard_issues = _check_hard_constraints(candidate, expected_index)
+            if hard_issues:
+                new_item = dict(item)
+                new_item["issues"] = [
+                    "Hard constraint failure after repair: " + "; ".join(hard_issues)
+                ]
+                new_item["invalid_prompt"] = candidate
+                still_invalid.append(new_item)
+            else:
+                repaired[expected_index] = candidate
+
+        if not still_invalid:
+            remaining = []
+        else:
+            remaining = still_invalid
+
+    if remaining:
+        failed_indices = [item["absolute_index"] for item in remaining]
+        details = "\n".join(
+            f"  - index {item['absolute_index']}: " + " | ".join(item["issues"])
+            for item in remaining
+        )
+        raise ValueError(
+            f"Batch [{batch_num}] failed to repair {len(remaining)} prompt(s) "
+            f"after {MAX_PROMPT_REPAIR_ATTEMPTS} attempts. "
+            f"Unrepaired image indices: {failed_indices}.\nDetails:\n{details}"
+        )
+
+    return repaired
+
+
+# =========================================================
+# BATCH PROCESSING
+# =========================================================
+def _process_single_batch(batch_tuple: tuple) -> tuple:
+    """
+    معالجة دفعة واحدة:
+      1) توليد البرومبتات الأساسية (مع إعادة محاولة محدودة إذا فشل الاتصال
+         بالنموذج أو أعاد عدداً خاطئاً من البرومبتات — لا تُعاد محاولة أي
+         دفعة أخرى بسبب فشل هذه الدفعة).
+      2) فحص الشروط الحاكمة الصارمة فقط.
+      3) مراجعة إبداعية ذكية عبر AI على الدفعة كاملة (طلب واحد)
+         مع تمرير الفهارس الحقيقية للبرومبتات الناجحة.
+      4) تصنيف: صحيح / يحتاج إصلاح
+         (فشل hard OR score < 80 OR قرار reviewer = "repair").
+      5) إصلاح المخالف فقط (فحص hard constraints داخل الحلقة).
+      6) بعد الإصلاح: إعادة مراجعة إبداعية سريعة للبرومبتات المُصلَحة (للتوثيق فقط).
+      7) إعادة بناء الدفعة بترتيبها الأصلي، مع فحص نهائي صارم.
+    لا تُرجَع الدفعة إلا بعد أن يصبح كل برومبت صحيحًا بالشروط الحاكمة.
+    """
+    (
+        batch_idx,
+        batch_sentences,
+        start_idx,
+        end_idx,
+        scene_map,
+        visual_bible,
+        creative_brief,
+        has_stage1_context,
+        episode_id,
+    ) = batch_tuple
+
+    logger.info(
+        f"🚀 بدء معالجة الدفعة [{batch_idx}] (episode_id={episode_id}) بالتوازي: "
+        f"الجمل من {start_idx} إلى {end_idx}"
+    )
+
+    # ---- بناء الـUser Prompt ----
+    if has_stage1_context:
+        system_instruction = STAGE_2_ENRICHED_SYSTEM_PROMPT
+        user_prompt = f"""Generate exactly {len(batch_sentences)} explicit image generation commands.
+The index for this batch MUST start sequentially at {start_idx} and end at {end_idx}.
+
+CHANNEL IDENTITY REMINDER:
+This channel is about human behavior, psychology, philosophy, ethics, language, literature, civilizations, and the history of ideas — it is NOT primarily a fitness channel. Only use gym, workout, or sports imagery when the sentence or scene context explicitly calls for it; otherwise favor symbolic environments such as libraries, archives, manuscripts, theaters, museums, classrooms, streets, mirrors, maps, doors, bridges, and abstract mental spaces. If a named thinker, book, or civilization is referenced, represent it safely via manuscripts, archives, statues, or historical settings, without inventing written quotations.
+
+MANDATORY PREFIX FOR EVERY COMMAND:
+Every single command MUST start EXACTLY with the literal text:
+"Create a 2D cel-shaded illustration showing ..."
+No command is allowed to begin with any other wording. This prefix is non-negotiable.
+
+MANDATORY LITERAL CONTENT INSIDE EVERY COMMAND:
+Each command MUST literally contain ALL of the following (do NOT omit any, even if it means repeating across commands):
+- The full character DNA: consistent orange muscular character, smooth head, two large white oval eyes, no mouth, black shorts, consistent proportions, clean 2D cel-shaded illustration style.
+- The literal background phrase: plain grey background as the dominant background (symbolic elements must be placed ON/OVER it, not replacing it).
+- A clear in-image number instruction using the CORRECT sequential image index for that command, in this style:
+  include the very small, subtle, faint number "N" inside the image, placed in the bottom-right corner
+  (replace N with the correct index: {start_idx} for the first command, {start_idx + 1} for the second, ..., {end_idx} for the last).
+- The anti-text clause: no written text, labels, captions, symbols containing letters, or extra numbers inside the image; only the required faint image index is allowed.
+- The command MUST NOT end with a bare standalone number. Never append the index as a standalone trailing digit.
+
+Each sentence has its own scene context below. Every command MUST:
+- Begin EXACTLY with "Create a 2D cel-shaded illustration showing ..." (literal, mandatory).
+- Reflect the non-literal, conceptual visual storytelling for THAT sentence (never a literal restatement of the sentence).
+- Build on the scene's visual_concept, emotion, character_action, environment, camera, composition, continuity, and transitions.
+- Spell out character DNA and background phrase literally inside the text.
+- Include a correct in-image number instruction with the correct index for that position.
+- Include the anti-text clause literally.
+- Include a clear character action / pose, a symbolic visual element placed on/over the grey background, an emotional state, a camera angle, a clear composition, lighting / color direction, and continuity with adjacent scenes.
+- Evolve across the scene's sentences (establishing → continuation → escalation → reveal → transformation), not repeat identical images.
+
+CREATIVE BRIEF (global narrative anchor):
+{_format_creative_brief(creative_brief)}
+
+Use the CREATIVE BRIEF to keep every command aligned with the video's core_idea, unique_angle, central_conflict, unexpected_insight, episode_concept, tone, and emotional_arc.
+
+VISUAL BIBLE (global style anchor for the whole video):
+{_format_visual_bible(visual_bible)}
+
+SENTENCES AND THEIR SCENE CONTEXTS (the [N] is the correct image index to place inside the in-image number instruction for that command):
+"""
+        for s_idx, sent in enumerate(batch_sentences, start=start_idx):
+            scene = scene_map.get(s_idx)
+            user_prompt += (
+                f"\n[{s_idx}] Sentence: {sent}\n"
+                f"Scene context:\n{_format_scene_context(scene)}\n"
+            )
+
+        user_prompt += (
+            "\nReturn the image generation commands separated ONLY by a single blank line, in order, "
+            "with no headers, no labels, no markdown, no quotes, and no extra commentary. "
+            "Every command MUST begin with the literal prefix "
+            "\"Create a 2D cel-shaded illustration showing ...\", MUST spell out the full character DNA, "
+            "the plain grey background phrase, the anti-text clause, and MUST place the correct "
+            "in-image index number inside the bottom-right corner (never as a bare trailing number)."
+        )
+    else:
+        system_instruction = STAGE_2_SYSTEM_PROMPT
+        user_prompt = f"""Process the following sentences and generate exactly {len(batch_sentences)} explicit image generation commands.
+The index for this batch MUST start sequentially at {start_idx} and end at {end_idx}.
+
+CHANNEL IDENTITY REMINDER:
+This channel is about human behavior, psychology, philosophy, ethics, language, literature, civilizations, and the history of ideas — it is NOT primarily a fitness channel. Only use gym, workout, or sports imagery when a sentence explicitly calls for it; otherwise favor symbolic environments such as libraries, archives, manuscripts, theaters, museums, classrooms, streets, mirrors, maps, doors, bridges, and abstract mental spaces.
+
+MANDATORY PREFIX FOR EVERY COMMAND:
+Every single command MUST start EXACTLY with the literal text:
+"Create a 2D cel-shaded illustration showing ..."
+No command is allowed to begin with any other wording. This prefix is non-negotiable.
+
+MANDATORY LITERAL CONTENT INSIDE EVERY COMMAND:
+Each command MUST literally contain ALL of the following (do NOT omit any, even if it means repeating across commands):
+- The full character DNA: consistent orange muscular character, smooth head, two large white oval eyes, no mouth, black shorts, consistent proportions, clean 2D cel-shaded illustration style.
+- The literal background phrase: plain grey background as the dominant background (symbolic elements must be placed ON/OVER it, not replacing it).
+- A clear in-image number instruction using the CORRECT sequential image index for that command, in this style:
+  include the very small, subtle, faint number "N" inside the image, placed in the bottom-right corner
+  (replace N with the correct index: {start_idx} for the first command, {start_idx + 1} for the second, ..., {end_idx} for the last).
+- The anti-text clause: no written text, labels, captions, symbols containing letters, or extra numbers inside the image; only the required faint image index is allowed.
+- The command MUST NOT end with a bare standalone number. Never append the index as a standalone trailing digit.
+
+Reminder:
+- Every command MUST begin EXACTLY with "Create a 2D cel-shaded illustration showing ..." (literal, mandatory).
+- NEVER restate the sentence literally. Translate it into a conceptual, symbolic, or story-driven visual.
+- Always spell out character DNA literally inside the prompt text.
+- Always include "plain grey background as the dominant background" literally.
+- Always include a correct in-image number instruction: include the very small, subtle, faint number "N" inside the image, placed in the bottom-right corner.
+- Always include the anti-text clause literally.
+- Always include a clear character action / pose, a symbolic visual element placed on/over the grey background, an emotional state, a camera angle, a clear composition, lighting / color direction, and continuity with adjacent scenes.
+- Never end with a bare standalone number.
+
+Sentences (the [N] is the correct image index to place inside the in-image number instruction for that command):
+"""
+        for s_idx, sent in enumerate(batch_sentences, start=start_idx):
+            user_prompt += f"[{s_idx}] {sent}\n"
+
+    # ---- 0) توليد الدفعة مع إعادة محاولة محدودة (لا تؤثر على الدفعات الأخرى) ----
+    expected_count = len(batch_sentences)
+    prompts: Optional[List[str]] = None
+    last_generation_error: Optional[str] = None
+    generation_user_prompt = user_prompt
+
+    for gen_attempt in range(1, MAX_BATCH_GENERATION_ATTEMPTS + 1):
         try:
-            allowed = ", ".join(sorted(AZURE_MALE_VOICES)) if AZURE_MALE_VOICES else "(لا يوجد)"
-        except Exception:
-            allowed = str(AZURE_MALE_VOICES)
-        raise ValueError(
-            f"الصوت '{voice}' غير مسموح. الأصوات المتاحة: {allowed}"
+            raw_output = call_gemini_with_fallback(
+                system_instruction=system_instruction,
+                user_prompt=generation_user_prompt,
+                response_mime_type="text/plain",
+            )
+        except Exception as exc:
+            last_generation_error = f"Gemini call failed: {exc}"
+            logger.warning(
+                f"⚠️ الدفعة [{batch_idx}] (episode_id={episode_id}) محاولة توليد "
+                f"{gen_attempt}/{MAX_BATCH_GENERATION_ATTEMPTS} فشلت أثناء الاتصال بالنموذج: {exc}"
+            )
+            continue
+
+        candidate_prompts = clean_and_parse_prompts(raw_output)
+
+        if len(candidate_prompts) == expected_count:
+            prompts = candidate_prompts
+            break
+
+        last_generation_error = (
+            f"expected {expected_count} prompts (indices {start_idx}-{end_idx}), "
+            f"got {len(candidate_prompts)}"
+        )
+        logger.warning(
+            f"⚠️ الدفعة [{batch_idx}] محاولة توليد {gen_attempt}/{MAX_BATCH_GENERATION_ATTEMPTS}: "
+            f"{last_generation_error}. سيُعاد توليد نفس الدفعة فقط (بدون التأثير على الدفعات الأخرى)."
+        )
+        generation_user_prompt = (
+            user_prompt
+            + "\n\nCOUNT CORRECTION (previous attempt failed): your previous response "
+              f"returned {len(candidate_prompts)} prompt(s), but exactly {expected_count} "
+              f"prompts are required for image indices {start_idx} to {end_idx} inclusive — "
+              "one prompt per sentence, in order. Return exactly that many prompts, no more "
+              "and no fewer, separated only by a single blank line."
         )
 
-    # C) الجمل: قائمة غير فارغة من نصوص غير فارغة
-    if not isinstance(sentences, list) or not sentences:
-        raise ValueError("قائمة الجمل فارغة أو غير صالحة!")
+    if prompts is None:
+        raise ValueError(
+            f"Batch [{batch_idx}] (episode_id={episode_id}, sentence range {start_idx}-{end_idx}) "
+            f"failed to produce the correct prompt count after {MAX_BATCH_GENERATION_ATTEMPTS} "
+            f"generation attempts. Expected {expected_count} prompts. "
+            f"Last error / validation failure category 'wrong_prompt_count': {last_generation_error}"
+        )
+
+    # ---- 1) فحص الشروط الحاكمة الصارمة ----
+    valid_prompts: Dict[int, str] = {}
+    invalid_items: List[Dict[str, Any]] = []
+
+    for offset, prompt in enumerate(prompts):
+        expected_index = start_idx + offset
+        hard_issues = _check_hard_constraints(prompt, expected_index)
+
+        # تشخيصي فقط (لا يؤثر على القبول)
+        diag_matched, diag_matched_groups, _ = _diagnose_flexible_groups(prompt)
+        logger.debug(
+            f"🔎 [idx={expected_index}] hard_issues={len(hard_issues)} "
+            f"flexible_matched={diag_matched}/8 groups={diag_matched_groups}"
+        )
+
+        if hard_issues:
+            sentence = batch_sentences[offset]
+            scene = scene_map.get(expected_index) if scene_map else None
+            invalid_items.append({
+                "absolute_index": expected_index,
+                "sentence": sentence,
+                "scene_context": _format_scene_context(scene),
+                "invalid_prompt": prompt,
+                "issues": ["Hard constraint failure: " + "; ".join(hard_issues)],
+                "origin": "hard",
+            })
+        else:
+            valid_prompts[expected_index] = prompt
+
+    # ---- 2) مراجعة إبداعية ذكية على البرومبتات التي نجحت في الشروط الحاكمة ----
+    if valid_prompts:
+        ordered_indices = sorted(valid_prompts.keys())
+        review_prompts = [valid_prompts[i] for i in ordered_indices]
+        review_sentences = [batch_sentences[i - start_idx] for i in ordered_indices]
+
+        reviews = _review_batch_creatively(
+            prompts=review_prompts,
+            sentences=review_sentences,
+            prompt_indices=ordered_indices,
+            scene_map=scene_map,
+            visual_bible=visual_bible,
+            creative_brief=creative_brief,
+        )
+
+        if reviews is not None:
+            for i, review in enumerate(reviews):
+                idx = ordered_indices[i]
+                score = review["score"]
+                decision = review["decision"]
+                review_issues = review.get("issues", []) or []
+
+                should_repair = (
+                    decision == "repair"
+                    or score < CREATIVE_REVIEW_REPAIR_THRESHOLD
+                )
+
+                if should_repair:
+                    sentence = batch_sentences[idx - start_idx]
+                    scene = scene_map.get(idx) if scene_map else None
+                    issue_lines = [
+                        f"AI reviewer score {score}/100 (decision={decision})"
+                    ]
+                    if review_issues:
+                        issue_lines.append(
+                            "Reviewer issues: "
+                            + "; ".join(str(x) for x in review_issues)
+                        )
+                    invalid_items.append({
+                        "absolute_index": idx,
+                        "sentence": sentence,
+                        "scene_context": _format_scene_context(scene),
+                        "invalid_prompt": valid_prompts[idx],
+                        "issues": issue_lines,
+                        "origin": "creative",
+                    })
+                    del valid_prompts[idx]
+                else:
+                    logger.info(
+                        f"✅ [idx={idx}] creative score {score}/100 accepted "
+                        f"(decision={decision})."
+                    )
+        else:
+            logger.warning(
+                f"⚠️ Batch [{batch_idx}] AI creative review unavailable — "
+                "accepting hard-constraint-valid prompts as-is."
+            )
+
+    logger.info(
+        f"📊 الدفعة [{batch_idx}]: {len(valid_prompts)} صحيح، "
+        f"{len(invalid_items)} مخالف يحتاج إصلاحًا."
+    )
+
+    # ---- 3) إصلاح المخالف فقط (فحص hard constraints داخل الحلقة) ----
+    if invalid_items:
+        repaired = _repair_invalid_prompts(
+            invalid_items=invalid_items,
+            valid_prompts=valid_prompts,
+            batch_sentences=batch_sentences,
+            start_idx=start_idx,
+            end_idx=end_idx,
+            scene_map=scene_map,
+            visual_bible=visual_bible,
+            creative_brief=creative_brief,
+            batch_num=batch_idx,
+        )
+
+        # ---- 4) إعادة مراجعة إبداعية للبرومبتات المُصلَحة (توثيق فقط) ----
+        creative_origins = {
+            item["absolute_index"] for item in invalid_items
+            if item.get("origin") == "creative"
+        }
+        repaired_for_review = sorted(
+            idx for idx in repaired.keys() if idx in creative_origins
+        )
+        if repaired_for_review:
+            review_prompts = [repaired[i] for i in repaired_for_review]
+            review_sentences = [
+                batch_sentences[i - start_idx] for i in repaired_for_review
+            ]
+            post_reviews = _review_batch_creatively(
+                prompts=review_prompts,
+                sentences=review_sentences,
+                prompt_indices=repaired_for_review,
+                scene_map=scene_map,
+                visual_bible=visual_bible,
+                creative_brief=creative_brief,
+            )
+            if post_reviews is not None:
+                for i, r in enumerate(post_reviews):
+                    logger.info(
+                        f"🔁 post-repair review [idx={repaired_for_review[i]}]: "
+                        f"score {r['score']}/100 decision={r['decision']}"
+                    )
+            else:
+                logger.info(
+                    "ℹ️ post-repair creative review unavailable — "
+                    "repaired prompts accepted on hard constraints."
+                )
+
+        valid_prompts.update(repaired)
+
+    # ---- 5) إعادة بناء الدفعة بالترتيب الأصلي ----
+    ordered_prompts: List[str] = []
+    for offset in range(len(batch_sentences)):
+        idx = start_idx + offset
+        if idx not in valid_prompts:
+            raise ValueError(
+                f"Batch [{batch_idx}] is missing a valid prompt for image index {idx} "
+                "after repair. Refusing to return an incomplete batch."
+            )
+        ordered_prompts.append(valid_prompts[idx])
+
+    # ---- 6) فحص نهائي صارم قبل الإرجاع ----
+    _validate_batch_prompts(batch_idx, start_idx, ordered_prompts)
+
+    logger.info(
+        f"✅ الدفعة [{batch_idx}] جاهزة ({len(ordered_prompts)} برومبت صحيح)."
+    )
+    return batch_idx, ordered_prompts
+
+
+def generate_stage2_prompts_batches(
+    sentences: List[str],
+    stage1_result: Optional[Dict[str, Any]] = None,
+) -> List[List[str]]:
+    """
+    توزيع كافة دفعات أوامر الصور على خيوط متوازية (Parallel Threads).
+    كل خيط يحصل تلقائياً على مفتاح مختلف من مصفوفة المفاتيح.
+
+    كل دفعة:
+    - تُولَّد (مع إعادة محاولة محدودة عند فشل الاتصال أو عدد خاطئ من البرومبتات،
+      دون التأثير على الدفعات الأخرى).
+    - تُفحص بالشروط الحاكمة الصارمة.
+    - تُراجع إبداعياً بواسطة AI على دفعة كاملة (طلب واحد) مع فهارس حقيقية.
+    - تُصنَّف إلى صحيحة ومخالفة (فشل hard OR score < 80 OR decision=repair).
+    - تُصلَح المخالفة فقط في طلبات مستقلة (حتى MAX_PROMPT_REPAIR_ATTEMPTS).
+    - لا تُرجَع إلا بعد نجاح كل برومبت في الشروط الحاكمة.
+
+    full_script_sentences (الممرّرة هنا كـ sentences) هي المصدر الوحيد المعتمد
+    لعدد وترتيب الجمل. لا يُعاد تقسيمها أو دمجها أو إعادة ترتيبها هنا.
+
+    أي دفعة يفشل توليدها أو إصلاحها بالكامل تُرفع كـValueError ولا تُحفظ.
+    """
+    # ---- التحقق من صحة المدخل الأساسي (قبل أي معالجة) ----
+    if not isinstance(sentences, list) or len(sentences) == 0:
+        raise ValueError(
+            "Validation failure category: empty_sentence_list — "
+            "Stage 2 received an empty or invalid full_script_sentences list."
+        )
+
     for i, s in enumerate(sentences, start=1):
         if not isinstance(s, str) or not s.strip():
-            raise ValueError(f"الجملة رقم {i} فارغة أو ليست نصاً صالحاً!")
+            raise ValueError(
+                "Validation failure category: invalid_sentence_input — "
+                f"sentence at position {i} is not a non-empty string."
+            )
 
-    # D) pydub إلزامي للدمج — قبل أي استدعاء Azure
-    if not PYDUB_AVAILABLE or AudioSegment is None:
-        raise RuntimeError(
-            "مكتبة pydub مطلوبة لدمج المقاطع الصوتية ولا يمكن المتابعة بدونها. "
-            f"التفاصيل: {PYDUB_IMPORT_ERROR or 'غير معروف'}. "
-            "للتثبيت: python -m pip install pydub"
+    total_sentences = len(sentences)
+
+    if total_sentences > 80:
+        raise ValueError(
+            "Validation failure category: hard_maximum_exceeded — "
+            f"Stage 2 received {total_sentences} sentences, but the absolute maximum is 80. "
+            "No image prompts were generated."
         )
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    final_audio_file = output_dir / f"episode_{episode_id}_audio.mp3"
-    clips_dir = output_dir / f"episode_{episode_id}_clips"
-    metadata_file = output_dir / f"episode_{episode_id}_audio_metadata.json"
+    # استخراج السياق من المرحلة الأولى (اختياري)
+    scene_plan: Optional[Union[List[Dict[str, Any]], Dict[str, Any]]] = None
+    visual_bible: Optional[Dict[str, Any]] = None
+    creative_brief: Optional[Any] = None
+    has_stage1_context = False
+    episode_id: Optional[Any] = None
 
-    run_id = uuid.uuid4().hex[:10]
-    staging_clips_dir = output_dir / f"episode_{episode_id}_clips__staging_{run_id}"
-    staging_audio_file = output_dir / f"episode_{episode_id}_audio__staging_{run_id}.mp3"
-    staging_metadata_file = output_dir / f"episode_{episode_id}_audio_metadata__staging_{run_id}.json"
-    staging_clips_dir.mkdir(parents=True, exist_ok=True)
+    if isinstance(stage1_result, dict):
+        episode_id = stage1_result.get("episode_id") or stage1_result.get("id")
+        candidate_plan = stage1_result.get("scene_plan")
+        candidate_bible = stage1_result.get("visual_bible")
+        candidate_brief = stage1_result.get("creative_brief")
+        if candidate_plan or candidate_bible or candidate_brief:
+            scene_plan = candidate_plan
+            visual_bible = candidate_bible
+            creative_brief = candidate_brief
+            has_stage1_context = True
 
-    try:
-        directions = generate_voice_direction_plan(sentences, episode_context)
-        clips_meta = []
+    if not has_stage1_context:
+        logger.info(
+            f"ℹ️ (episode_id={episode_id}) لا يوجد scene_plan / visual_bible / creative_brief — "
+            "سيتم استخدام السلوك القديم (fallback)."
+        )
 
-        for i, (sentence, direction) in enumerate(zip(sentences, directions), start=1):
-            clip_filename = f"sentence_{i:04d}.mp3"
-            clip_path = staging_clips_dir / clip_filename
-            sentence_hash = hashlib.sha256(sentence.encode("utf-8")).hexdigest()
+    # خريطة الجملة -> المشهد (1-based sentence index -> scene dict)
+    scene_map = (
+        _map_sentences_to_scenes(sentences, scene_plan)
+        if has_stage1_context else {}
+    )
 
-            ssml = build_sentence_ssml(sentence, direction, voice)
-            _validate_single_ssml(ssml, expected_voice=voice)
+    # تجهيز بيانات الدفعات
+    batch_tasks = []
+    for batch_num, i in enumerate(range(0, total_sentences, BATCH_SIZE), start=1):
+        batch_sentences = sentences[i : i + BATCH_SIZE]
+        start_idx = i + 1
+        end_idx = start_idx + len(batch_sentences) - 1
+        batch_tasks.append(
+            (
+                batch_num,
+                batch_sentences,
+                start_idx,
+                end_idx,
+                scene_map,
+                visual_bible,
+                creative_brief,
+                has_stage1_context,
+                episode_id,
+            )
+        )
 
-            for attempt in range(1, MAX_CLIP_RETRIES + 1):
-                try:
-                    call_azure_tts_api(ssml, clip_path)
-                    if clip_path.exists() and clip_path.stat().st_size > 0:
-                        break
-                except Exception as e:
-                    if attempt == MAX_CLIP_RETRIES:
-                        raise RuntimeError(f"فشل توليد المقطع {i}: {e}")
+    logger.info(
+        f"⚡ (episode_id={episode_id}) تشغيل {len(batch_tasks)} دفعات بالتوازي "
+        f"لإجمالي {total_sentences} جملة عبر مفاتيح مختلفة في نفس اللحظة..."
+    )
 
-            duration_ms = _get_mp3_duration_ms(clip_path) or _estimate_mp3_duration_ms(clip_path)
+    completed_results: Dict[int, List[str]] = {}
 
-            clips_meta.append({
-                "sentence_index": i,
-                "filename": clip_filename,
-                "sentence_text": sentence,
-                "sentence_hash": sentence_hash,
-                "narrative_role": direction.get("narrative_role"),
-                "delivery_mode": direction.get("delivery_mode"),
-                "azure_style": direction.get("azure_style"),
-                "energy": int(direction.get("energy", 3)),
-                "rate_percent": int(direction.get("rate_percent", -4)),
-                "pitch_percent": int(direction.get("pitch_percent", -1)),
-                "pause_before_ms": int(direction.get("pause_before_ms", 100)),
-                "pause_after_ms": int(direction.get("pause_after_ms", 300)),
-                "emphasis_words": direction.get("emphasis_words", []),
-                "breath_breaks": [],
-                "reason": direction.get("reason", ""),
-                "duration_ms": duration_ms,
-            })
-
-        _merge_clips_with_pauses(clips_meta, staging_clips_dir, staging_audio_file)
-
-        metadata = {
-            "episode_id": episode_id,
-            "voice_name": voice,
-            "language": "en-US",
-            "sentence_count": len(sentences),
-            "voice_bible_version": VOICE_BIBLE_VERSION,
-            "clips": clips_meta,
+    with ThreadPoolExecutor(max_workers=min(len(batch_tasks), 4)) as executor:
+        future_to_batch = {
+            executor.submit(_process_single_batch, task): task[0]
+            for task in batch_tasks
         }
-        with open(staging_metadata_file, "w", encoding="utf-8") as f:
-            json.dump(metadata, f, ensure_ascii=False, indent=2)
+        for future in as_completed(future_to_batch):
+            batch_num, prompts = future.result()
 
-        # تحقق شامل على مسارات الـ staging قبل أي التزام نهائي
-        validate_audio_outputs(
-            sentences,
-            staging_clips_dir,
-            staging_audio_file,
-            staging_metadata_file,
-            expected_voice=voice,
+            expected = len(batch_tasks[batch_num - 1][1])
+            _validate_batch(batch_num, expected, prompts)
+
+            completed_results[batch_num] = prompts
+            logger.info(
+                f"✅ انتهت الدفعة [{batch_num}] بنجاح ({len(prompts)} برومبت)"
+            )
+
+    # تجميع النتائج بالترتيب المتسلسل السليم
+    sorted_batches = [completed_results[k] for k in sorted(completed_results.keys())]
+
+    total_generated = sum(len(b) for b in sorted_batches)
+    if total_generated != total_sentences:
+        raise ValueError(
+            "Validation failure category: final_count_mismatch — "
+            f"total prompts generated ({total_generated}) does not match "
+            f"total sentences ({total_sentences})."
         )
 
-        # =====================================================
-        # SAFE COMMIT — لا نحذف النهائيات إلا بعد نجاح التحقق
-        # =====================================================
+    # ---- فحص نهائي شامل عبر كل الدفعات المدمجة ----
+    _validate_final_prompts(sentences, sorted_batches)
 
-        # 1) الصوت والبيانات الوصفية: Path.replace ذرّي على نفس نظام الملفات
-        staging_audio_file.replace(final_audio_file)
-        staging_metadata_file.replace(metadata_file)
-
-        # 2) مجلد المقاطع: نُزيح القديم جانباً، نُدخل الجديد، ثم نحذف القديم
-        old_clips_backup = output_dir / f"episode_{episode_id}_clips__old_{run_id}"
-        had_old_clips = clips_dir.exists()
-        if had_old_clips:
-            clips_dir.rename(old_clips_backup)
-
-        try:
-            staging_clips_dir.rename(clips_dir)
-        except Exception:
-            # استرجاع النسخة القديمة إن فشل نقل الـ staging
-            if had_old_clips and old_clips_backup.exists() and not clips_dir.exists():
-                try:
-                    old_clips_backup.rename(clips_dir)
-                except Exception:
-                    logger.error("⚠️ فشل استرجاع مجلد المقاطع القديم بعد فشل الالتزام.")
-            raise
-
-        if old_clips_backup.exists():
-            shutil.rmtree(old_clips_backup, ignore_errors=True)
-
-        logger.info(f"✅ تم إنتاج صوت حلقة Vot بالهوية الجديدة بنجاح: {final_audio_file}")
-        return final_audio_file
-
-    except Exception as err:
-        logger.error(f"❌ خطأ أثناء توليد الصوت: {err}")
-        # تنظيف الـ staging فقط. لا نحذف ملفات نهائية من تشغيل سابق ناجح.
-        _safe_cleanup_staging(staging_clips_dir, staging_audio_file, staging_metadata_file)
-        raise err
-
-def generate_voice_preview(
-    voice: str = "en-US-BrianMultilingualNeural",
-    voice_name: str = None,
-    text: str = "Most people think collapse happens all at once. But it doesn't.",
-    output_dir: Path = Path("outputs")
-) -> Path:
-    final_voice = voice_name or voice
-    output_dir.mkdir(parents=True, exist_ok=True)
-    preview_file = output_dir / f"preview_{final_voice}.mp3"
-
-    direction = {"azure_style": "calm", "energy": 2, "rate_percent": -4, "pitch_percent": -1}
-    ssml_payload = build_sentence_ssml(text, direction, final_voice)
-    call_azure_tts_api(ssml_payload, preview_file)
-    return preview_file
+    return sorted_batches
