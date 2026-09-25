@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import time
 import shutil
 import asyncio
 import logging
@@ -55,6 +56,17 @@ OUTPUTS_DIR = BASE_DIR / "outputs"
 OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # -----------------------------------------------------------------
+# ثوابت
+# -----------------------------------------------------------------
+SENTENCE_MIN = 60
+SENTENCE_MAX = 80
+DEFAULT_VOICE = "en-US-BrianMultilingualNeural"
+
+# نمط مجلدات المونتاج المؤقتة التي ينشئها stage4_composer.py
+_COMPOSER_TEMP_DIR_RE = re.compile(r"^temp_segments_[0-9a-fA-F\-]+$")
+_COMPOSER_TEMP_MAX_AGE_SECONDS = 1800  # 30 دقيقة = "قديم بشكل واضح"
+
+# -----------------------------------------------------------------
 # إدارة الجلسات والمهام
 # -----------------------------------------------------------------
 user_sessions = {}
@@ -79,13 +91,14 @@ def _fresh_session():
         "stage1_result": None,
         "stage1_approved": False,
         "stage1_plan_message_id": None,
-        "awaiting_script_edit": False,    # NEW: وضع تعديل السكريبت اليدوي
-        "manual_map": {},                 # {int(slot): Path}
+        "awaiting_script_edit": False,
+        "manual_map": {},                 # {int(slot): Path}  نهائي حتى يقوم المستخدم بإعادة التعيين
         "manual_queue": [],               # [Path, ...]
         "manual_missing": [],             # [int, ...]
         "manual_current": None,           # Path الحالية
         "manual_unindexed_files": [],     # [Path, ...]
         "manual_missing_indices": [],     # [int, ...]
+        "ocr_indexed_map": {},            # {int(slot): str(path)} من آخر فحص OCR
         # =============================================================
         # نظام مراجعة وترتيب الصور المستقل (قبل المونتاج)
         # =============================================================
@@ -98,12 +111,11 @@ def _fresh_session():
         "image_review_confirmed_flag": False,
         "image_review_summary": None,        # dict ملخص جاهز للعرض
         "image_review_message_id": None,
-        "image_review_missing": [],          # [int(slot), ...] من MissingAssetsError
+        "image_review_missing": [],          # [int(slot), ...]
         "image_review_duplicates": [],       # [int(slot), ...]
         "image_review_excluded": [],         # [int(slot), ...] الصور المستبعدة
         "image_review_manual_edits": [],     # [{"old": int, "new": int}, ...]
-        "image_review_pending_slot": None,   # int | None  (أثناء WAITING_IMAGE_CORRECTION)
-        "image_review_allow_partial": False, # bool
+        "image_review_pending_slot": None,   # int | None
         "final_image_map": {},               # {int(slot): str(path)} معتمدة نهائياً
     }
 
@@ -162,25 +174,18 @@ def _as_dict(val):
 
 
 # =================================================================
-# FORMAT-ONLY NORMALIZER (NEW)
+# FORMAT-ONLY NORMALIZER (للسكريبت اليدوي)
 # =================================================================
 
 def normalize_script_sentences(raw_text: str) -> list[str]:
     """
     تنظيف تنسيقي فقط للسكريبت — لا إعادة صياغة ولا ترجمة ولا تغيير معنى.
-    - يقسم النص على الفواصل: أسطر جديدة + علامات نهاية الجملة (. ? !)
-    - يزيل المسافات الطرفية
-    - يسقط القطع الفارغة
-    - يضيف نقطة واحدة إن لم تكن الجملة منتهية بـ . ? !
-    - يدمج المسافات الداخلية المتعددة إلى مسافة واحدة
-    - يرفع ValueError لو لم تُستخرج أي جملة صالحة
     """
     if raw_text is None or not isinstance(raw_text, str):
         raise ValueError("النص المُرسل فارغ أو غير صالح.")
 
     text = raw_text.replace("\r\n", "\n").replace("\r", "\n")
 
-    # تقسيم على نهايات الجمل متبوعة بمسافة/سطر جديد، وعلى الأسطر الجديدة.
     parts = re.split(r'(?<=[.!?])(?=\s)|\n+', text)
 
     sentences: list[str] = []
@@ -209,7 +214,6 @@ def _save_normalized_sentences(ep_id, session, normalized: list[str]) -> None:
 
     stage1_res["full_script_sentences"] = list(normalized)
 
-    # إعادة حساب عدد الكلمات إن كان الحقل موجوداً أو لإضافته دائماً
     try:
         stage1_res["total_word_count"] = int(
             sum(len(s.split()) for s in normalized)
@@ -289,7 +293,7 @@ def _build_stage1_summary(ep_id, episode, stage1_res) -> str:
 
 
 def _cleanup_episode_temp_files(ep_id):
-    """يحذف كل المجلدات المؤقتة للحلقة لتفادي استهلاك المساحة."""
+    """يحذف مجلدات الحلقة المؤقتة القديمة (لا يمس ملفات المصدر أو الفيديو النهائي)."""
     if not ep_id:
         return
     targets = [
@@ -299,7 +303,6 @@ def _cleanup_episode_temp_files(ep_id):
         OUTPUTS_DIR / f"episode_{ep_id}_clean_frames_renamed",
         OUTPUTS_DIR / f"episode_{ep_id}_temp_segments",
         OUTPUTS_DIR / f"episode_{ep_id}_temp_segments_audio",
-        OUTPUTS_DIR / "temp_segments",
         *OUTPUTS_DIR.glob("episode_*_temp_segments_ep*"),
     ]
     for t in targets:
@@ -309,6 +312,38 @@ def _cleanup_episode_temp_files(ep_id):
                 logger.info(f"🧹 تم حذف المجلد المؤقت: {t.name}")
         except Exception as e:
             logger.warning(f"تعذّر حذف {t}: {e}")
+
+
+def _cleanup_stale_composer_temp_dirs(max_age_seconds: int = _COMPOSER_TEMP_MAX_AGE_SECONDS):
+    """
+    يحذف مجلدات stage4_composer المؤقتة (temp_segments_<uuid>) القديمة فقط.
+
+    - يطابق النمط temp_segments_<uuid> فقط.
+    - لا يحذف أي شيء أحدث من max_age_seconds (حماية الجلسات النشطة الأخرى).
+    - لا يحذف صوراً أو صوتاً أو ترجمات أو فيديو نهائياً.
+    """
+    try:
+        entries = list(OUTPUTS_DIR.iterdir())
+    except Exception as e:
+        logger.warning(f"failed to iterate OUTPUTS_DIR for cleanup: {e}")
+        return
+    now = time.time()
+    for entry in entries:
+        try:
+            if not entry.is_dir():
+                continue
+            if not _COMPOSER_TEMP_DIR_RE.match(entry.name):
+                continue
+            try:
+                mtime = entry.stat().st_mtime
+            except Exception:
+                continue
+            if now - mtime < max_age_seconds:
+                continue
+            shutil.rmtree(entry, ignore_errors=True)
+            logger.info(f"🧹 removed stale composer temp dir: {entry.name}")
+        except Exception as e:
+            logger.warning(f"failed to remove stale temp dir {entry}: {e}")
 
 
 def load_all_episodes():
@@ -347,18 +382,13 @@ def _format_missing_indices(missing, limit=15):
 
 # =================================================================
 # 1. /start → إعادة تشغيل كاملة (Hard Reset)
-# يدعم الاستدعاء من Update (CommandHandler) و CallbackQuery (btn_back_main)
 # =================================================================
 
 async def start_command(update_or_query, context: ContextTypes.DEFAULT_TYPE):
-    # يدعم الاستدعاء من:
-    #   - Update        (CommandHandler: /start)
-    #   - CallbackQuery (btn_back_main)
     if isinstance(update_or_query, Update):
         chat_id = update_or_query.effective_chat.id
         reply_message = update_or_query.message
     else:
-        # CallbackQuery
         chat_id = update_or_query.message.chat_id
         reply_message = update_or_query.message
 
@@ -372,6 +402,7 @@ async def start_command(update_or_query, context: ContextTypes.DEFAULT_TYPE):
 
     user_sessions[chat_id] = _fresh_session()
     _cleanup_episode_temp_files(old_ep_id)
+    _cleanup_stale_composer_temp_dirs()
 
     logger.info(
         f"♻️ Hard Reset للمستخدم {chat_id} | cancelled_task={cancelled} | cleaned_ep={old_ep_id}"
@@ -531,9 +562,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             run_stage2_after_approval(query, context)
         )
 
-    # =============================================================
-    # NEW: تعديل السكريبت يدوياً بعد المرحلة الأولى
-    # =============================================================
     elif data.startswith("edit_stage1_"):
         target_id = data.replace("edit_stage1_", "")
         active_id = session.get("episode_id")
@@ -565,6 +593,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             "• <b>جملة واحدة لكل سطر</b> (مُفضّل) — أو نص متصل.\n"
             "• سيقوم البوت <b>فقط</b> بتصحيح علامات الترقيم والتنسيق — "
             "<b>بدون</b> إعادة صياغة أو ترجمة أو تغيير للمعنى.\n"
+            f"• <b>عدد الجمل يجب أن يكون بين {SENTENCE_MIN} و {SENTENCE_MAX} جملة.</b>\n"
             "• بعد التأكيد ستظهر لك معاينة، وسيتبقى عليك الضغط على "
             "<b>✅ اعتماد</b> للانتقال إلى المرحلة الثانية.\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
@@ -580,8 +609,18 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 run_stage1_only(query, context, ep)
             )
 
+    # -------------------------------------------------------------
+    # معاينة الصوت — التحقق من قائمة AZURE_MALE_VOICES
+    # -------------------------------------------------------------
     elif data.startswith("preview_voice_"):
-        preview_voice = data.replace("preview_voice_", "")
+        preview_voice = data[len("preview_voice_"):]
+        if preview_voice not in AZURE_MALE_VOICES:
+            logger.warning(f"⚠️ preview_voice غير مصرح به: {preview_voice}")
+            try:
+                await query.answer("⚠️ صوت غير مُعرَّف في الإعدادات.", show_alert=True)
+            except Exception:
+                pass
+            return
         try:
             preview_path = await asyncio.to_thread(
                 generate_voice_preview,
@@ -608,8 +647,18 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 pass
         return
 
+    # -------------------------------------------------------------
+    # اختيار الصوت — التحقق من قائمة AZURE_MALE_VOICES
+    # -------------------------------------------------------------
     elif data.startswith("voice_"):
-        selected_voice = data.replace("voice_", "")
+        selected_voice = data[len("voice_"):]
+        if selected_voice not in AZURE_MALE_VOICES:
+            logger.warning(f"⚠️ voice غير مصرح به: {selected_voice}")
+            try:
+                await query.answer("⚠️ صوت غير مُعرَّف في الإعدادات.", show_alert=True)
+            except Exception:
+                pass
+            return
         session["voice"] = selected_voice
         session["engine"] = "azure"
         user_tasks[chat_id] = asyncio.create_task(
@@ -617,27 +666,15 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         )
 
     # -------------------------------------------------------------
-    # بدء المونتاج → الآن يبدأ فحص الصور ثم المراجعة
+    # بدء فحص الصور
     # -------------------------------------------------------------
     elif data == "btn_start_render":
-        session["image_review_allow_partial"] = False
         user_tasks[chat_id] = asyncio.create_task(
-            run_image_verification(query.message, context, allow_partial=False)
+            run_image_verification(query.message, context)
         )
-
-    elif data == "btn_force_render":
-        session["image_review_allow_partial"] = True
-        user_tasks[chat_id] = asyncio.create_task(
-            run_image_verification(query.message, context, allow_partial=True)
-        )
-
-    elif data == "btn_proceed_with_ocr":
-        # اعتماد نتيجة OCR الحالية مباشرة بدون فحص تاني
-        session["image_review_allow_partial"] = True
-        await _finalize_after_manual(context, chat_id)
 
     # -------------------------------------------------------------
-    # الوضع اليدوي (يبقى كما هو)
+    # الوضع اليدوي
     # -------------------------------------------------------------
     elif data == "manual_cancel":
         session["state"] = "IDLE"
@@ -649,7 +686,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_caption(
                 caption=(
                     "❌ <b>تم إلغاء الوضع اليدوي.</b>\n"
-                    "يمكنك رفع الصور الناقصة أو المتابعة بالصور المتوفرة."
+                    "يمكنك رفع الصور الناقصة ثم إعادة الفحص."
                 ),
                 parse_mode=ParseMode.HTML,
             )
@@ -672,11 +709,9 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             await query.answer("لا توجد صور بحاجة لتعيين يدوي.", show_alert=True)
             return
 
-        # لا تمسح manual_map — اختيارات المستخدم السابقة نهائية
         if not isinstance(session.get("manual_map"), dict):
             session["manual_map"] = {}
 
-        # صفّ فقط الملفات التي لم تُعيَّن بعد
         already = set()
         for p in session["manual_map"].values():
             try:
@@ -751,7 +786,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await show_review_summary(chat_id, context)
 
     elif data == "review_noop":
-        # زر عرض العدّاد فقط، لا يفعل شيء
         return
 
     # =============================================================
@@ -773,11 +807,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(
             "❌ <b>تم إلغاء مراجعة الصور.</b>\nيمكنك العودة للقائمة الرئيسية عبر /start.",
             parse_mode=ParseMode.HTML,
-        )
-
-    elif data == "review_summary_force_partial":
-        user_tasks[chat_id] = asyncio.create_task(
-            run_final_render(query.message, context, allow_partial=True)
         )
 
 
@@ -856,7 +885,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     # =============================================================
-    # NEW: استقبال السكريبت المُعدَّل يدوياً (WAITING_SCRIPT_EDIT)
+    # استقبال السكريبت المُعدَّل يدوياً (WAITING_SCRIPT_EDIT)
     # =============================================================
     if state == "WAITING_SCRIPT_EDIT":
         if _is_stale(chat_id, session):
@@ -881,6 +910,24 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
             return
 
+        # ✅ فرض قاعدة عدد الجمل 60..80 قبل الحفظ
+        sentence_count = len(normalized)
+        if sentence_count < SENTENCE_MIN or sentence_count > SENTENCE_MAX:
+            logger.info(
+                f"⛔ رفض سكريبت يدوي للحلقة {session.get('episode_id')} "
+                f"بعدد جمل {sentence_count} (المسموح {SENTENCE_MIN}-{SENTENCE_MAX})"
+            )
+            await update.message.reply_text(
+                f"❌ <b>عدد الجمل غير مقبول.</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📊 <b>العدد المُرسل:</b> <code>{sentence_count}</code>\n"
+                f"✅ <b>النطاق المطلوب:</b> <code>{SENTENCE_MIN}</code> – <code>{SENTENCE_MAX}</code> جملة.\n\n"
+                f"لم يتم حفظ السكريبت، ولم يتم الاعتماد.\n"
+                f"عدّل النص وأرسله مرة أخرى (أنت لا تزال في وضع تعديل السكريبت).",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
         ep_id = session.get("episode_id")
         _save_normalized_sentences(ep_id, session, normalized)
 
@@ -889,7 +936,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         session["state"] = "IDLE"
         session["stage1_approved"] = False
 
-        n = len(normalized)
+        n = sentence_count
         first_three = normalized[:3]
         last_two = normalized[-2:] if n > 3 else []
 
@@ -1173,15 +1220,19 @@ async def run_stage2_after_approval(query, context):
 
 
 async def present_audio_engine_choice(bot_or_query, chat_id=None):
+    """
+    يعرض كل الأصوات المُعرَّفة في AZURE_MALE_VOICES ديناميكياً،
+    مع زر اختيار + زر معاينة لكل صوت.
+    """
     text = (
         "🎙️ <b>المرحلة 3: اختيار الصوت التعبيري (Microsoft Azure)</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "يمكنك الاستماع لعينة فورية لأي صوت قبل الاختيار عبر زر <b>🎧 استمع للعينة</b>،\n"
         "ثم اضغط على اسم الصوت لاعتماده وبدء توليد التعليق الصوتي.\n"
+        f"<i>الصوت الافتراضي عند عدم الاختيار: <code>{DEFAULT_VOICE}</code></i>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     )
 
-    # Brian هو الصوت المُعتمد والموصى به لقناة VOT
     descriptions = {
         "en-US-BrianMultilingualNeural": "الصوت المعتمد لقناة VOT — سرد هادئ وإنساني ⭐",
         "en-US-GuyNeural": "تلوين انفعالي كامل وشامل 🌟",
@@ -1191,6 +1242,7 @@ async def present_audio_engine_choice(bot_or_query, chat_id=None):
     }
 
     buttons = []
+    # Iterate ديناميكياً على القائمة المُعدَّة في config
     for v in AZURE_MALE_VOICES:
         label = descriptions.get(v, v)
         buttons.append([
@@ -1220,9 +1272,22 @@ async def run_stage3(query, context):
     ep_id = session.get("episode_id")
     sentences = session.get("sentences", [])
     engine = "azure"
-    voice = session.get("voice", "en-US-BrianMultilingualNeural")
+    voice = session.get("voice") or DEFAULT_VOICE
 
     if _is_stale(chat_id, session):
+        return
+
+    # ✅ تحقق من أن الصوت من القائمة المُعدَّة
+    if voice not in AZURE_MALE_VOICES:
+        try:
+            await query.edit_message_text(
+                f"❌ <b>الصوت المختار غير مُعرَّف في الإعدادات:</b>\n"
+                f"<code>{_esc(voice)}</code>\n"
+                f"الرجاء اختيار صوت من القائمة المُعتمدة.",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
         return
 
     try:
@@ -1236,7 +1301,6 @@ async def run_stage3(query, context):
         return
 
     try:
-        # ✅ استرجاع مخرجات المرحلة الأولى الكاملة (إلزامي لدعم Voice Director)
         episode_context = session.get("stage1_result")
 
         if not isinstance(episode_context, dict):
@@ -1375,7 +1439,7 @@ async def handle_media_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
         await file_obj.download_to_drive(save_path)
         session["uploaded_count"] += 1
 
-        # أي رفع جديد يُبطل أي مراجعة سابقة (لأن الخريطة ستُبنى من جديد)
+        # أي رفع جديد يُبطل أي اعتماد سابق (سيُعاد الفحص من الصفر)
         session["image_review_confirmed_flag"] = False
         session["final_image_map"] = {}
 
@@ -1394,7 +1458,7 @@ async def handle_media_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 # =================================================================
-# دالة المعالجة اليدوية + حماية Anti-Spam + توحيد نوع المفتاح
+# المعالجة اليدوية
 # =================================================================
 
 async def handle_manual_assign(query, context, slot):
@@ -1427,7 +1491,6 @@ async def handle_manual_assign(query, context, slot):
     await show_next_manual_image(context, chat_id)
 
 
-
 async def _build_map_from_ocr_and_manual(session) -> dict:
     """يدمج نتيجة OCR + التعيين اليدوي. اختيار المستخدم يطغى."""
     merged = {}
@@ -1444,12 +1507,51 @@ async def _build_map_from_ocr_and_manual(session) -> dict:
     return merged
 
 
+def _compute_duplicates_from_map(review_map):
+    """يُرجع قائمة أرقام مكررة (نفس المسار لأكثر من slot)."""
+    seen = {}
+    duplicates = set()
+    for slot, p in review_map.items():
+        try:
+            key = str(Path(p).resolve())
+        except Exception:
+            key = str(p)
+        if key in seen:
+            duplicates.add(int(seen[key]))
+            duplicates.add(int(slot))
+        else:
+            seen[key] = int(slot)
+    return sorted(duplicates)
+
+
+def _reset_image_review_state(session, review_map, total_expected):
+    """
+    يعيد بناء كل حقول مراجعة الصور من الخريطة الحالية.
+    لا يحتفظ بحالة قديمة.
+    """
+    review_map = {int(k): str(v) for k, v in (review_map or {}).items() if v}
+    session["image_review_map"] = dict(review_map)
+    session["image_review_original"] = dict(review_map)
+    session["image_review_missing"] = [
+        s for s in range(1, total_expected + 1) if s not in review_map
+    ]
+    session["image_review_duplicates"] = _compute_duplicates_from_map(review_map)
+    session["image_review_excluded"] = []
+    session["image_review_manual_edits"] = []
+    session["image_review_confirmed"] = {}
+    session["image_review_confirmed_flag"] = False
+    session["image_review_summary"] = None
+    session["image_review_mode"] = None
+    session["image_review_index"] = 0
+    session["image_review_items"] = []
+    session["final_image_map"] = {}
+
+
 async def _finalize_after_manual(context, chat_id):
     """
-    بعد ما المستخدم يخلص التعيين اليدوي:
-    - نعتمد على كلامه كمصدر نهائي
-    - مفيش فحص OCR تاني
-    - نبني خريطة المراجعة ونقول له: تم التأكد، تحب تبدأ مونتاج؟
+    بعد انتهاء المستخدم من التعيين اليدوي:
+    - نبني الخريطة من OCR + Manual ونُعيد ضبط كل حالة المراجعة.
+    - لا نعرض أبداً خيار رندرة جزئية.
     """
     session = get_session(chat_id)
     if _is_stale(chat_id, session):
@@ -1458,73 +1560,48 @@ async def _finalize_after_manual(context, chat_id):
     total_expected = len(session.get("sentences", []) or [])
     review_map = await _build_map_from_ocr_and_manual(session)
 
-    session["image_review_map"] = dict(review_map)
-    session["image_review_original"] = dict(review_map)
-    session["image_review_confirmed"] = {int(s): True for s in review_map}
-    session["image_review_confirmed_flag"] = True
-    session["image_review_summary"] = None
-    session["image_review_excluded"] = []
-    session["image_review_manual_edits"] = []
-    session["image_review_duplicates"] = []
-    session["image_review_mode"] = None
-    session["image_review_index"] = 0
-    session["image_review_items"] = []
-    session["image_review_missing"] = [
-        s for s in range(1, total_expected + 1) if s not in review_map
-    ]
-    session["final_image_map"] = dict(review_map)
-    session["state"] = "IMAGE_REVIEW_SUMMARY"
+    _reset_image_review_state(session, review_map, total_expected)
+    session["state"] = "IDLE"
 
-    found = len(review_map)
+    found = len(session["image_review_map"])
     missing = session["image_review_missing"]
-    missing_txt = _format_missing_indices(missing) if missing else "—"
+    duplicates = session["image_review_duplicates"]
     manual_count = len(session.get("manual_map") or {})
 
-    fully = (found == total_expected) and (not missing)
+    fully_complete = (found == total_expected) and (not missing) and (not duplicates)
 
-    if fully:
-        header = "✅ <b>تم التأكد من الصور بالكامل</b>"
-        note = "كل الأرقام اتعيّنت (OCR + يدوي). اختيارك نهائي — مش هنعمل فحص تاني."
-    else:
-        header = f"✅ <b>تم اعتماد {found} صورة</b>"
-        note = (
-            f"لسه فيه <code>{len(missing)}</code> رقم ناقص. "
-            "تقدر تبدأ مونتاج باللي موجود، أو ترفع الناقص وتعيد الفحص."
+    if fully_complete:
+        keyboard = [
+            [InlineKeyboardButton("📋 مراجعة الصور واعتماد الترتيب", callback_data="review_mode_full")],
+            [InlineKeyboardButton("📊 عرض الملخص النهائي مباشرة", callback_data="review_finish")],
+            [InlineKeyboardButton("❌ إلغاء", callback_data="btn_back_main")],
+        ]
+        text = (
+            f"✅ <b>تم تجميع كل الصور ({found}/{total_expected})</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🧩 <b>تعيين يدوي:</b> <code>{manual_count}</code>\n"
+            f"👇 يمكنك مراجعة الترتيب ثم اعتماده لبدء المونتاج."
         )
-
-    keyboard = []
-    if fully:
-        keyboard.append([
-            InlineKeyboardButton(
-                "🎬 ابدأ المونتاج / الرندرة الآن",
-                callback_data="review_summary_approve",
-            )
-        ])
     else:
-        keyboard.append([
-            InlineKeyboardButton(
-                f"🎬 ابدأ المونتاج بالـ {found} صورة المتوفرة",
-                callback_data="review_summary_force_partial",
-            )
-        ])
-        keyboard.append([
-            InlineKeyboardButton(
-                "🔄 إعادة الفحص بعد رفع النواقص",
-                callback_data="btn_start_render",
-            )
-        ])
+        missing_txt = _format_missing_indices(missing) if missing else "—"
+        keyboard = [
+            [InlineKeyboardButton("🔄 إعادة الفحص بعد رفع النواقص", callback_data="btn_start_render")],
+            [InlineKeyboardButton("❌ إلغاء والعودة", callback_data="btn_back_main")],
+        ]
+        text = (
+            f"⚠️ <b>لسه فيه نواقص — لا يمكن بدء المونتاج</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"✅ <b>المعتمد:</b> <code>{found}</code> / <code>{total_expected}</code>\n"
+            f"⚠️ <b>الناقص:</b> <code>{len(missing)}</code>\n"
+            f"    └ {_esc(missing_txt)}\n"
+            f"🔁 <b>التكرارات:</b> <code>{len(duplicates)}</code>\n\n"
+            f"<i>ارفع الصور الناقصة، ثم اضغط «إعادة الفحص».</i>\n"
+            f"<i>لا يوجد خيار للرندرة الجزئية.</i>"
+        )
 
     await context.bot.send_message(
         chat_id=chat_id,
-        text=(
-            f"{header}\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📸 <b>الصور المعتمدة:</b> <code>{found}</code> / <code>{total_expected}</code>\n"
-            f"🧩 <b>تعيين يدوي:</b> <code>{manual_count}</code>\n"
-            f"⚠️ <b>الناقص:</b> <code>{_esc(missing_txt)}</code>\n\n"
-            f"<i>{note}</i>\n\n"
-            f"👇 تحب تبدأ المونتاج دلوقتي؟"
-        ),
+        text=text,
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode=ParseMode.HTML,
     )
@@ -1539,7 +1616,6 @@ async def show_next_manual_image(context, chat_id):
 
     if not queue:
         session["manual_current"] = None
-        # اختيار المستخدم نهائي — مفيش OCR تاني
         await _finalize_after_manual(context, chat_id)
         return
 
@@ -1590,14 +1666,15 @@ async def show_next_manual_image(context, chat_id):
 
 
 # =================================================================
-# 7. فحص الصور (Process & Verify) — بدون أي تعديل على stage4_vision
+# 7. فحص الصور — لا يوجد allow_partial من الـ UI
 # =================================================================
 
-async def run_image_verification(msg_obj, context, allow_partial: bool = False):
+async def run_image_verification(msg_obj, context):
     """
-    يشغّل process_and_verify_images كما هي، ثم يبني خريطة مراجعة أولية
-    ويعرض للمستخدم اختيار وضع المراجعة (سريع / كامل).
-    لا يبدأ الرندرة إطلاقاً في هذه المرحلة.
+    يشغّل process_and_verify_images مع allow_partial=False دائماً.
+    بعد الفحص الناجح: يُعيد بناء كل حالة المراجعة من الخريطة الجديدة
+    (لا توجد بيانات ناقصة قديمة).
+    عند MissingAssetsError: يعرض فقط: تعيين يدوي / إعادة فحص / إلغاء.
     """
     chat_id = msg_obj.chat_id
     session = get_session(chat_id)
@@ -1620,12 +1697,11 @@ async def run_image_verification(msg_obj, context, allow_partial: bool = False):
     raw_dir = OUTPUTS_DIR / f"episode_{ep_id}_raw_images"
     clean_dir = OUTPUTS_DIR / f"episode_{ep_id}_clean_frames"
 
-    mode_tag = "⚡ فحص بالصور المتوفرة" if allow_partial else "🔍 فحص كامل"
     try:
         progress_msg = await context.bot.send_message(
             chat_id=chat_id,
             text=(
-                f"{mode_tag}\n"
+                "🔍 <b>فحص كامل</b>\n"
                 f"<i>جاري فحص الركن السفلي الأيمن للصور بالـ OCR ومطابقة الترتيب...</i>"
             ),
             parse_mode=ParseMode.HTML,
@@ -1639,7 +1715,7 @@ async def run_image_verification(msg_obj, context, allow_partial: bool = False):
             uploaded_images_dir=raw_dir,
             output_frames_dir=clean_dir,
             expected_total=total_expected,
-            allow_partial=allow_partial,
+            allow_partial=False,
             manual_assignments=session.get("manual_map", {}),
         )
         if _is_stale(chat_id, session):
@@ -1651,54 +1727,76 @@ async def run_image_verification(msg_obj, context, allow_partial: bool = False):
 
         missing_preview = _format_missing_indices(m_err.missing_indices)
         unindexed_files = list(getattr(m_err, "unindexed_files", []) or [])
-        session["manual_unindexed_files"] = unindexed_files
-        session["manual_missing_indices"] = list(m_err.missing_indices)
-        session["image_review_missing"] = [int(x) for x in m_err.missing_indices]
+        missing_indices = [int(x) for x in (m_err.missing_indices or [])]
 
-        # حفظ خريطة OCR الناجحة — اختيار المستخدم بعد كده نهائي ومش هنعيد الفحص
+        # ✅ إعادة بناء الحالة من نتيجة الفحص الجديدة فقط
         ocr_map = getattr(m_err, "indexed_images", None) or {}
-        session["ocr_indexed_map"] = {
-            int(k): str(v) for k, v in ocr_map.items()
-        }
+        ocr_map_int = {}
+        for k, v in ocr_map.items():
+            try:
+                ocr_map_int[int(k)] = str(v)
+            except (TypeError, ValueError):
+                continue
+
+        session["ocr_indexed_map"] = ocr_map_int
+        session["manual_unindexed_files"] = unindexed_files
+        session["manual_missing_indices"] = missing_indices
+
+        # لا تمسح manual_map (اختيارات المستخدم النهائية)
+        # لكن لا تسمح ببقاء نتائج OCR قديمة تتعارض مع الفحص الجديد
+        _reset_image_review_state(session, ocr_map_int, total_expected)
+        # بعد reset، خريطة المراجعة هي OCR فقط + أي manual_valid مدمج لاحقاً.
+        # لكن دعنا نطبّق manual_map فوقها إذا كان الملف موجوداً
+        merged = dict(session["image_review_map"])
+        for slot, p in (session.get("manual_map") or {}).items():
+            try:
+                sp = int(slot)
+            except (TypeError, ValueError):
+                continue
+            if p and Path(p).exists():
+                merged[sp] = str(p)
+        session["image_review_map"] = merged
+        session["image_review_original"] = dict(merged)
+        session["image_review_missing"] = [
+            s for s in range(1, total_expected + 1) if s not in merged
+        ]
+        session["image_review_duplicates"] = _compute_duplicates_from_map(merged)
 
         keyboard = []
         if unindexed_files:
-            # فيه صور زيادة / فشل OCR → الوضع اليدوي
             keyboard.append([
                 InlineKeyboardButton(
                     f"🧩 تعيين يدوي لـ {len(unindexed_files)} صورة",
                     callback_data="btn_manual_assign",
                 )
             ])
-        # دايمًا نقدر نكمل باللي اتقرا
-        keyboard.append([
-            InlineKeyboardButton(
-                f"🎬 ابدأ المونتاج بالـ {m_err.found_count} صورة المتوفرة",
-                callback_data="btn_proceed_with_ocr",
-            )
-        ])
         keyboard.append([
             InlineKeyboardButton(
                 "🔄 إعادة الفحص بعد رفع النواقص",
                 callback_data="btn_start_render",
             )
         ])
+        keyboard.append([
+            InlineKeyboardButton("❌ إلغاء والعودة للقائمة", callback_data="btn_back_main")
+        ])
 
         extra_note = (
-            f"\n🧩 <b>صور فشل قراءة رقمها (تحتاج تعيين يدوي):</b> <code>{len(unindexed_files)}</code>"
+            f"\n🧩 <b>صور فشل قراءة رقمها (تحتاج تعيين يدوي):</b> "
+            f"<code>{len(unindexed_files)}</code>"
             if unindexed_files else ""
         )
 
         await progress_msg.edit_text(
             f"📊 <b>جرد الصور</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"✅ تم التحقق من <b>{m_err.found_count}</b> صورة من أصل <b>{m_err.total_expected}</b>.{extra_note}\n\n"
-            f"⚠️ <b>الأرقام الناقصة:</b>\n"
+            f"✅ تم التحقق من <b>{m_err.found_count}</b> صورة من أصل "
+            f"<b>{m_err.total_expected}</b>.{extra_note}\n\n"
+            f"⚠️ <b>الأرقام الناقصة ({len(missing_indices)}):</b>\n"
             f"<code>{_esc(missing_preview)}</code>\n\n"
+            f"<i>⚠️ لا يمكن بدء المونتاج قبل اكتمال كل الأرقام.</i>\n\n"
             f"👇 <b>اختار:</b>\n"
             f"• <b>تعيين يدوي</b>: لو فيه صور زيادة أو فشل الـ OCR — هتشوف الصورة وتختار رقمها.\n"
-            f"• <b>ابدأ المونتاج</b>: بالموجود دلوقتي ({m_err.found_count} صورة) من غير فحص تاني.\n"
-            f"• <b>إعادة الفحص</b>: بعد ما ترفع الناقص.",
+            f"• <b>إعادة الفحص</b>: بعد ما ترفع الصور الناقصة.",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode=ParseMode.HTML,
         )
@@ -1716,64 +1814,28 @@ async def run_image_verification(msg_obj, context, allow_partial: bool = False):
         return
 
     # -------------------------------------------------------------
-    # بناء خريطة المراجعة الأولية
-    # ملاحظة: عند اكتمال الصور، تُرجع process_and_verify_images قائمة
-    # مرتبة حسب الرقم المكتشف، لذلك يكون العنصر i هو slot (i + 1).
-    # أما عند الرندرة الجزئية فلا يجوز افتراض ذلك؛ فغياب slot في المنتصف
-    # سيؤدي إلى إزاحة كل الصور التالية إلى أرقام خاطئة.
+    # فحص ناجح كامل → إعادة بناء كل الحالة من الصفر
     # -------------------------------------------------------------
-    if allow_partial and len(frames) != total_expected:
-        await progress_msg.edit_text(
-            "⚠️ <b>تم إيقاف الرندرة الجزئية الآمنة.</b>\n"
-            "نتيجة فحص الصور لا تحتوي على خريطة رقمية صريحة لكل صورة، "
-            "ولا يجوز تخمين أرقام الصور من ترتيب القائمة.\n\n"
-            "ارفع الصور الناقصة ثم أعد الفحص للحصول على ترتيب صحيح.",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
     review_map = {}
     for idx, path in enumerate(frames):
         review_map[idx + 1] = str(path)
 
-    # تطبيق التعيين اليدوي إن وجد (إن لزم، يطغى على الخريطة)
+    # manual_map له الأولوية على نتيجة OCR في نفس الخانة
     for slot, path in (session.get("manual_map") or {}).items():
         try:
-            review_map[int(slot)] = str(path)
+            sp = int(slot)
         except (ValueError, TypeError):
             continue
+        if path and Path(path).exists():
+            review_map[sp] = str(path)
 
-    # كشف التكرارات (نفس المسار لرقمين) — هذا لا يجب أن يحدث لكنه حماية
-    seen_paths = {}
-    duplicates = set()
-    for slot, p in review_map.items():
-        if p in seen_paths:
-            duplicates.add(slot)
-            duplicates.add(seen_paths[p])
-        else:
-            seen_paths[p] = slot
+    # ✅ إعادة بناء كاملة لكل حقول المراجعة
+    _reset_image_review_state(session, review_map, total_expected)
+    session["ocr_indexed_map"] = {int(k): str(v) for k, v in review_map.items()}
 
-    session["image_review_map"] = dict(review_map)
-    session["image_review_original"] = dict(review_map)
-    session["image_review_confirmed"] = {}
-    session["image_review_confirmed_flag"] = False
-    session["image_review_summary"] = None
-    session["image_review_excluded"] = []
-    session["image_review_manual_edits"] = []
-    session["image_review_duplicates"] = sorted(duplicates)
-    session["image_review_mode"] = None
-    session["image_review_index"] = 0
-    session["image_review_items"] = []
-    session["final_image_map"] = {}
-
-    # حفظ قائمة النواقص إن وُجدت
-    if not session.get("image_review_missing"):
-        session["image_review_missing"] = [
-            s for s in range(1, total_expected + 1) if s not in review_map
-        ]
-
-    found = len(review_map)
-    missing_count = len(session.get("image_review_missing", []))
+    found = len(session["image_review_map"])
+    missing_count = len(session["image_review_missing"])
+    duplicates_count = len(session["image_review_duplicates"])
 
     keyboard = [
         [InlineKeyboardButton("⚡ مراجعة الصور التي تحتاج تدقيقًا فقط", callback_data="review_mode_quick")],
@@ -1786,8 +1848,8 @@ async def run_image_verification(msg_obj, context, allow_partial: bool = False):
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📸 <b>الصور المكتشفة:</b> <code>{found}</code> من أصل <code>{total_expected}</code>\n"
         f"⚠️ <b>الأرقام المفقودة:</b> <code>{missing_count}</code>\n"
-        f"🔁 <b>التكرارات:</b> <code>{len(session.get('image_review_duplicates', []))}</code>\n\n"
-        f"<i>⚠️ لن تبدأ الرندرة إلا بعد اعتمادك الصريح من شاشة الملخص.</i>\n\n"
+        f"🔁 <b>التكرارات:</b> <code>{duplicates_count}</code>\n\n"
+        f"<i>⚠️ لن تبدأ الرندرة إلا بعد اعتمادك الصريح من شاشة الملخص، وبشرط اكتمال كل الأرقام.</i>\n\n"
         f"👇 <b>اختر وضع المراجعة:</b>",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode=ParseMode.HTML,
@@ -1799,7 +1861,6 @@ async def run_image_verification(msg_obj, context, allow_partial: bool = False):
 # =================================================================
 
 def _get_quick_review_items(session):
-    """يرجع قائمة الأرقام التي تحتاج تدقيقاً (مفقودة + مكررة + معدلة يدوياً)."""
     items = set()
     for s in session.get("image_review_missing", []) or []:
         try:
@@ -1846,9 +1907,8 @@ async def start_image_review(chat_id, context, mode: str):
             )
             await show_review_summary(chat_id, context)
             return
-    else:  # full
+    else:
         total_expected = len(session.get("sentences", []))
-        # نعرض كل الأرقام من 1..total_expected (المتوفرة منها وغير المتوفرة)
         items = list(range(1, total_expected + 1))
 
     session["image_review_mode"] = mode
@@ -1959,7 +2019,6 @@ async def show_review_image(chat_id, context):
     caption = _build_review_caption(session, slot)
     keyboard = _build_review_keyboard(session, slot)
 
-    # حذف رسالة المراجعة السابقة إن وجدت
     prev_msg_id = session.get("image_review_message_id")
     if prev_msg_id:
         try:
@@ -1983,7 +2042,6 @@ async def show_review_image(chat_id, context):
         except Exception as e:
             logger.error(f"فشل إرسال صورة المراجعة: {e}")
 
-    # إذا لم تكن الصورة موجودة (مفقودة) → رسالة نصية
     sent = await context.bot.send_message(
         chat_id=chat_id,
         text=caption,
@@ -2020,7 +2078,6 @@ async def handle_review_confirm(chat_id, context):
     confirmed[int(slot)] = True
     session["image_review_confirmed"] = confirmed
 
-    # الانتقال للصورة التالية تلقائياً إن وُجدت
     if idx < len(items) - 1:
         session["image_review_index"] = idx + 1
         await show_review_image(chat_id, context)
@@ -2137,8 +2194,6 @@ async def handle_image_correction_text(update: Update, context: ContextTypes.DEF
         session["image_review_pending_slot"] = None
         return
 
-    # تطبيق التعديل. إذا كانت الخانة الجديدة مشغولة، يتم تبديل الصورتين
-    # بدل رفض العملية؛ وهذا يسمح بتصحيح حالتيْن معكوستين بسهولة من Telegram.
     if int(new_slot) != int(old_slot):
         other_path = review_map.get(int(new_slot))
         review_map[int(old_slot)] = other_path if other_path else current_path
@@ -2150,7 +2205,6 @@ async def handle_image_correction_text(update: Update, context: ContextTypes.DEF
             edits.append({"old": int(new_slot), "new": int(old_slot), "swapped": True})
         session["image_review_manual_edits"] = edits
 
-        # التبديل/النقل يلغي الاعتماد السابق للخانتين حتى يراجعهما المستخدم.
         confirmed = session.get("image_review_confirmed") or {}
         confirmed.pop(int(old_slot), None)
         confirmed.pop(int(new_slot), None)
@@ -2158,13 +2212,10 @@ async def handle_image_correction_text(update: Update, context: ContextTypes.DEF
 
     session["image_review_map"] = review_map
 
-    # ضمان أن الخريطة لا تحتوي على مسارات مكررة بعد النقل أو التبديل.
-    path_slots = {}
-    for mapped_slot, mapped_path in review_map.items():
-        if mapped_path:
-            path_slots.setdefault(str(mapped_path), []).append(int(mapped_slot))
-    duplicate_paths = [slots for slots in path_slots.values() if len(slots) > 1]
-    session["image_review_duplicates"] = sorted({slot for slots in duplicate_paths for slot in slots})
+    session["image_review_duplicates"] = _compute_duplicates_from_map(review_map)
+    session["image_review_missing"] = [
+        s for s in range(1, total_expected + 1) if s not in review_map
+    ]
 
     session["state"] = "IMAGE_REVIEW"
     session["image_review_pending_slot"] = None
@@ -2186,15 +2237,18 @@ def _compute_review_summary(session):
     review_map = session.get("image_review_map", {}) or {}
     excluded = set(session.get("image_review_excluded") or [])
 
-    # الأرقام المرتبة = المفاتيح في الخريطة غير المستبعدة
     ordered_slots = sorted([int(s) for s in review_map.keys() if int(s) not in excluded])
-    # الأرقام المفقودة
     missing = [s for s in range(1, total_expected + 1) if s not in ordered_slots]
-    # الأرقام المكررة (نفس المسار لأرقام متعددة)
+
     path_to_slots = {}
     for s in ordered_slots:
         p = review_map[s]
-        path_to_slots.setdefault(p, []).append(s)
+        try:
+            key = str(Path(p).resolve())
+        except Exception:
+            key = str(p)
+        path_to_slots.setdefault(key, []).append(s)
+
     duplicates = []
     for p, slots in path_to_slots.items():
         if len(slots) > 1:
@@ -2249,7 +2303,10 @@ async def show_review_summary(chat_id, context):
 
     fully_complete = (ordered_count == total_expected) and (not missing) and (not duplicates)
 
-    header = "✅ <b>جاهز للاعتماد</b>" if fully_complete else "⚠️ <b>الترتيب غير مكتمل</b>"
+    if fully_complete:
+        header = "✅ <b>جاهز للاعتماد</b>"
+    else:
+        header = "⚠️ <b>الترتيب غير مكتمل — لن تبدأ الرندرة</b>"
 
     text = (
         f"<b>📊 ملخص مراجعة الصور النهائي</b>\n"
@@ -2266,7 +2323,7 @@ async def show_review_summary(chat_id, context):
         f"✏️ <b>تعديلات يدوية:</b> <code>{len(manual_edits)}</code>\n"
         f"    └ {_esc(edits_txt)}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"<i>⚠️ لن يبدأ المونتاج إلا بعد ضغطك على زر الاعتماد أدناه.</i>"
+        f"<i>⚠️ لن يبدأ المونتاج إلا بعد ضغطك على زر الاعتماد، وبشرط اكتمال كل الأرقام.</i>"
     )
 
     row1 = []
@@ -2277,8 +2334,8 @@ async def show_review_summary(chat_id, context):
         ))
     else:
         row1.append(InlineKeyboardButton(
-            "⏩ رندرة جزئية بالصور المتوفرة",
-            callback_data="review_summary_force_partial",
+            "🔄 إعادة الفحص بعد رفع النواقص",
+            callback_data="btn_start_render",
         ))
 
     row2 = [
@@ -2295,52 +2352,121 @@ async def show_review_summary(chat_id, context):
 
 
 # =================================================================
-# 10. اعتماد الترتيب + بدء الرندرة
+# 10. اعتماد الترتيب + بدء الرندرة الكاملة فقط
 # =================================================================
 
+def _validate_final_map(final_map, total_expected):
+    """
+    يتحقق من أن الخريطة النهائية كاملة وصحيحة رقمياً وفيزيائياً.
+    يُرجع (ok: bool, errors: list[str]).
+    """
+    errors = []
+    slots = sorted(final_map.keys())
+
+    # 1. يجب أن تكون المفاتيح هي 1..total_expected بالضبط
+    expected_set = set(range(1, total_expected + 1))
+    actual_set = set(slots)
+    if actual_set != expected_set:
+        missing_slots = sorted(expected_set - actual_set)
+        extra_slots = sorted(actual_set - expected_set)
+        if missing_slots:
+            errors.append(
+                f"أرقام مفقودة: {_format_missing_indices(missing_slots)}"
+            )
+        if extra_slots:
+            errors.append(
+                f"أرقام خارج النطاق: {_format_missing_indices(extra_slots)}"
+            )
+
+    # 2. كل مسار موجود وملف فعلي غير فارغ
+    resolved_seen = {}
+    for slot in slots:
+        p = final_map[slot]
+        try:
+            pp = Path(p)
+        except Exception:
+            errors.append(f"مسار غير صالح للرقم #{slot}")
+            continue
+        if not pp.exists():
+            errors.append(f"ملف غير موجود للرقم #{slot}: {pp.name}")
+            continue
+        if not pp.is_file():
+            errors.append(f"ليس ملفًا للرقم #{slot}: {pp.name}")
+            continue
+        try:
+            if pp.stat().st_size == 0:
+                errors.append(f"ملف فارغ للرقم #{slot}: {pp.name}")
+                continue
+        except Exception:
+            errors.append(f"تعذّر قراءة حالة الملف للرقم #{slot}")
+            continue
+        try:
+            key = str(pp.resolve())
+        except Exception:
+            key = str(pp)
+        if key in resolved_seen:
+            errors.append(
+                f"مسار مكرر بين #{resolved_seen[key]} و #{slot}"
+            )
+        else:
+            resolved_seen[key] = slot
+
+    return (not errors), errors
+
+
 async def approve_and_render(msg_obj, context):
-    session = get_session(msg_obj.chat_id)
-    if _is_stale(msg_obj.chat_id, session):
+    chat_id = msg_obj.chat_id
+    session = get_session(chat_id)
+    if _is_stale(chat_id, session):
         return
 
-    summary = _compute_review_summary(session)
-    total_expected = summary["total_expected"]
-    ordered_slots = summary["ordered_slots"]
-    missing = summary["missing"]
-
-    if missing:
-        await context.bot.send_message(
-            chat_id=msg_obj.chat_id,
-            text=(
-                f"❌ <b>لا يمكن بدء المونتاج الكامل — توجد أرقام مفقودة.</b>\n"
-                f"المفقود: <code>{_esc(_format_missing_indices(missing))}</code>\n\n"
-                f"ارفع الصور الناقصة، أو اختر <b>الرندرة الجزئية</b> من شاشة الملخص."
-            ),
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    # بناء الخريطة النهائية من رقم واحد صريح لكل صورة
+    total_expected = len(session.get("sentences", []))
     review_map = session.get("image_review_map", {}) or {}
     excluded = set(session.get("image_review_excluded") or [])
 
     final_map = {}
-    for slot in ordered_slots:
-        if slot in excluded:
+    for slot, p in review_map.items():
+        try:
+            s = int(slot)
+        except (ValueError, TypeError):
             continue
-        p = review_map.get(slot)
+        if s in excluded:
+            continue
         if p:
-            final_map[int(slot)] = str(p)
+            final_map[s] = str(p)
+
+    ok, errors = _validate_final_map(final_map, total_expected)
+
+    if not ok:
+        errors_txt = "\n".join(f"• {_esc(e)}" for e in errors[:8])
+        keyboard = [
+            [InlineKeyboardButton("🔄 إعادة الفحص", callback_data="btn_start_render")],
+            [InlineKeyboardButton("📋 العودة للمراجعة", callback_data="review_mode_full")],
+            [InlineKeyboardButton("❌ إلغاء", callback_data="review_summary_cancel")],
+        ]
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"❌ <b>لا يمكن بدء المونتاج — خريطة الصور غير مكتملة أو غير صالحة.</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"{errors_txt}\n\n"
+                f"<i>لا يوجد خيار للرندرة الجزئية. ارفع الصور الناقصة، صحّح الأرقام، "
+                f"ثم أعد الفحص.</i>"
+            ),
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.HTML,
+        )
+        return
 
     session["final_image_map"] = final_map
     session["image_review_confirmed_flag"] = True
 
-    await run_final_render(msg_obj, context, allow_partial=False)
+    await run_final_render(msg_obj, context)
 
 
-async def run_final_render(msg_obj, context, allow_partial: bool = False):
+async def run_final_render(msg_obj, context):
     """
-    ينفّذ المونتاج باستخدام final_image_map كخريطة صريحة (لا يعتمد على الترتيب التلقائي).
+    ينفّذ المونتاج الكامل فقط. لا يوجد allow_partial.
     """
     chat_id = msg_obj.chat_id
     session = get_session(chat_id)
@@ -2352,13 +2478,8 @@ async def run_final_render(msg_obj, context, allow_partial: bool = False):
     sentences = session.get("sentences", [])
     total_expected = len(sentences)
 
-    final_map = session.get("final_image_map") or session.get("image_review_map") or {}
-
-    # بناء frames مرتبة حسب الأرقام تصاعدياً (بدون sorted على أسماء ملفات)
-    ordered_slots = sorted([int(s) for s in final_map.keys()])
-    frames = [str(final_map[s]) for s in ordered_slots]
-
-    if not frames:
+    final_map = session.get("final_image_map") or {}
+    if not final_map:
         await context.bot.send_message(
             chat_id=chat_id,
             text="❌ لا توجد صور معتمدة لبدء المونتاج.",
@@ -2366,39 +2487,29 @@ async def run_final_render(msg_obj, context, allow_partial: bool = False):
         )
         return
 
-    missing = [s for s in range(1, total_expected + 1) if s not in final_map]
-    if missing and allow_partial:
+    ok, errors = _validate_final_map(final_map, total_expected)
+    if not ok:
+        errors_txt = "\n".join(f"• {_esc(e)}" for e in errors[:8])
         await context.bot.send_message(
             chat_id=chat_id,
             text=(
-                "⚠️ <b>تم منع الرندرة الجزئية.</b>\n"
-                "لا توجد خريطة رقمية صريحة للصور المتوفرة، ولذلك قد يؤدي تشغيلها "
-                "إلى إزاحة الصور ووضعها في أرقام خاطئة.\n\n"
-                f"الأرقام المفقودة: <code>{_esc(_format_missing_indices(missing))}</code>\n"
-                "ارفع الصور الناقصة ثم أعد الفحص."
+                f"❌ <b>تم رفض بدء المونتاج — خريطة الصور غير مكتملة.</b>\n"
+                f"{errors_txt}\n\n"
+                f"<i>ارفع الصور الناقصة أو صحّح الأرقام ثم أعد الفحص.</i>"
             ),
             parse_mode=ParseMode.HTML,
         )
         return
 
-    if missing and not allow_partial:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                f"❌ <b>لا يمكن بدء المونتاج الكامل — أرقام ناقصة:</b>\n"
-                f"<code>{_esc(_format_missing_indices(missing))}</code>\n\n"
-                f"استخدم <b>الرندرة الجزئية</b> إن أردت المتابعة بالصور المتوفرة."
-            ),
-            parse_mode=ParseMode.HTML,
-        )
-        return
+    # ترتيب صريح حسب الرقم (لا نعتمد على ترتيب قائمة)
+    ordered_slots = sorted(final_map.keys())
+    frames = [str(final_map[s]) for s in ordered_slots]
 
-    mode_tag = "⚡ رندرة جزئية" if allow_partial else "🏆 رندرة كاملة"
     try:
         progress_msg = await context.bot.send_message(
             chat_id=chat_id,
             text=(
-                f"<b>🎬 {mode_tag} — جاري بدء المونتاج عبر FFmpeg (1080p 60fps)</b>\n"
+                f"<b>🎬 رندرة كاملة — جاري بدء المونتاج عبر FFmpeg (1080p 60fps)</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"✅ تم اعتماد ترتيب <b>{len(frames)}</b> صورة.\n"
                 f"⏳ جاري المزامنة الدقيقة بالمللي ثانية وتوليد الترجمة الحركية...\n"
@@ -2414,6 +2525,12 @@ async def run_final_render(msg_obj, context, allow_partial: bool = False):
         audio_file = session.get("audio_path")
         if not audio_file:
             raise RuntimeError("ملف الصوت غير موجود في الجلسة.")
+        try:
+            ap = Path(audio_file)
+        except Exception:
+            ap = None
+        if not ap or not ap.exists() or not ap.is_file():
+            raise RuntimeError("ملف الصوت غير موجود على القرص.")
 
         subtitles_ass = OUTPUTS_DIR / f"episode_{ep_id}_subtitles.ass"
         final_video = OUTPUTS_DIR / f"episode_{ep_id}_final_1080p.mp4"
@@ -2433,14 +2550,13 @@ async def run_final_render(msg_obj, context, allow_partial: bool = False):
             return
 
         file_size_mb = final_video.stat().st_size / (1024 * 1024)
-        render_badge = "⚡ (رندرة جزئية)" if allow_partial else "🏆"
         if file_size_mb < 49:
             with open(final_video, "rb") as fv:
                 await context.bot.send_video(
                     chat_id=chat_id,
                     video=fv,
                     caption=(
-                        f"{render_badge} <b>فيديو الحلقة #{ep_id} جاهز للنشر!</b>\n"
+                        f"🏆 <b>فيديو الحلقة #{ep_id} جاهز للنشر!</b>\n"
                         f"الدقة: 1080p Full HD @ 60fps | الحجم: {file_size_mb:.1f} MB"
                     ),
                     parse_mode=ParseMode.HTML,
@@ -2449,7 +2565,7 @@ async def run_final_render(msg_obj, context, allow_partial: bool = False):
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=(
-                    f"{render_badge} <b>تم تصدير الفيديو النهائي بنجاح على السيرفر!</b>\n"
+                    f"🏆 <b>تم تصدير الفيديو النهائي بنجاح على السيرفر!</b>\n"
                     f"📊 الحجم: <code>{file_size_mb:.1f} MB</code> (أكبر من حد تيليجرام 50MB)\n"
                     f"📁 المسار المباشر على السيرفر:\n<code>{final_video}</code>"
                 ),
@@ -2523,7 +2639,7 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_media_upload))
 
     print("=" * 60)
-    print("🚀 محرك Vot Studio Pro يعمل الآن — Stage1 Approval + Manual Script Edit + Image Review System")
+    print("🚀 محرك Vot Studio Pro يعمل الآن — Complete-Render-Only + 60-80 Sentence Edit + Full Voice List + Image Review")
     print("=" * 60)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
