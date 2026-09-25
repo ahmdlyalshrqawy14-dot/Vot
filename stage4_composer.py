@@ -2,11 +2,13 @@ import os
 import wave
 import struct
 import math
+import shutil
 import subprocess
 import array
-from pathlib import Path
-from typing import List, Dict, Any
+import uuid
 import logging
+from pathlib import Path
+from typing import List, Dict, Any, Tuple
 
 logger = logging.getLogger("Stage4Composer")
 
@@ -51,6 +53,13 @@ def build_whoosh_timeline(
     - يزرع نسخة من الـ whoosh عند كل نقطة انتقال بشدة 0.4.
     هذا يُغني عن تمرير عشرات المدخلات لـ FFmpeg ويختصر أمر التنفيذ النهائي.
     """
+    if not base_whoosh.exists() or not base_whoosh.is_file():
+        raise FileNotFoundError(f"ملف الـ whoosh الأساسي غير موجود: {base_whoosh}")
+
+    if not isinstance(total_duration, (int, float)) or \
+            not math.isfinite(total_duration) or total_duration <= 0:
+        raise ValueError(f"مدة إجمالية غير صالحة لمسار الـ whoosh: {total_duration!r}")
+
     with wave.open(str(base_whoosh), "rb") as wf:
         sr = wf.getframerate()
         raw = wf.readframes(wf.getnframes())
@@ -60,10 +69,19 @@ def build_whoosh_timeline(
     base_len = len(base_samples)
 
     total_samples = int(total_duration * sr)
+    if total_samples <= 0:
+        raise ValueError(
+            f"عدد العينات الكلي غير صالح لمسار الـ whoosh: {total_samples}"
+        )
+
     out = array.array("h", bytes(2 * total_samples))
 
     for t in transition_times:
+        if not isinstance(t, (int, float)) or not math.isfinite(t) or t < 0:
+            continue
         start = int(t * sr)
+        if start < 0 or start >= total_samples:
+            continue
         for i in range(base_len):
             idx = start + i
             if idx >= total_samples:
@@ -92,7 +110,20 @@ def get_ken_burns_filter(pattern_index: int, duration: float, fps: int = 60) -> 
     5. Slow Zoom In
     6. Slow Pan Left
     """
+    if not isinstance(duration, (int, float)) or \
+            not math.isfinite(duration) or duration <= 0:
+        raise ValueError(f"مدة غير صالحة لفلتر Ken Burns: {duration!r}")
+
+    if not isinstance(fps, int) or fps <= 0:
+        raise ValueError(f"معدل إطارات غير صالح لفلتر Ken Burns: {fps!r}")
+
     frames = int(duration * fps)
+    if frames < 1:
+        raise ValueError(
+            f"المدة ({duration:.6f}s) قصيرة جدًا لإنتاج إطار واحد عند {fps}fps. "
+            f"الحد الأدنى المطلوب تقريبًا: {1.0 / fps:.6f}s"
+        )
+
     pattern = pattern_index % 6
 
     if pattern == 0:
@@ -113,17 +144,84 @@ def _probe_media_duration(path: Path) -> float:
     """
     قراءة المدة الفعلية لملف وسائط (صوت أو فيديو) بالثواني عبر ffprobe.
     تُستخدم لجعل الصوت هو المرجع الزمني النهائي للمونتاج.
+
+    ترفض: الناتج الفارغ، NaN، Infinity، الصفر، القيم السالبة.
     """
-    result = subprocess.run(
-        [
-            "ffprobe", "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            str(path),
-        ],
-        capture_output=True, text=True, check=True,
-    )
-    return float(result.stdout.strip())
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ],
+            capture_output=True, text=True, check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(
+            f"فشل ffprobe في قراءة المدة للملف: {path} "
+            f"(رمز الخروج: {e.returncode})"
+        ) from e
+    except FileNotFoundError as e:
+        raise RuntimeError(
+            "ffprobe غير متوفر في بيئة التشغيل. لا يمكن قياس مدة الوسائط."
+        ) from e
+
+    raw = (result.stdout or "").strip()
+    if not raw:
+        raise RuntimeError(f"ffprobe أعاد ناتجًا فارغًا للملف: {path}")
+
+    try:
+        duration = float(raw)
+    except (TypeError, ValueError) as e:
+        raise RuntimeError(
+            f"قيمة مدة غير قابلة للتحويل من ffprobe للملف: {path} (الناتج: {raw!r})"
+        ) from e
+
+    if not math.isfinite(duration):
+        raise RuntimeError(
+            f"قيمة مدة غير منتهية أو NaN من ffprobe للملف: {path} ({duration!r})"
+        )
+    if duration <= 0:
+        raise RuntimeError(
+            f"قيمة مدة غير موجبة من ffprobe للملف: {path} ({duration})"
+        )
+
+    return duration
+
+
+def _safe_concat_escape(path: Path) -> str:
+    """
+    تهيئة مسار آمن لصيغة FFmpeg concat demuxer:
+    - المسار يجب أن يكون مطلقًا ومحلولًا.
+    - نغلّفه بعلامات اقتباس مفردة، ونهرّب أي اقتباس مفرد داخلي.
+    """
+    resolved = path.resolve().as_posix()
+    # Escape single quotes for the ffmpeg concat demuxer syntax.
+    escaped = resolved.replace("'", "'\\''")
+    return f"file '{escaped}'\n"
+
+
+def _validate_regular_file(path: Path, label: str, index: int = -1) -> None:
+    """التحقق من وجود ملف عادي بأخطاء واضحة."""
+    idx_part = f"[{index}] " if index >= 0 else ""
+    if not path.exists():
+        raise FileNotFoundError(f"{idx_part}{label} غير موجود: {path}")
+    if not path.is_file():
+        raise ValueError(f"{idx_part}{label} ليس ملفًا عاديًا: {path}")
+
+
+def _validate_non_empty_file(path: Path, label: str) -> None:
+    """التحقق من أن الملف موجود وليس فارغًا."""
+    if not path.exists():
+        raise RuntimeError(f"{label} غير موجود بعد التنفيذ: {path}")
+    if not path.is_file():
+        raise RuntimeError(f"{label} ليس ملفًا عاديًا: {path}")
+    try:
+        if path.stat().st_size <= 0:
+            raise RuntimeError(f"{label} فارغ (0 بايت): {path}")
+    except OSError as e:
+        raise RuntimeError(f"تعذّر فحص حجم {label}: {path}") from e
 
 
 def render_final_video(
@@ -154,11 +252,21 @@ def render_final_video(
     [البنية الجديدة]
     - المرحلة A: دمج المقاطع فيديو-فقط (بدون صوت) عبر -c:v copy.
     - المرحلة B: قياس المدة الحقيقية + tpad + mux مع التعليق الصوتي و-t audio_duration.
+
+    [العزل]
+    - كل استدعاء يحصل على مجلد مؤقت فريد (uuid) داخل مجلد الإخراج.
+    - يُنظَّف المجلد المؤقت بعد النجاح أو الفشل، دون المساس بمخرجات سابقة.
+    - المخرج النهائي يُكتب أولًا في ملف مرحلي داخل المجلد المؤقت، ثم يُنقل
+      ذريًّا إلى المسار النهائي بعد نجاح كل التحققات. هذا يضمن عدم إتلاف أي
+      فيديو نهائي سابق إذا فشلت الرندرة.
     """
 
     # ============================================================
     # [حماية 1] استبعاد العناصر الفارغة + التحقق من تناسق الأعداد
     # ============================================================
+    if not isinstance(frames, list) or not isinstance(timeline, list):
+        raise TypeError("frames و timeline يجب أن تكونا قائمتين.")
+
     renderable_timeline = [it for it in timeline if not it.get("empty")]
 
     if not renderable_timeline:
@@ -167,9 +275,6 @@ def render_final_video(
             "(كل العناصر فارغة أو القائمة فارغة أصلًا)."
         )
 
-    # حالتان مسموحتان فقط:
-    #   A) frames يطابق عدد العناصر غير الفارغة مباشرةً (الأكثر شيوعًا).
-    #   B) frames يطابق الـ timeline الكامل (بما فيها placeholder للعناصر الفارغة).
     if len(frames) == len(renderable_timeline):
         raw_pairs = list(zip(frames, renderable_timeline))
     elif len(frames) == len(timeline):
@@ -185,11 +290,28 @@ def render_final_video(
         )
 
     # ============================================================
-    # [حماية 2 + 3] التحقق من المدة الموجبة ومن سلامة ملفات الصور
+    # [حماية 2 + 3] التحقق المبكر من المدة ومن سلامة ملفات الصور
     # ============================================================
-    validated_pairs: List[tuple] = []
+    validated_pairs: List[Tuple[Path, Dict[str, Any], float]] = []
     for idx, (frame_path, item) in enumerate(raw_pairs):
-        duration = float(item.get("duration", 0.0) or 0.0)
+        raw_duration = item.get("duration", 0.0)
+
+        try:
+            duration = float(raw_duration)
+        except (TypeError, ValueError) as e:
+            preview = str(item.get("text", ""))[:40]
+            raise ValueError(
+                f"مدة غير قابلة للتحويل ({raw_duration!r}) للعنصر رقم {idx} "
+                f"(النص: {preview!r})."
+            ) from e
+
+        if not math.isfinite(duration):
+            preview = str(item.get("text", ""))[:40]
+            raise ValueError(
+                f"مدة غير منتهية/NaN ({duration}) للعنصر رقم {idx} "
+                f"(النص: {preview!r})."
+            )
+
         if duration <= 0:
             preview = str(item.get("text", ""))[:40]
             raise ValueError(
@@ -198,147 +320,272 @@ def render_final_video(
             )
 
         fp = Path(frame_path)
-        if not fp.exists():
-            raise FileNotFoundError(f"[{idx}] ملف الصورة غير موجود: {fp}")
-        if not fp.is_file():
-            raise ValueError(f"[{idx}] المسار ليس ملفًا عاديًا: {fp}")
+        _validate_regular_file(fp, "ملف الصورة", index=idx)
 
         validated_pairs.append((fp, item, duration))
 
     # ============================================================
-    # من هذه النقطة نعمل حصريًا على validated_pairs
+    # [حماية 4] التحقق المبكر من مدخلات الصوت والترجمة ومجلد الإخراج
     # ============================================================
-    temp_dir = output_video_path.parent / "temp_segments"
-    temp_dir.mkdir(parents=True, exist_ok=True)
+    audio_file = Path(audio_file)
+    subtitles_ass = Path(subtitles_ass)
+    output_video_path = Path(output_video_path)
 
-    sfx_whoosh = output_video_path.parent / "whoosh_soft.wav"
-    create_synthetic_whoosh(sfx_whoosh)
+    _validate_regular_file(audio_file, "ملف التعليق الصوتي")
+    _validate_regular_file(subtitles_ass, "ملف الترجمة ASS")
 
-    segment_files = []
-    fps = 60
+    output_dir = output_video_path.parent
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise RuntimeError(
+            f"تعذّر إنشاء مجلد الإخراج: {output_dir}"
+        ) from e
 
-    logger.info(f"🎬 جاري بناء {len(validated_pairs)} مقطع Ken Burns...")
+    if not output_dir.is_dir():
+        raise RuntimeError(f"مسار الإخراج الأب ليس مجلدًا: {output_dir}")
 
-    # 1. رندرة مقطع مستقل لكل لقطة
-    for idx, (frame_path, _item, duration) in enumerate(validated_pairs):
-        kb_filter = get_ken_burns_filter(idx, duration, fps=fps)
+    # ============================================================
+    # [FIX 1] مساحة عمل مؤقتة فريدة لكل استدعاء (uuid)
+    # ============================================================
+    run_id = uuid.uuid4().hex
+    temp_dir = output_dir / f"temp_segments_{run_id}"
+    try:
+        temp_dir.mkdir(parents=True, exist_ok=False)
+    except OSError as e:
+        raise RuntimeError(
+            f"تعذّر إنشاء مجلد العمل المؤقت الفريد: {temp_dir}"
+        ) from e
 
-        seg_output = temp_dir / f"seg_{idx:03d}.mp4"
-        cmd = [
+    # الـ whoosh الأساسي يُخزَّن داخل مساحة العمل المؤقتة لتفادي التسابق بين العمليات.
+    sfx_whoosh = temp_dir / "whoosh_soft.wav"
+    whoosh_timeline = temp_dir / "whoosh_timeline.wav"
+
+    # المخرج النهائي المرحلي: لا نكتب أبدًا مباشرة إلى output_video_path قبل نجاح كل شيء.
+    staged_output_video = temp_dir / "final_output_staged.mp4"
+
+    success = False
+    try:
+        create_synthetic_whoosh(sfx_whoosh)
+        if not sfx_whoosh.exists() or sfx_whoosh.stat().st_size <= 0:
+            raise RuntimeError(
+                f"فشل إنشاء ملف الـ whoosh الأساسي: {sfx_whoosh}"
+            )
+
+        segment_files: List[Path] = []
+        fps = 60
+
+        logger.info(
+            f"🎬 بدء جلسة الرندرة (run_id={run_id}) لعدد "
+            f"{len(validated_pairs)} مقطع Ken Burns..."
+        )
+
+        # ============================================================
+        # 1. رندرة مقطع مستقل لكل لقطة
+        # ============================================================
+        for idx, (frame_path, _item, duration) in enumerate(validated_pairs):
+            kb_filter = get_ken_burns_filter(idx, duration, fps=fps)
+
+            seg_output = temp_dir / f"seg_{idx:03d}.mp4"
+            cmd = [
+                "ffmpeg", "-y", "-v", "error",
+                "-i", str(frame_path),
+                "-vf", kb_filter,
+                "-t", str(duration),
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", str(fps),
+                "-an",
+                str(seg_output),
+            ]
+            try:
+                subprocess.run(cmd, check=True)
+            except subprocess.CalledProcessError as e:
+                raise RuntimeError(
+                    f"فشل إنشاء المقطع رقم {idx} (stage=segment_render): "
+                    f"exit={e.returncode}"
+                ) from e
+
+            _validate_non_empty_file(seg_output, f"المقطع رقم {idx}")
+            segment_files.append(seg_output)
+
+        # ============================================================
+        # 2. إنشاء قائمة تجميع المقاطع (بمسارات آمنة ومهرَّبة)
+        # ============================================================
+        concat_list_file = temp_dir / "concat_list.txt"
+        try:
+            with open(concat_list_file, "w", encoding="utf-8") as f:
+                for seg in segment_files:
+                    f.write(_safe_concat_escape(seg))
+        except OSError as e:
+            raise RuntimeError(
+                f"تعذّر كتابة ملف قائمة الدمج: {concat_list_file}"
+            ) from e
+
+        if not concat_list_file.exists() or concat_list_file.stat().st_size <= 0:
+            raise RuntimeError(
+                f"ملف قائمة الدمج فارغ أو غير موجود: {concat_list_file}"
+            )
+
+        # ============================================================
+        # [المرحلة A] دمج الفيديو فقط (بدون صوت)
+        # ============================================================
+        logger.info("🧩 [A] دمج مقاطع الفيديو (فيديو-فقط) باستخدام stream copy...")
+
+        concat_video_only = temp_dir / "concat_video_only.mp4"
+        cmd_concat_only = [
             "ffmpeg", "-y", "-v", "error",
-            "-i", str(frame_path),
-            "-vf", kb_filter,
-            "-t", str(duration),
-            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", str(fps),
+            "-f", "concat", "-safe", "0", "-i", str(concat_list_file),
+            "-c:v", "copy",
             "-an",
-            str(seg_output)
+            str(concat_video_only),
         ]
-        subprocess.run(cmd, check=True)
-        segment_files.append(seg_output)
+        try:
+            subprocess.run(cmd_concat_only, check=True)
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(
+                f"فشل دمج المقاطع (stage=concat_video_only): exit={e.returncode}"
+            ) from e
 
-    # 2. إنشاء قائمة تجميع المقاطع
-    concat_list_file = temp_dir / "concat_list.txt"
-    with open(concat_list_file, "w", encoding="utf-8") as f:
-        for seg in segment_files:
-            f.write(f"file '{seg.resolve().as_posix()}'\n")
+        _validate_non_empty_file(concat_video_only, "الفيديو المُجمَّع (فيديو-فقط)")
 
-    # ============================================================
-    # [المرحلة A] دمج الفيديو فقط (بدون صوت)
-    # ============================================================
-    logger.info("🧩 [A] دمج مقاطع الفيديو (فيديو-فقط) باستخدام stream copy...")
+        # ============================================================
+        # [المرحلة B] قياس المدة الحقيقية + tpad + mux مع التعليق
+        # ============================================================
+        audio_duration = _probe_media_duration(audio_file)
+        real_video_duration = _probe_media_duration(concat_video_only)
 
-    concat_video_only = temp_dir / "concat_video_only.mp4"
-    cmd_concat_only = [
-        "ffmpeg", "-y", "-v", "error",
-        "-f", "concat", "-safe", "0", "-i", str(concat_list_file),
-        "-c:v", "copy",
-        "-an",
-        str(concat_video_only)
-    ]
-    subprocess.run(cmd_concat_only, check=True)
+        pad_needed = max(0.0, audio_duration - real_video_duration)
 
-    # ============================================================
-    # [المرحلة B] قياس المدة الحقيقية + tpad + mux مع التعليق
-    # ============================================================
-    # الصوت هو المرجع الزمني الوحيد.
-    audio_duration = _probe_media_duration(audio_file)
-    real_video_duration = _probe_media_duration(concat_video_only)
+        logger.info(
+            f"🎧 مدة التعليق الصوتي المرجعية: {audio_duration:.3f}s | "
+            f"🎞️ المدة الحقيقية للفيديو المُجمَّع: {real_video_duration:.3f}s | "
+            f"🩹 الحشو المطلوب (tpad clone): {pad_needed:.3f}s"
+        )
 
-    # الفرق الحقيقي المطلوب لحشو آخر إطار (clone) ليطابق الفيديو مدة الصوت.
-    pad_needed = max(0.0, audio_duration - real_video_duration)
+        unsubbed_video = temp_dir / "unsubbed_assembled.mp4"
+        logger.info(
+            "🎞️ [B] تطبيق tpad clone ودمج التعليق الصوتي (الصوت هو مرجع المدة)..."
+        )
 
-    logger.info(
-        f"🎧 مدة التعليق الصوتي المرجعية: {audio_duration:.3f}s | "
-        f"🎞️ المدة الحقيقية للفيديو المُجمَّع: {real_video_duration:.3f}s | "
-        f"🩹 الحشو المطلوب (tpad clone): {pad_needed:.3f}s"
-    )
+        tpad_filter = (
+            f"[0:v]tpad=stop_mode=clone:stop_duration={pad_needed:.3f}[vpad]"
+        )
 
-    unsubbed_video = temp_dir / "unsubbed_assembled.mp4"
-    logger.info("🎞️ [B] تطبيق tpad clone ودمج التعليق الصوتي (الصوت هو مرجع المدة)...")
+        cmd_concat = [
+            "ffmpeg", "-y", "-v", "error",
+            "-i", str(concat_video_only),
+            "-i", str(audio_file),
+            "-filter_complex", tpad_filter,
+            "-map", "[vpad]",
+            "-map", "1:a",
+            "-t", f"{audio_duration:.3f}",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "22",
+            "-pix_fmt", "yuv420p", "-r", str(fps),
+            "-c:a", "aac", "-b:a", "192k",
+            str(unsubbed_video),
+        ]
+        try:
+            subprocess.run(cmd_concat, check=True)
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(
+                f"فشل دمج الفيديو مع الصوت (stage=pad_and_mux): exit={e.returncode}"
+            ) from e
 
-    # ملاحظة: stop_duration=0 صالح في FFmpeg ولا يضيف أي إطار.
-    tpad_filter = (
-        f"[0:v]tpad=stop_mode=clone:stop_duration={pad_needed:.3f}[vpad]"
-    )
+        _validate_non_empty_file(unsubbed_video, "الفيديو الوسيط (بدون ترجمة)")
 
-    cmd_concat = [
-        "ffmpeg", "-y", "-v", "error",
-        "-i", str(concat_video_only),
-        "-i", str(audio_file),
-        "-filter_complex", tpad_filter,
-        "-map", "[vpad]",
-        "-map", "1:a",
-        "-t", f"{audio_duration:.3f}",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "22",
-        "-pix_fmt", "yuv420p", "-r", str(fps),
-        "-c:a", "aac", "-b:a", "192k",
-        str(unsubbed_video)
-    ]
-    subprocess.run(cmd_concat, check=True)
+        # ============================================================
+        # 3. توليد مسار whoosh موحد بطول audio_duration
+        # ============================================================
+        transition_times: List[float] = []
+        current_time = 0.0
+        for _, _, duration in validated_pairs[:-1]:
+            current_time += duration
+            transition_times.append(current_time)
 
-    # 4. توليد مسار whoosh موحد في الذاكرة.
-    logger.info("✨ حرق الترجمة الحركية الصفراء الباهتة وتطبيق مؤثرات الانتقال الصوتية...")
+        build_whoosh_timeline(
+            sfx_whoosh,
+            transition_times,
+            audio_duration,
+            whoosh_timeline,
+            whoosh_volume=0.4,
+        )
+        _validate_non_empty_file(whoosh_timeline, "مسار الـ whoosh الموحد")
 
-    # بناء انتقالات whoosh من العناصر المُتحققة فقط (وليس من timeline الكامل)
-    transition_times = []
-    current_time = 0.0
-    for _, _, duration in validated_pairs[:-1]:
-        current_time += duration
-        transition_times.append(current_time)
+        # ============================================================
+        # 4. دمج الترجمة وميكس الصوت داخل filter_complex موحد
+        #    الكتابة تكون إلى الملف المرحلي فقط.
+        # ============================================================
+        logger.info(
+            "✨ حرق الترجمة الحركية الصفراء الباهتة وتطبيق مؤثرات الانتقال الصوتية..."
+        )
 
-    # مسار الـ whoosh يُبنى بطول audio_duration ليطابق الفيديو النهائي تمامًا.
-    whoosh_timeline = output_video_path.parent / "whoosh_timeline.wav"
-    build_whoosh_timeline(
-        sfx_whoosh,
-        transition_times,
-        audio_duration,
-        whoosh_timeline,
-        whoosh_volume=0.4,
-    )
+        ass_escaped = (
+            subtitles_ass.resolve().as_posix().replace(":", "\\:")
+        )
 
-    # 5. دمج الترجمة وميكس الصوت داخل filter_complex واحد موحد.
-    ass_escaped = subtitles_ass.resolve().as_posix().replace(":", "\\:")
+        filter_complex = (
+            f"[0:v]ass='{ass_escaped}'[vout];"
+            f"[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=0:weights=1 1[aout]"
+        )
 
-    filter_complex = (
-        f"[0:v]ass='{ass_escaped}'[vout];"
-        f"[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=0:weights=1 1[aout]"
-    )
+        cmd_final = [
+            "ffmpeg", "-y", "-v", "info",
+            "-i", str(unsubbed_video),
+            "-i", str(whoosh_timeline),
+            "-filter_complex", filter_complex,
+            "-map", "[vout]",
+            "-map", "[aout]",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "22",
+            "-c:a", "aac", "-b:a", "192k",
+            str(staged_output_video),
+        ]
+        try:
+            subprocess.run(cmd_final, check=True)
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(
+                f"فشل التصدير النهائي (stage=final_mux): exit={e.returncode}"
+            ) from e
 
-    cmd_final = [
-        "ffmpeg", "-y", "-v", "info",
-        "-i", str(unsubbed_video),
-        "-i", str(whoosh_timeline),
-        "-filter_complex", filter_complex,
-        "-map", "[vout]",
-        "-map", "[aout]",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "22",
-        "-c:a", "aac", "-b:a", "192k",
-        str(output_video_path)
-    ]
+        # ============================================================
+        # [FIX 6] التحقق من الإخراج المرحلي قبل نقله إلى المسار النهائي
+        # ============================================================
+        _validate_non_empty_file(staged_output_video, "الفيديو النهائي المرحلي")
+        final_duration = _probe_media_duration(staged_output_video)
+        if final_duration <= 0:
+            raise RuntimeError(
+                f"مدة الفيديو النهائي المرحلي غير موجبة: {final_duration}"
+            )
 
-    subprocess.run(cmd_final, check=True)
+        # ============================================================
+        # [FIX 7] النقل الذري إلى المسار النهائي بعد نجاح كل التحققات.
+        # لا يتم لمس أي فيديو نهائي سابق إذا فشل أي شيء قبل هذه النقطة.
+        # ============================================================
+        try:
+            staged_output_video.replace(output_video_path)
+        except OSError as e:
+            raise RuntimeError(
+                f"تعذّر نقل الفيديو النهائي المرحلي إلى المسار النهائي: "
+                f"{staged_output_video} -> {output_video_path}"
+            ) from e
 
-    logger.info(
-        f"🏆 تم تصدير الفيديو النهائي بنجاح بأعلى دقة: {output_video_path} "
-        f"(المدة النهائية = {audio_duration:.3f}s)"
-    )
+        logger.info(
+            f"🏆 تم تصدير الفيديو النهائي بنجاح بأعلى دقة: {output_video_path} "
+            f"(المدة النهائية = {final_duration:.3f}s | مرجع الصوت = {audio_duration:.3f}s)"
+        )
+
+        success = True
+
+    finally:
+        # ============================================================
+        # [FIX 1] تنظيف المجلد المؤقت الفريد فقط
+        # ============================================================
+        try:
+            if temp_dir.exists() and temp_dir.is_dir():
+                shutil.rmtree(temp_dir, ignore_errors=True)
+        except Exception as cleanup_err:
+            logger.warning(
+                f"تعذّر تنظيف المجلد المؤقت {temp_dir}: {cleanup_err}"
+            )
+
+    if not success:
+        # لن نصل هنا إلا في حالة استثناء تم رفعه بالفعل من داخل try.
+        raise RuntimeError("فشلت الرندرة دون استثناء صريح (حالة غير متوقعة).")
