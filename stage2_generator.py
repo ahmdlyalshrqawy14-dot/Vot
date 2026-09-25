@@ -68,6 +68,10 @@ FLEXIBLE_GROUPS: Dict[str, Tuple[str, ...]] = {
         "element", "prop", "object", "surface", "environment",
         "landscape", "scene", "hologram", "joint", "knee", "vault",
         "statue", "room", "gym", "studio", "background", "visual element",
+        "library", "libraries", "archive", "archives", "manuscript",
+        "manuscripts", "theater", "theatre", "ancient city", "museum",
+        "museums", "classroom", "classrooms", "street", "streets",
+        "quiet room", "road", "roads", "shadow", "shadows",
     ),
     "emotion": (
         "determined", "confused", "tired", "hopeful", "worried", "calm",
@@ -119,12 +123,24 @@ CREATIVE_REVIEW_ACCEPT_THRESHOLD = 90   # score >= 90 -> auto-accept
 
 BATCH_SIZE = 24
 MAX_PROMPT_REPAIR_ATTEMPTS = 4
+MAX_BATCH_GENERATION_ATTEMPTS = 3
 
 
 # =========================================================
 # SYSTEM PROMPTS
 # =========================================================
 STAGE_2_SYSTEM_PROMPT = """You are an expert AI Art Director and Visual Storyboard Artist. Your task is to generate explicit IMAGE GENERATION COMMANDS for an educational YouTube video based on a sequential list of script sentences.
+
+=========================================
+CHANNEL IDENTITY (READ FIRST)
+=========================================
+This channel is about human behavior, psychology, philosophy, ethics, language, linguistics, literature, civilizations, the history of ideas, important books and references, human contradictions, willpower, courage, patience, fear, identity, meaning, and decision-making.
+
+This is NOT primarily a fitness channel. Do NOT default to gym scenes, workouts, muscle training, dieting, weight loss, body transformation, or sports imagery unless the sentence explicitly requires it.
+
+For psychology, philosophy, language, literature, and civilization topics, favor symbolic environments such as: libraries, archives, manuscripts, theaters, ancient cities, museums, classrooms, streets, quiet rooms, mirrors, maps, doors, bridges, shadows, clocks, masks, cages, roads, and abstract mental spaces.
+
+If a sentence mentions or depends on a named thinker, scholar, author, philosopher, researcher, historical figure, civilization, or book, preserve that conceptual reference through safe visual representation — a manuscript, archive, statue, library, theater, map, historical setting, or symbolic artifact. Never invent or render written quotations inside the image. Never require an exact portrait unless genuinely necessary.
 
 =========================================
 CORE PRINCIPLE: NARRATION ≠ LITERAL IMAGE
@@ -158,6 +174,13 @@ Literal (FORBIDDEN): a brain, a confused person holding their head, or a questio
 
 REQUIRED conceptual approach:
 The orange character standing between a nearby easy door leading to a dead end and a distant difficult door leading toward the real goal, with hesitant body language showing the conflict of choice.
+
+FORBIDDEN literal example:
+Narration: "Many philosophers questioned whether free will truly exists."
+Literal (FORBIDDEN): A philosopher character with a text bubble saying "free will?"
+
+REQUIRED conceptual approach:
+The orange character stands at a fork in an ancient stone road beneath a vast library facade, one path fading into shadow and the other into light, body language caught mid-step, symbolizing the unresolved question of free will.
 
 =========================================
 CHARACTER DNA (NEVER CHANGE)
@@ -258,6 +281,17 @@ Return the prompts separated ONLY by a single blank line. No quotation marks, no
 STAGE_2_ENRICHED_SYSTEM_PROMPT = """You are an expert AI Art Director, Visual Storyteller, and Storyboard Artist. Your task is to generate explicit IMAGE GENERATION COMMANDS for an educational YouTube video based on a sequential list of script sentences, each mapped to a scene from an existing scene plan and visual bible.
 
 =========================================
+CHANNEL IDENTITY (READ FIRST)
+=========================================
+This channel is about human behavior, psychology, philosophy, ethics, language, linguistics, literature, civilizations, the history of ideas, important books and references, human contradictions, willpower, courage, patience, fear, identity, meaning, and decision-making.
+
+This is NOT primarily a fitness channel. Do NOT default to gym scenes, workouts, muscle training, dieting, weight loss, body transformation, or sports imagery unless the sentence or scene context explicitly requires it.
+
+For psychology, philosophy, language, literature, and civilization topics, favor symbolic environments such as: libraries, archives, manuscripts, theaters, ancient cities, museums, classrooms, streets, quiet rooms, mirrors, maps, doors, bridges, shadows, clocks, masks, cages, roads, and abstract mental spaces.
+
+If a sentence mentions or depends on a named thinker, scholar, author, philosopher, researcher, historical figure, civilization, or book, preserve that conceptual reference through safe visual representation — a manuscript, archive, statue, library, theater, map, historical setting, or symbolic artifact. Never invent or render written quotations inside the image. Never require an exact portrait unless genuinely necessary.
+
+=========================================
 ABSOLUTE RULE: NARRATION ≠ LITERAL IMAGE
 =========================================
 NEVER translate a sentence into a literal illustration of its words.
@@ -293,6 +327,13 @@ Literal (FORBIDDEN): a brain, a confused person holding their head, or a questio
 
 Required approach:
 The orange character standing between a nearby easy door leading to a dead end and a distant difficult door leading toward the real goal, with hesitant body language showing the conflict of choice.
+
+Forbidden example:
+Narration: "Many philosophers questioned whether free will truly exists."
+Literal (FORBIDDEN): A philosopher character with a text bubble saying "free will?"
+
+Required approach:
+The orange character stands at a fork in an ancient stone road beneath a vast library facade, one path fading into shadow and the other into light, body language caught mid-step, symbolizing the unresolved question of free will.
 
 =========================================
 CHARACTER DNA (NEVER CHANGE)
@@ -441,6 +482,7 @@ IMPORTANT RULES FOR YOUR REVIEW
 - Judge whether the prompt is executable in Google Flow (self-contained, explicit, no contradictions).
 - Judge whether character identity and background constraints are preserved.
 - Judge camera, composition, lighting, and continuity between adjacent prompts.
+- The channel covers human behavior, psychology, philosophy, ethics, language, literature, civilizations, and the history of ideas — not primarily fitness. Do not penalize prompts for using non-fitness symbolic environments (libraries, archives, museums, theaters, ancient cities, manuscripts, mirrors, maps). Treat forced or unjustified gym/workout/fitness imagery on a clearly non-fitness topic as a MATERIAL defect: flag it in "issues" and factor it into the score.
 
 SCORING (TOTAL 100)
 ===================
@@ -943,6 +985,58 @@ def _validate_batch(batch_idx: int, expected_count: int, prompts: List[str]) -> 
         )
 
 
+def _validate_final_prompts(sentences: List[str], batches: List[List[str]]) -> None:
+    """
+    فحص نهائي شامل عبر كل الدفعات المدمجة (بعد الدمج بالترتيب الصحيح)، للتأكد من:
+      - القائمة النهائية list حقيقية.
+      - عدد البرومبتات النهائي = N بالضبط (N = عدد الجمل).
+      - كل برومبت نص غير فارغ.
+      - كل برومبت يبدأ بالبادئة الإلزامية.
+      - كل برومبت يحتوي فهرسه الصحيح المتسلسل (بدون فجوات أو تكرار،
+        لأن الفهارس هنا مبنية على ترتيب الدمج نفسه: 1..N).
+    هذا الفحص لا يعيد كتابة أي برومبت؛ فقط يرفع خطأ واضح عند وجود عطل حقيقي
+    (وهو خط دفاع أخير بعد الفحوص الداخلية لكل دفعة).
+    """
+    if not isinstance(batches, list):
+        raise ValueError(
+            "Final validation failure category: invalid_internal_structure — "
+            "merged batches result is not a list."
+        )
+
+    flat: List[str] = []
+    for b in batches:
+        if not isinstance(b, list):
+            raise ValueError(
+                "Final validation failure category: invalid_internal_structure — "
+                "a batch result is not a list."
+            )
+        flat.extend(b)
+
+    n = len(sentences)
+    if len(flat) != n:
+        raise ValueError(
+            "Final validation failure category: final_count_mismatch — "
+            f"got {len(flat)} prompts for {n} sentences."
+        )
+
+    for i, prompt in enumerate(flat, start=1):
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError(
+                "Final validation failure category: empty_or_invalid_prompt — "
+                f"prompt at image index {i} is empty or not a string."
+            )
+        if not prompt.startswith(MANDATORY_PREFIX):
+            raise ValueError(
+                "Final validation failure category: invalid_prompt_prefix — "
+                f"prompt at image index {i} does not start with the mandatory prefix."
+            )
+        if f'"{i}"' not in prompt:
+            raise ValueError(
+                "Final validation failure category: missing_or_wrong_index — "
+                f"prompt at image index {i} does not contain its correct in-image index."
+            )
+
+
 # =========================================================
 # PARTIAL REPAIR FOR INVALID PROMPTS ONLY
 # =========================================================
@@ -999,6 +1093,11 @@ def _build_repair_request(
     body += "- Conceptual / symbolic (NON-literal) visual idea\n"
     body += "- Clear character action / pose / body language\n"
     body += "- Symbolic environment or visual element placed ON/OVER the grey background\n"
+    body += (
+        "- Favor non-fitness symbolic environments (library, archive, manuscript, theater, "
+        "museum, mirror, map, door, bridge, abstract mental space) unless the sentence "
+        "explicitly requires fitness/gym imagery\n"
+    )
     body += "- Emotional state / expression\n"
     body += "- Camera angle / shot type\n"
     body += "- Composition\n"
@@ -1133,7 +1232,9 @@ def _repair_invalid_prompts(
 def _process_single_batch(batch_tuple: tuple) -> tuple:
     """
     معالجة دفعة واحدة:
-      1) توليد البرومبتات الأساسية.
+      1) توليد البرومبتات الأساسية (مع إعادة محاولة محدودة إذا فشل الاتصال
+         بالنموذج أو أعاد عدداً خاطئاً من البرومبتات — لا تُعاد محاولة أي
+         دفعة أخرى بسبب فشل هذه الدفعة).
       2) فحص الشروط الحاكمة الصارمة فقط.
       3) مراجعة إبداعية ذكية عبر AI على الدفعة كاملة (طلب واحد)
          مع تمرير الفهارس الحقيقية للبرومبتات الناجحة.
@@ -1153,10 +1254,12 @@ def _process_single_batch(batch_tuple: tuple) -> tuple:
         visual_bible,
         creative_brief,
         has_stage1_context,
+        episode_id,
     ) = batch_tuple
 
     logger.info(
-        f"🚀 بدء معالجة الدفعة [{batch_idx}] بالتوازي: الجمل من {start_idx} إلى {end_idx}"
+        f"🚀 بدء معالجة الدفعة [{batch_idx}] (episode_id={episode_id}) بالتوازي: "
+        f"الجمل من {start_idx} إلى {end_idx}"
     )
 
     # ---- بناء الـUser Prompt ----
@@ -1164,6 +1267,9 @@ def _process_single_batch(batch_tuple: tuple) -> tuple:
         system_instruction = STAGE_2_ENRICHED_SYSTEM_PROMPT
         user_prompt = f"""Generate exactly {len(batch_sentences)} explicit image generation commands.
 The index for this batch MUST start sequentially at {start_idx} and end at {end_idx}.
+
+CHANNEL IDENTITY REMINDER:
+This channel is about human behavior, psychology, philosophy, ethics, language, literature, civilizations, and the history of ideas — it is NOT primarily a fitness channel. Only use gym, workout, or sports imagery when the sentence or scene context explicitly calls for it; otherwise favor symbolic environments such as libraries, archives, manuscripts, theaters, museums, classrooms, streets, mirrors, maps, doors, bridges, and abstract mental spaces. If a named thinker, book, or civilization is referenced, represent it safely via manuscripts, archives, statues, or historical settings, without inventing written quotations.
 
 MANDATORY PREFIX FOR EVERY COMMAND:
 Every single command MUST start EXACTLY with the literal text:
@@ -1220,6 +1326,9 @@ SENTENCES AND THEIR SCENE CONTEXTS (the [N] is the correct image index to place 
         user_prompt = f"""Process the following sentences and generate exactly {len(batch_sentences)} explicit image generation commands.
 The index for this batch MUST start sequentially at {start_idx} and end at {end_idx}.
 
+CHANNEL IDENTITY REMINDER:
+This channel is about human behavior, psychology, philosophy, ethics, language, literature, civilizations, and the history of ideas — it is NOT primarily a fitness channel. Only use gym, workout, or sports imagery when a sentence explicitly calls for it; otherwise favor symbolic environments such as libraries, archives, manuscripts, theaters, museums, classrooms, streets, mirrors, maps, doors, bridges, and abstract mental spaces.
+
 MANDATORY PREFIX FOR EVERY COMMAND:
 Every single command MUST start EXACTLY with the literal text:
 "Create a 2D cel-shaded illustration showing ..."
@@ -1250,14 +1359,57 @@ Sentences (the [N] is the correct image index to place inside the in-image numbe
         for s_idx, sent in enumerate(batch_sentences, start=start_idx):
             user_prompt += f"[{s_idx}] {sent}\n"
 
-    raw_output = call_gemini_with_fallback(
-        system_instruction=system_instruction,
-        user_prompt=user_prompt,
-        response_mime_type="text/plain",
-    )
+    # ---- 0) توليد الدفعة مع إعادة محاولة محدودة (لا تؤثر على الدفعات الأخرى) ----
+    expected_count = len(batch_sentences)
+    prompts: Optional[List[str]] = None
+    last_generation_error: Optional[str] = None
+    generation_user_prompt = user_prompt
 
-    prompts = clean_and_parse_prompts(raw_output)
-    _validate_batch(batch_idx, len(batch_sentences), prompts)
+    for gen_attempt in range(1, MAX_BATCH_GENERATION_ATTEMPTS + 1):
+        try:
+            raw_output = call_gemini_with_fallback(
+                system_instruction=system_instruction,
+                user_prompt=generation_user_prompt,
+                response_mime_type="text/plain",
+            )
+        except Exception as exc:
+            last_generation_error = f"Gemini call failed: {exc}"
+            logger.warning(
+                f"⚠️ الدفعة [{batch_idx}] (episode_id={episode_id}) محاولة توليد "
+                f"{gen_attempt}/{MAX_BATCH_GENERATION_ATTEMPTS} فشلت أثناء الاتصال بالنموذج: {exc}"
+            )
+            continue
+
+        candidate_prompts = clean_and_parse_prompts(raw_output)
+
+        if len(candidate_prompts) == expected_count:
+            prompts = candidate_prompts
+            break
+
+        last_generation_error = (
+            f"expected {expected_count} prompts (indices {start_idx}-{end_idx}), "
+            f"got {len(candidate_prompts)}"
+        )
+        logger.warning(
+            f"⚠️ الدفعة [{batch_idx}] محاولة توليد {gen_attempt}/{MAX_BATCH_GENERATION_ATTEMPTS}: "
+            f"{last_generation_error}. سيُعاد توليد نفس الدفعة فقط (بدون التأثير على الدفعات الأخرى)."
+        )
+        generation_user_prompt = (
+            user_prompt
+            + "\n\nCOUNT CORRECTION (previous attempt failed): your previous response "
+              f"returned {len(candidate_prompts)} prompt(s), but exactly {expected_count} "
+              f"prompts are required for image indices {start_idx} to {end_idx} inclusive — "
+              "one prompt per sentence, in order. Return exactly that many prompts, no more "
+              "and no fewer, separated only by a single blank line."
+        )
+
+    if prompts is None:
+        raise ValueError(
+            f"Batch [{batch_idx}] (episode_id={episode_id}, sentence range {start_idx}-{end_idx}) "
+            f"failed to produce the correct prompt count after {MAX_BATCH_GENERATION_ATTEMPTS} "
+            f"generation attempts. Expected {expected_count} prompts. "
+            f"Last error / validation failure category 'wrong_prompt_count': {last_generation_error}"
+        )
 
     # ---- 1) فحص الشروط الحاكمة الصارمة ----
     valid_prompts: Dict[int, str] = {}
@@ -1429,24 +1581,51 @@ def generate_stage2_prompts_batches(
     كل خيط يحصل تلقائياً على مفتاح مختلف من مصفوفة المفاتيح.
 
     كل دفعة:
-    - تُولَّد.
+    - تُولَّد (مع إعادة محاولة محدودة عند فشل الاتصال أو عدد خاطئ من البرومبتات،
+      دون التأثير على الدفعات الأخرى).
     - تُفحص بالشروط الحاكمة الصارمة.
     - تُراجع إبداعياً بواسطة AI على دفعة كاملة (طلب واحد) مع فهارس حقيقية.
     - تُصنَّف إلى صحيحة ومخالفة (فشل hard OR score < 80 OR decision=repair).
     - تُصلَح المخالفة فقط في طلبات مستقلة (حتى MAX_PROMPT_REPAIR_ATTEMPTS).
     - لا تُرجَع إلا بعد نجاح كل برومبت في الشروط الحاكمة.
 
-    أي دفعة يفشل إصلاحها بالكامل تُرفع كـValueError ولا تُحفظ.
+    full_script_sentences (الممرّرة هنا كـ sentences) هي المصدر الوحيد المعتمد
+    لعدد وترتيب الجمل. لا يُعاد تقسيمها أو دمجها أو إعادة ترتيبها هنا.
+
+    أي دفعة يفشل توليدها أو إصلاحها بالكامل تُرفع كـValueError ولا تُحفظ.
     """
+    # ---- التحقق من صحة المدخل الأساسي (قبل أي معالجة) ----
+    if not isinstance(sentences, list) or len(sentences) == 0:
+        raise ValueError(
+            "Validation failure category: empty_sentence_list — "
+            "Stage 2 received an empty or invalid full_script_sentences list."
+        )
+
+    for i, s in enumerate(sentences, start=1):
+        if not isinstance(s, str) or not s.strip():
+            raise ValueError(
+                "Validation failure category: invalid_sentence_input — "
+                f"sentence at position {i} is not a non-empty string."
+            )
+
     total_sentences = len(sentences)
+
+    if total_sentences > 80:
+        raise ValueError(
+            "Validation failure category: hard_maximum_exceeded — "
+            f"Stage 2 received {total_sentences} sentences, but the absolute maximum is 80. "
+            "No image prompts were generated."
+        )
 
     # استخراج السياق من المرحلة الأولى (اختياري)
     scene_plan: Optional[Union[List[Dict[str, Any]], Dict[str, Any]]] = None
     visual_bible: Optional[Dict[str, Any]] = None
     creative_brief: Optional[Any] = None
     has_stage1_context = False
+    episode_id: Optional[Any] = None
 
     if isinstance(stage1_result, dict):
+        episode_id = stage1_result.get("episode_id") or stage1_result.get("id")
         candidate_plan = stage1_result.get("scene_plan")
         candidate_bible = stage1_result.get("visual_bible")
         candidate_brief = stage1_result.get("creative_brief")
@@ -1458,7 +1637,7 @@ def generate_stage2_prompts_batches(
 
     if not has_stage1_context:
         logger.info(
-            "ℹ️ لا يوجد scene_plan / visual_bible / creative_brief — "
+            f"ℹ️ (episode_id={episode_id}) لا يوجد scene_plan / visual_bible / creative_brief — "
             "سيتم استخدام السلوك القديم (fallback)."
         )
 
@@ -1484,11 +1663,13 @@ def generate_stage2_prompts_batches(
                 visual_bible,
                 creative_brief,
                 has_stage1_context,
+                episode_id,
             )
         )
 
     logger.info(
-        f"⚡ تشغيل {len(batch_tasks)} دفعات بالتوازي عبر مفاتيح مختلفة في نفس اللحظة..."
+        f"⚡ (episode_id={episode_id}) تشغيل {len(batch_tasks)} دفعات بالتوازي "
+        f"لإجمالي {total_sentences} جملة عبر مفاتيح مختلفة في نفس اللحظة..."
     )
 
     completed_results: Dict[int, List[str]] = {}
@@ -1515,8 +1696,12 @@ def generate_stage2_prompts_batches(
     total_generated = sum(len(b) for b in sorted_batches)
     if total_generated != total_sentences:
         raise ValueError(
-            f"Total prompts generated ({total_generated}) "
-            f"does not match total sentences ({total_sentences})."
+            "Validation failure category: final_count_mismatch — "
+            f"total prompts generated ({total_generated}) does not match "
+            f"total sentences ({total_sentences})."
         )
+
+    # ---- فحص نهائي شامل عبر كل الدفعات المدمجة ----
+    _validate_final_prompts(sentences, sorted_batches)
 
     return sorted_batches
