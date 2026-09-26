@@ -367,6 +367,44 @@ def get_episode(target_id=None):
         if ep.get("status") == "pending":
             return ep
     return episodes[0]
+    
+
+def mark_episode_completed(episode_id):
+    """
+    يحدّث حالة الحلقة في episodes.json من pending إلى completed.
+    يرجع True لو تم التحديث بنجاح، False لو فشل.
+    """
+    if not EPISODES_FILE.exists():
+        logger.warning("episodes.json غير موجود، تعذّر تحديث الحالة")
+        return False
+
+    try:
+        with open(EPISODES_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        episodes = data if isinstance(data, list) else data.get("episodes", [])
+        updated = False
+
+        for ep in episodes:
+            if str(ep.get("id")) == str(episode_id):
+                if ep.get("status") != "completed":
+                    ep["status"] = "completed"
+                    updated = True
+                break
+
+        if not updated:
+            logger.warning(f"لم يتم العثور على الحلقة {episode_id} لتحديث حالتها")
+            return False
+
+        with open(EPISODES_FILE, "w", encoding="utf-8") as f:
+            json.dump(episodes, f, ensure_ascii=False, indent=2)
+
+        logger.info(f"✅ تم تحديث حالة الحلقة {episode_id} إلى completed")
+        return True
+
+    except Exception as e:
+        logger.error(f"فشل تحديث حالة الحلقة {episode_id}: {e}")
+        return False
 
 
 def _format_missing_indices(missing, limit=15):
