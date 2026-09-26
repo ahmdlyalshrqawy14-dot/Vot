@@ -10,6 +10,69 @@ logger = logging.getLogger("Stage4Subtitles")
 
 
 # ===========================================================================
+# توحيد حساب وقفة الحدود مع stage3_audio._compute_boundary_gap_ms
+# ===========================================================================
+
+_MAX_MERGE_GAP_MS = 1500
+
+_BOUNDARY_GAP_CAPS = {
+    "hook": 400,
+    "setup": 500,
+    "question": 500,
+    "myth": 400,
+    "contradiction": 550,
+    "explanation": 400,
+    "analogy": 400,
+    "transition": 500,
+    "tension": 550,
+    "revelation": 700,
+    "payoff": 450,
+    "actionable": 450,
+    "reflection": 700,
+    "cta": 400,
+}
+
+
+def _clamp_ms(value, lo, hi, default=0):
+    try:
+        v = int(round(float(value)))
+    except Exception:
+        return default
+    return max(lo, min(hi, v))
+
+
+def _compute_boundary_gap_ms(prev_meta, curr_meta):
+    """
+    نفس منطق stage3_audio._compute_boundary_gap_ms بالضبط.
+    بيرجع الوقفة بالميلي ثانية بين مقطعين.
+    """
+    try:
+        prev_after = int(prev_meta.get("pause_after_ms", 0) or 0)
+    except (TypeError, ValueError):
+        prev_after = 0
+    try:
+        curr_before = int(curr_meta.get("pause_before_ms", 0) or 0)
+    except (TypeError, ValueError):
+        curr_before = 0
+
+    role = str(curr_meta.get("narrative_role", "") or "")
+    cap = _BOUNDARY_GAP_CAPS.get(role, 400)
+
+    if role in ("revelation", "reflection"):
+        gap = int((prev_after + curr_before) * 0.6)
+    elif role in ("tension", "contradiction"):
+        gap = int(prev_after * 0.7 + curr_before * 0.7)
+    elif role in ("transition", "setup"):
+        gap = max(prev_after, curr_before) + 40
+    elif role in ("payoff", "actionable"):
+        gap = int((prev_after + curr_before) * 0.6)
+    else:
+        gap = max(prev_after, curr_before)
+
+    return _clamp_ms(gap, 0, min(cap, _MAX_MERGE_GAP_MS), 0)
+
+
+# ===========================================================================
 # Whisper model (lazy singleton - loaded once, reused for all clips/files)
 # ===========================================================================
 
@@ -582,18 +645,13 @@ def _try_use_clips(
         )
         sentence_word_timings[s_idx] = aligned
 
-        # حساب الفجوة بين هذا المقطع والمقطع التالي.
-        # نأخذ الأكبر بين pause_after للمقطع الحالي و pause_before للمقطع التالي
-        # لتجنّب حساب نفس الوقفة مرتين.
-        next_pb = 0.0
+        # حساب الفجوة بنفس منطق stage3_audio (توحيد التوقيت مع الصوت الفعلي)
         if pos + 1 < len(ordered):
-            try:
-                next_pb = float(
-                    ordered[pos + 1].get("pause_before_ms", 0)
-                ) / 1000.0
-            except Exception:
-                next_pb = 0.0
-        gap = max(pause_after, next_pb, 0.0)
+            gap_ms = _compute_boundary_gap_ms(clip_meta, ordered[pos + 1])
+            gap = max(gap_ms / 1000.0, 0.0)
+        else:
+            # آخر مقطع: نضيف pause_after فقط (زي stage3)
+            gap = max(pause_after, 0.0)
         cursor = clip_end + gap
 
     if cursor > audio_duration + 0.5:
