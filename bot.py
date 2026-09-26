@@ -55,6 +55,9 @@ EPISODES_FILE = BASE_DIR / "episodes.json"
 OUTPUTS_DIR = BASE_DIR / "outputs"
 OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 
+# ✅ قفل لحماية القراءة/الكتابة على episodes.json من التضارب
+_EPISODES_LOCK = asyncio.Lock()
+
 # -----------------------------------------------------------------
 # ثوابت
 # -----------------------------------------------------------------
@@ -366,45 +369,56 @@ def get_episode(target_id=None):
     for ep in episodes:
         if ep.get("status") == "pending":
             return ep
-    return episodes[0]
+    # ✅ لا توجد حلقات pending — نرجع None بدل episodes[0]
+    return None
     
 
-def mark_episode_completed(episode_id):
+async def mark_episode_completed(episode_id):
     """
     يحدّث حالة الحلقة في episodes.json من pending إلى completed.
     يرجع True لو تم التحديث بنجاح، False لو فشل.
+    محمي بقفل لمنع التضارب بين الجلسات المتزامنة.
     """
-    if not EPISODES_FILE.exists():
-        logger.warning("episodes.json غير موجود، تعذّر تحديث الحالة")
-        return False
-
-    try:
-        with open(EPISODES_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        episodes = data if isinstance(data, list) else data.get("episodes", [])
-        updated = False
-
-        for ep in episodes:
-            if str(ep.get("id")) == str(episode_id):
-                if ep.get("status") != "completed":
-                    ep["status"] = "completed"
-                    updated = True
-                break
-
-        if not updated:
-            logger.warning(f"لم يتم العثور على الحلقة {episode_id} لتحديث حالتها")
+    async with _EPISODES_LOCK:
+        if not EPISODES_FILE.exists():
+            logger.warning("episodes.json غير موجود، تعذّر تحديث الحالة")
             return False
 
-        with open(EPISODES_FILE, "w", encoding="utf-8") as f:
-            json.dump(episodes, f, ensure_ascii=False, indent=2)
+        try:
+            def _do_update():
+                with open(EPISODES_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
 
-        logger.info(f"✅ تم تحديث حالة الحلقة {episode_id} إلى completed")
-        return True
+                episodes = data if isinstance(data, list) else data.get("episodes", [])
+                updated = False
 
-    except Exception as e:
-        logger.error(f"فشل تحديث حالة الحلقة {episode_id}: {e}")
-        return False
+                for ep in episodes:
+                    if str(ep.get("id")) == str(episode_id):
+                        if ep.get("status") != "completed":
+                            ep["status"] = "completed"
+                            updated = True
+                        break
+
+                if not updated:
+                    return False
+
+                with open(EPISODES_FILE, "w", encoding="utf-8") as f:
+                    json.dump(episodes, f, ensure_ascii=False, indent=2)
+
+                return True
+
+            result = await asyncio.to_thread(_do_update)
+
+            if result:
+                logger.info(f"✅ تم تحديث حالة الحلقة {episode_id} إلى completed")
+            else:
+                logger.warning(f"لم يتم العثور على الحلقة {episode_id} لتحديث حالتها")
+
+            return result
+
+        except Exception as e:
+            logger.error(f"فشل تحديث حالة الحلقة {episode_id}: {e}")
+            return False
 
 
 def _format_missing_indices(missing, limit=15):
@@ -2646,6 +2660,26 @@ async def run_final_render(msg_obj, context):
             parse_mode=ParseMode.HTML,
         )
 
+        # ✅ تحديث حالة الحلقة إلى completed عشان المرة الجاية
+        #    get_episode(target_id=None) ترجع الحلقة اللي بعدها
+        try:
+            updated = await mark_episode_completed(ep_id)
+            if updated:
+                logger.info(f"✅ تم تعليم الحلقة {ep_id} كمكتملة في episodes.json")
+            else:
+                logger.warning(f"⚠️ mark_episode_completed رجعت False للحلقة {ep_id}")
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        "⚠️ <b>تنبيه:</b> تم إنتاج الفيديو بنجاح، لكن فشل تحديث حالة الحلقة "
+                        f"<code>#{_esc(ep_id)}</code> إلى <code>completed</code> في <code>episodes.json</code>.\n"
+                        "لازم تحدّثها يدوياً قبل ما تشغّل الحلقة التالية، وإلا هترجع نفس الحلقة."
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+        except Exception as e:
+            logger.exception(f"خطأ غير متوقع في mark_episode_completed للحلقة {ep_id}: {e}")
+
     except asyncio.CancelledError:
         raise
     except Exception as e:
@@ -2655,9 +2689,15 @@ async def run_final_render(msg_obj, context):
             chat_id=chat_id, text=f"⚠️ تعذر استخراج ميتاداتا النشر: {_esc(str(e))}"
         )
 
+    # ✅ إعادة ضبط الجلسة بعد اكتمال دورة الإنتاج بنجاح
+    try:
+        if not _is_stale(chat_id, session):
+            session["cancelled"] = True
+            user_sessions[chat_id] = _fresh_session()
+            logger.info(f"♻️ تم إعادة ضبط الجلسة للمستخدم {chat_id} بعد اكتمال الحلقة {ep_id}")
+    except Exception as e:
+        logger.warning(f"تعذّر إعادة ضبط الجلسة للمستخدم {chat_id}: {e}")
 
-# تحديث حالة الحلقة إلى completed
-        mark_episode_completed(ep_id)
 
 # =================================================================
 # 11. نقطة التشغيل
