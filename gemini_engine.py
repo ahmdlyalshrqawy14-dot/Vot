@@ -2,7 +2,7 @@ import base64
 import logging
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 import requests
 
@@ -17,11 +17,12 @@ logger = logging.getLogger("GeminiEngine")
 
 
 FAST_TIMEOUT = 25
-COOLDOWN_DURATION = 300
+COOLDOWN_DURATION = 20
 
 _lock = threading.Lock()
 _request_counter = 0
 _model_cooldown: Dict[str, float] = {}
+_dead_models: Set[str] = set()
 _fastest_model: Optional[str] = None
 
 
@@ -75,22 +76,35 @@ def _get_next_key_index(total_keys: int) -> int:
         return index
 
 
+def _mark_dead_model(raw_model: str) -> None:
+    """Permanently drop non-existent models (404) across all keys."""
+    global _fastest_model
+    with _lock:
+        _dead_models.add(raw_model)
+        if _fastest_model == raw_model:
+            _fastest_model = None
+
+
 def _get_active_models() -> List[str]:
-    """Return models in configured order, preferring the last successful model."""
+    """Return valid models in configured order, ignoring dead ones and respecting cooldown."""
     global _fastest_model
     configured = _get_configured_models()
     now = time.time()
 
     with _lock:
+        available = [model for model in configured if model not in _dead_models]
+        if not available:
+            available = list(configured)
+
         active = [
             model
-            for model in configured
+            for model in available
             if now >= _model_cooldown.get(model, 0)
         ]
 
         # If every configured model is cooling down, do not deadlock the engine.
         if not active:
-            active = list(configured)
+            active = list(available)
 
         if _fastest_model and _fastest_model in active:
             active.remove(_fastest_model)
@@ -192,6 +206,9 @@ def _execute_fallback(payload: Dict[str, Any], operation: str) -> str:
         models_pool = _get_active_models()
 
         for raw_model in models_pool:
+            if raw_model in _dead_models:
+                continue
+
             model_id = _format_model_name(raw_model)
             url = (
                 "https://generativelanguage.googleapis.com/v1beta/models/"
@@ -251,6 +268,7 @@ def _execute_fallback(payload: Dict[str, Any], operation: str) -> str:
                 break
 
             if status == 404:
+                _mark_dead_model(raw_model)
                 _log_attempt(key_index, masked_key, model_id, status, "model_not_found")
                 failures.append("model_not_found")
                 continue
@@ -258,6 +276,7 @@ def _execute_fallback(payload: Dict[str, Any], operation: str) -> str:
             if status == 429:
                 _log_attempt(key_index, masked_key, model_id, status, "rate_limited")
                 failures.append("rate_limited")
+                time.sleep(1.0)
                 continue
 
             if status == 400:
@@ -269,11 +288,13 @@ def _execute_fallback(payload: Dict[str, Any], operation: str) -> str:
                 _log_attempt(key_index, masked_key, model_id, status, "unavailable")
                 failures.append("unavailable")
                 _apply_model_cooldown(raw_model)
+                time.sleep(1.5)
                 continue
 
             if status in (500, 502, 504):
                 _log_attempt(key_index, masked_key, model_id, status, "server_error")
                 failures.append("server_error")
+                time.sleep(1.0)
                 continue
 
             _log_attempt(key_index, masked_key, model_id, status, "unknown_status")
