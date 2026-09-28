@@ -23,8 +23,8 @@ logger = logging.getLogger("GeminiEngine")
 # ---------------------------------------------------------------------------
 
 CONNECT_TIMEOUT = 5            # ثواني للاتصال
-READ_TIMEOUT = 25              # ثواني لانتظار الرد
-TOTAL_DEADLINE = 40            # سقف زمني كلي للطلب الواحد
+READ_TIMEOUT = 60              # ثواني لانتظار الرد
+TOTAL_DEADLINE = 90            # سقف زمني كلي للطلب الواحد
 MAX_ATTEMPTS = 8               # أقصى عدد محاولات للطلب الواحد
 MIN_ATTEMPT_TIME = 3           # لو الوقت المتبقي أقل من كده مفيش محاولة جديدة
 MAX_WAIT_FOR_RECOVERY = 3.0    # أقصى انتظار لزوج/مفتاح قرب يفوق
