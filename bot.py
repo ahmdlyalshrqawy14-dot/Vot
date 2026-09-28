@@ -264,10 +264,14 @@ def _save_script_version(ep_id, version: int, sentences: list[str]) -> Path:
 
 
 def _chunk_script_lines(sentences: list[str]) -> list[str]:
-    """يقسّم السكريبت إلى أجزاء بحيث لا يتجاوز كل جزء SCRIPT_SEND_CHUNK حرفاً."""
+    """
+    يقسّم السكريبت إلى أجزاء بحيث لا يتجاوز كل جزء SCRIPT_SEND_CHUNK حرفاً.
+    ✅ كل جملة في سطر مستقل، بدون أي ترقيم — تنسيق نظيف للقراءة والمراجعة.
+    ✅ إن كان السكريبت كاملاً يستوعبه جزء واحد، يُعاد كجزء واحد (رسالة واحدة).
+    """
     chunks, buf, buf_len = [], [], 0
-    for i, s in enumerate(sentences, 1):
-        line = f"{i}. {s}"
+    for s in sentences:
+        line = s  # بدون ترقيم
         if buf and buf_len + len(line) + 1 > SCRIPT_SEND_CHUNK:
             chunks.append("\n".join(buf))
             buf, buf_len = [line], len(line)
@@ -281,7 +285,15 @@ def _chunk_script_lines(sentences: list[str]) -> list[str]:
 
 async def _send_full_script_for_review(context, chat_id, ep_id, episode,
                                         sentences, version: int):
-    """يرسل السكريبت الكامل (نصاً على أجزاء + ملف .txt) مع أزرار المراجعة."""
+    """
+    يرسل السكريبت الكامل للمراجعة:
+      1) رسالة رأس (الموضوع + عدد الجمل).
+      2) ملف .txt واحد — كل جملة بسطر (الطريقة المُفضّلة للتحرير وإعادة الإرسال).
+      3) نسخة نصية داخل الشات للمراجعة السريعة:
+         - إن استوعبتها رسالة واحدة، تُرسل رسالة واحدة.
+         - وإلا تُقسَّم على أجزاء، مع بقاء كل جملة في سطرها.
+      4) لوحة أزرار الاعتماد / الاستبدال / إعادة التوليد / الإلغاء.
+    """
     total = len(sentences)
 
     await context.bot.send_message(
@@ -297,19 +309,9 @@ async def _send_full_script_for_review(context, chat_id, ep_id, episode,
         parse_mode=ParseMode.HTML,
     )
 
-    chunks = _chunk_script_lines(sentences)
-    n_chunks = len(chunks)
-    for i, ch in enumerate(chunks, 1):
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                f"<b>[الجزء {i} من {n_chunks}]</b>\n"
-                f"<pre>{html.escape(ch)}</pre>"
-            ),
-            parse_mode=ParseMode.HTML,
-        )
-
-    # ملف نصي جاهز للتعديل
+    # -------------------------------------------------------------
+    # (2) ملف .txt واحد — الطريقة المُفضّلة (كل جملة بسطر)
+    # -------------------------------------------------------------
     txt_path = OUTPUTS_DIR / f"script_draft_v{version}_episode_{ep_id}.txt"
     txt_path.write_text("\n".join(sentences), encoding="utf-8")
     with open(txt_path, "rb") as fp:
@@ -317,10 +319,40 @@ async def _send_full_script_for_review(context, chat_id, ep_id, episode,
             chat_id=chat_id,
             document=fp,
             filename=f"script_draft_v{version}.txt",
-            caption=f"📄 <b>نسخة قابلة للتعديل — v{version}</b>",
+            caption=(
+                f"📄 <b>النسخة الكاملة القابلة للتحرير — v{version}</b>\n"
+                f"<i>كل جملة في سطر مستقل. عدّل ثم أعد إرسال النص للاستبدال.</i>"
+            ),
             parse_mode=ParseMode.HTML,
         )
 
+    # -------------------------------------------------------------
+    # (3) نسخة نصية داخل الشات — كل جملة بسطر، وبدون ترقيم
+    # -------------------------------------------------------------
+    chunks = _chunk_script_lines(sentences)
+    n_chunks = len(chunks)
+
+    if n_chunks == 1:
+        # ✅ كل السكريبت استوعبته رسالة واحدة — هذا هو الشكل المُفضّل
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"<pre>{html.escape(chunks[0])}</pre>",
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        for i, ch in enumerate(chunks, 1):
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"<b>[الجزء {i} من {n_chunks}]</b>\n"
+                    f"<pre>{html.escape(ch)}</pre>"
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+
+    # -------------------------------------------------------------
+    # (4) لوحة الأزرار
+    # -------------------------------------------------------------
     keyboard = [
         [InlineKeyboardButton(
             "✅ اعتماد السكريبت والانتقال للمرحلة الثانية",
@@ -1488,24 +1520,30 @@ async def run_stage2_after_approval(query, context):
             pass
         return
 
-    # ✅ نستخدم approved_script إن وُجد — وهو المصدر الوحيد المعتمد
-    sentences = list(session.get("approved_script") or [])
-    if not sentences:
-        sentences = _as_list(stage1_res.get("full_script_sentences"))
-    if not sentences:
-        sentences = session.get("sentences") or []
-
-    if not sentences:
+    # ⛔ المصدر الوحيد المعتمد هو approved_script — لا fallback إطلاقاً
+    #    أي استعمال لـ stage1_result أو session["sentences"] هنا يعتبر خرقاً
+    #    لقاعدة الاعتماد الصريح، ويمنع البوت من إنتاج صوت/صور على سكريبت غير مُعتمد.
+    approved = session.get("approved_script")
+    if not isinstance(approved, list) or not approved:
+        logger.warning(
+            f"⛔ رفض تشغيل المرحلة الثانية للحلقة {ep_id}: "
+            f"لا يوجد approved_script صالح في الجلسة "
+            f"(episode_status={session.get('episode_status')})."
+        )
         try:
             await query.edit_message_text(
-                "❌ <b>لا توجد جمل صالحة لتشغيل المرحلة الثانية.</b>\n"
-                "الرجاء إعادة توليد المرحلة الأولى.",
+                "⛔ <b>لا يمكن بدء المرحلة الثانية بدون سكريبت معتمد.</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "لم يتم العثور على <code>approved_script</code> في الجلسة.\n"
+                "اعتمد السكريبت صراحةً عبر زر <b>✅ اعتماد السكريبت</b>، "
+                "أو أعد توليد المرحلة الأولى عبر /start.",
                 parse_mode=ParseMode.HTML,
             )
         except Exception:
             pass
         return
 
+    sentences = list(approved)
     session["sentences"] = sentences
     session["stage1_approved"] = True
 
@@ -3055,7 +3093,7 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_media_upload))
 
     print("=" * 60)
-    print("🚀 محرك Vot Studio Pro يعمل الآن — Human Script Review + Full-Script Fallback + Complete-Render-Only")
+    print("🚀 محرك Vot Studio Pro يعمل الآن — Human Script Review + Single-File Script + Complete-Render-Only")
     print("=" * 60)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
