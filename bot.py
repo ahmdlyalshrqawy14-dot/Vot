@@ -64,6 +64,7 @@ _EPISODES_LOCK = asyncio.Lock()
 SENTENCE_MIN = 60
 SENTENCE_MAX = 80
 DEFAULT_VOICE = "en-US-BrianMultilingualNeural"
+SCRIPT_SEND_CHUNK = 3500  # حد آمن داخل <pre> لرسائل تيليجرام
 
 # نمط مجلدات المونتاج المؤقتة التي ينشئها stage4_composer.py
 _COMPOSER_TEMP_DIR_RE = re.compile(r"^temp_segments_[0-9a-fA-F\-]+$")
@@ -95,6 +96,17 @@ def _fresh_session():
         "stage1_approved": False,
         "stage1_plan_message_id": None,
         "awaiting_script_edit": False,
+
+        # =============================================================
+        # نظام مراجعة السكريبت البشري (قبل الصوت)
+        # =============================================================
+        "episode_status": None,      # generating_script | awaiting_script_review
+                                     # script_approved | processing_audio | completed
+        "script_version": 0,         # يبدأ من 0، يصبح 1 بعد التوليد الأول
+        "script_versions": [],       # [{"version":1,"sentences":[...],"path":"..."}]
+        "approved_script": None,     # list[str] — لا يتغير بعد الاعتماد
+        "awaiting_script_replace": False,
+
         "manual_map": {},                 # {int(slot): Path}  نهائي حتى يقوم المستخدم بإعادة التعيين
         "manual_queue": [],               # [Path, ...]
         "manual_missing": [],             # [int, ...]
@@ -240,6 +252,107 @@ def _save_normalized_sentences(ep_id, session, normalized: list[str]) -> None:
         logger.error(f"فشل حفظ stage1_episode_{ep_id}.json بعد التعديل اليدوي: {e}")
 
 
+def _save_script_version(ep_id, version: int, sentences: list[str]) -> Path:
+    """يحفظ نسخة السكريبت على القرص: script_v{n}_episode_{id}.json"""
+    p = OUTPUTS_DIR / f"script_v{version}_episode_{ep_id}.json"
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(
+            {"version": version, "sentences": list(sentences)},
+            f, ensure_ascii=False, indent=2,
+        )
+    return p
+
+
+def _chunk_script_lines(sentences: list[str]) -> list[str]:
+    """يقسّم السكريبت إلى أجزاء بحيث لا يتجاوز كل جزء SCRIPT_SEND_CHUNK حرفاً."""
+    chunks, buf, buf_len = [], [], 0
+    for i, s in enumerate(sentences, 1):
+        line = f"{i}. {s}"
+        if buf and buf_len + len(line) + 1 > SCRIPT_SEND_CHUNK:
+            chunks.append("\n".join(buf))
+            buf, buf_len = [line], len(line)
+        else:
+            buf.append(line)
+            buf_len += len(line) + 1
+    if buf:
+        chunks.append("\n".join(buf))
+    return chunks
+
+
+async def _send_full_script_for_review(context, chat_id, ep_id, episode,
+                                        sentences, version: int):
+    """يرسل السكريبت الكامل (نصاً على أجزاء + ملف .txt) مع أزرار المراجعة."""
+    total = len(sentences)
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"📜 <b>السكريبت الكامل — الإصدار v{version}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📌 <b>الموضوع:</b> {_esc(episode.get('topic')) if isinstance(episode, dict) else '—'}\n"
+            f"🧩 <b>عدد الجمل:</b> <code>{total}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"<i>راجع النص بالكامل، ثم اختر من الأزرار في نهاية الرسائل.</i>"
+        ),
+        parse_mode=ParseMode.HTML,
+    )
+
+    chunks = _chunk_script_lines(sentences)
+    n_chunks = len(chunks)
+    for i, ch in enumerate(chunks, 1):
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"<b>[الجزء {i} من {n_chunks}]</b>\n"
+                f"<pre>{html.escape(ch)}</pre>"
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+
+    # ملف نصي جاهز للتعديل
+    txt_path = OUTPUTS_DIR / f"script_draft_v{version}_episode_{ep_id}.txt"
+    txt_path.write_text("\n".join(sentences), encoding="utf-8")
+    with open(txt_path, "rb") as fp:
+        await context.bot.send_document(
+            chat_id=chat_id,
+            document=fp,
+            filename=f"script_draft_v{version}.txt",
+            caption=f"📄 <b>نسخة قابلة للتعديل — v{version}</b>",
+            parse_mode=ParseMode.HTML,
+        )
+
+    keyboard = [
+        [InlineKeyboardButton(
+            "✅ اعتماد السكريبت والانتقال للمرحلة الثانية",
+            callback_data=f"approve_stage1_{ep_id}",
+        )],
+        [InlineKeyboardButton(
+            "📥 إرسال نسخة جديدة كاملة (استبدال)",
+            callback_data=f"script_review_replace_{ep_id}",
+        )],
+        [InlineKeyboardButton(
+            "🔄 إعادة توليد من الصفر",
+            callback_data=f"regenerate_stage1_{ep_id}",
+        )],
+        [InlineKeyboardButton("❌ إلغاء والعودة", callback_data="btn_back_main")],
+    ]
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            "👇 <b>ماذا تريد أن تفعل؟</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "• <b>اعتماد</b>: يبدأ تقسيم الجمل ← الصور ← الصوت.\n"
+            f"• <b>نسخة جديدة</b>: أرسل السكريبت كاملاً بعد التعديل "
+            f"({SENTENCE_MIN}–{SENTENCE_MAX} جملة).\n"
+            "• <b>إعادة توليد</b>: يبدأ من الصفر (يفقد النسخة الحالية).\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "<i>⚠️ لن يبدأ أي شيء متعلق بالصوت قبل اعتمادك الصريح.</i>"
+        ),
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode=ParseMode.HTML,
+    )
+
+
 def _build_stage1_summary(ep_id, episode, stage1_res) -> str:
     """يبني رسالة ملخص المرحلة الأولى (HTML Safe)."""
     if not isinstance(stage1_res, dict):
@@ -290,7 +403,7 @@ def _build_stage1_summary(ep_id, episode, stage1_res) -> str:
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
         f"<b>✅ تقرير الجودة:</b> معتمد = {approved_tag}",
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        "هل تود اعتماد هذه الخطة والانتقال إلى <b>المرحلة الثانية</b>؟",
+        "👇 <i>سيتم إرسال السكريبت الكامل للمراجعة في الرسائل التالية.</i>",
     ]
     return "\n".join(lines)
 
@@ -554,6 +667,49 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 run_stage1_only(query, context, ep)
             )
 
+    # =============================================================
+    # نظام مراجعة السكريبت — استبدال بنسخة جديدة
+    # =============================================================
+    elif data.startswith("script_review_replace_"):
+        target_id = data.replace("script_review_replace_", "")
+        if str(session.get("episode_id")) != str(target_id):
+            try:
+                await query.answer("⚠️ لا يخص الحلقة النشطة.", show_alert=True)
+            except Exception:
+                pass
+            return
+
+        if session.get("episode_status") == "script_approved":
+            try:
+                await query.answer(
+                    "ℹ️ تم اعتماد السكريبت بالفعل. استخدم /start للبدء من جديد.",
+                    show_alert=True,
+                )
+            except Exception:
+                pass
+            return
+
+        session["awaiting_script_replace"] = True
+        session["state"] = "WAITING_SCRIPT_REPLACE"
+        next_v = int(session.get("script_version", 0)) + 1
+
+        try:
+            await query.edit_message_text(
+                f"📥 <b>وضع استبدال السكريبت بالكامل</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"الصق الآن <b>السكريبت الجديد كاملاً</b> كنص عادي:\n"
+                f"• <b>جملة واحدة لكل سطر</b> (مُفضّل) — أو نص متصل.\n"
+                f"• <b>عدد الجمل:</b> من <code>{SENTENCE_MIN}</code> "
+                f"إلى <code>{SENTENCE_MAX}</code> جملة.\n"
+                f"• تنسيق فقط (ترقيم) — <b>بدون</b> إعادة صياغة أو ترجمة.\n"
+                f"• سيُسجَّل كإصدار جديد: <b>v{next_v}</b> "
+                f"(الإصدارات السابقة تبقى محفوظة على السيرفر).\n"
+                f"• <b>لا</b> يبدأ الصوت تلقائياً — ستعود لشاشة المراجعة.",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+
     elif data.startswith("approve_stage1_"):
         target_id = data.replace("approve_stage1_", "")
         active_id = session.get("episode_id")
@@ -609,46 +765,65 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 pass
             return
 
+        # ✅ تثبيت النسخة المعتمدة بلا رجعة
+        approved_sentences = list(session.get("sentences") or [])
+        if not approved_sentences:
+            try:
+                await query.answer("⚠️ لا توجد جمل معتمدة.", show_alert=True)
+            except Exception:
+                pass
+            return
+
+        session["approved_script"] = approved_sentences
+        session["episode_status"] = "script_approved"
+        session["stage1_approved"] = True
+
+        # مزامنة stage1_result لتفادي أي اختلاف بعد الاعتماد
+        s1_res = session.get("stage1_result")
+        if isinstance(s1_res, dict):
+            s1_res["full_script_sentences"] = list(approved_sentences)
+            session["stage1_result"] = s1_res
+
         _cancel_user_task(chat_id)
         user_tasks[chat_id] = asyncio.create_task(
             run_stage2_after_approval(query, context)
         )
 
     elif data.startswith("edit_stage1_"):
+        # Alias قديم → يحوّل لمسار الاستبدال الكامل حفاظاً على التناسق
         target_id = data.replace("edit_stage1_", "")
         active_id = session.get("episode_id")
 
         if not active_id or str(active_id) != str(target_id):
-            logger.warning(
-                f"⚠️ edit_stage1 قديم/غير مطابق | target={target_id} | active={active_id}"
-            )
             try:
                 await query.answer("⚠️ هذا الزر لا يخص الحلقة النشطة الحالية.", show_alert=True)
             except Exception:
                 pass
             return
 
-        if session.get("stage1_approved") is True:
+        if session.get("episode_status") == "script_approved":
             try:
-                await query.answer("ℹ️ تم اعتماد هذه المرحلة بالفعل.", show_alert=True)
+                await query.answer("ℹ️ تم اعتماد السكريبت بالفعل.", show_alert=True)
             except Exception:
                 pass
             return
 
         session["awaiting_script_edit"] = True
         session["state"] = "WAITING_SCRIPT_EDIT"
+        next_v = int(session.get("script_version", 0)) + 1
 
         await query.edit_message_text(
-            "✏️ <b>وضع تعديل السكريبت اليدوي</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "الصق الآن <b>السكريبت الكامل</b> كنص عادي:\n"
-            "• <b>جملة واحدة لكل سطر</b> (مُفضّل) — أو نص متصل.\n"
-            "• سيقوم البوت <b>فقط</b> بتصحيح علامات الترقيم والتنسيق — "
-            "<b>بدون</b> إعادة صياغة أو ترجمة أو تغيير للمعنى.\n"
+            f"✏️ <b>وضع تعديل السكريبت اليدوي</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"الصق الآن <b>السكريبت الكامل</b> كنص عادي:\n"
+            f"• <b>جملة واحدة لكل سطر</b> (مُفضّل) — أو نص متصل.\n"
+            f"• سيقوم البوت <b>فقط</b> بتصحيح علامات الترقيم والتنسيق — "
+            f"<b>بدون</b> إعادة صياغة أو ترجمة أو تغيير للمعنى.\n"
             f"• <b>عدد الجمل يجب أن يكون بين {SENTENCE_MIN} و {SENTENCE_MAX} جملة.</b>\n"
-            "• بعد التأكيد ستظهر لك معاينة، وسيتبقى عليك الضغط على "
-            "<b>✅ اعتماد</b> للانتقال إلى المرحلة الثانية.\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            f"• سيُسجَّل كإصدار جديد: <b>v{next_v}</b>.\n"
+            f"• بعد التأكيد ستظهر معاينة، وسيتبقى عليك الضغط على "
+            f"<b>✅ اعتماد</b> للانتقال إلى المرحلة الثانية.\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
             parse_mode=ParseMode.HTML,
         )
 
@@ -937,10 +1112,116 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     # =============================================================
+    # استبدال كامل للسكريبت (نسخة جديدة) — قبل الاعتماد فقط
+    # =============================================================
+    if state == "WAITING_SCRIPT_REPLACE":
+        if _is_stale(chat_id, session):
+            return
+
+        if session.get("episode_status") == "script_approved":
+            await update.message.reply_text(
+                "⚠️ السكريبت معتمد بالفعل. استخدم /start لبدء حلقة جديدة.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        raw = update.message.text or ""
+        try:
+            normalized = normalize_script_sentences(raw)
+        except ValueError as ve:
+            await update.message.reply_text(
+                f"⚠️ <b>لم أتمكن من قراءة جمل صالحة.</b>\n"
+                f"<i>{_esc(str(ve))}</i>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        except Exception as e:
+            logger.exception("خطأ أثناء تنسيق السكريبت الجديد")
+            await update.message.reply_text(
+                f"❌ <b>خطأ أثناء التنسيق:</b>\n<code>{_esc(str(e))}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        n = len(normalized)
+        if n < SENTENCE_MIN or n > SENTENCE_MAX:
+            await update.message.reply_text(
+                f"❌ <b>عدد الجمل غير مقبول.</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📊 <b>العدد المُرسل:</b> <code>{n}</code>\n"
+                f"✅ <b>النطاق المطلوب:</b> <code>{SENTENCE_MIN}</code> – "
+                f"<code>{SENTENCE_MAX}</code> جملة.\n\n"
+                f"لم يُحفظ شيء. أرسل النص مرة أخرى.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        ep_id = session.get("episode_id")
+        new_version = int(session.get("script_version", 0)) + 1
+
+        # حفظ الإصدار الجديد على القرص + في الجلسة
+        v_path = _save_script_version(ep_id, new_version, normalized)
+        versions = list(session.get("script_versions") or [])
+        versions.append({
+            "version": new_version,
+            "sentences": list(normalized),
+            "path": str(v_path),
+        })
+        session["script_versions"] = versions
+        session["script_version"] = new_version
+        session["sentences"] = list(normalized)
+
+        # تحديث stage1_result حتى تكون المصدر الوحيد لبقية المراحل
+        s1_res = session.get("stage1_result")
+        if not isinstance(s1_res, dict):
+            s1_res = {}
+        s1_res["full_script_sentences"] = list(normalized)
+        try:
+            s1_res["total_word_count"] = sum(len(s.split()) for s in normalized)
+        except Exception:
+            pass
+        session["stage1_result"] = s1_res
+
+        # حفظ على disk أيضًا داخل stage1_episode_<id>.json
+        if ep_id:
+            try:
+                s1_file = OUTPUTS_DIR / f"stage1_episode_{ep_id}.json"
+                with open(s1_file, "w", encoding="utf-8") as f:
+                    json.dump(s1_res, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                logger.error(f"فشل تحديث stage1_episode_{ep_id}.json: {e}")
+
+        session["awaiting_script_replace"] = False
+        session["state"] = "IDLE"
+        session["episode_status"] = "awaiting_script_review"
+        session["stage1_approved"] = False
+
+        await update.message.reply_text(
+            f"✅ <b>تم استلام النسخة الجديدة v{new_version}</b>\n"
+            f"🧩 <b>عدد الجمل:</b> <code>{n}</code>\n"
+            f"<i>سيتم عرضها الآن للمراجعة من جديد. لم يُعتمد شيء بعد.</i>",
+            parse_mode=ParseMode.HTML,
+        )
+
+        # إعادة إرسال السكريبت الكامل + أزرار المراجعة
+        ep = session.get("episode_data") or {}
+        await _send_full_script_for_review(
+            context, chat_id, ep_id, ep, normalized, version=new_version
+        )
+        return
+
+    # =============================================================
     # استقبال السكريبت المُعدَّل يدوياً (WAITING_SCRIPT_EDIT)
     # =============================================================
     if state == "WAITING_SCRIPT_EDIT":
         if _is_stale(chat_id, session):
+            return
+
+        if session.get("episode_status") == "script_approved":
+            await update.message.reply_text(
+                "⚠️ السكريبت معتمد بالفعل. استخدم /start لبدء حلقة جديدة.",
+                parse_mode=ParseMode.HTML,
+            )
             return
 
         raw = update.message.text or ""
@@ -981,12 +1262,26 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
 
         ep_id = session.get("episode_id")
+        new_version = int(session.get("script_version", 0)) + 1
+
         _save_normalized_sentences(ep_id, session, normalized)
+
+        # حفظ كإصدار جديد أيضاً
+        v_path = _save_script_version(ep_id, new_version, normalized)
+        versions = list(session.get("script_versions") or [])
+        versions.append({
+            "version": new_version,
+            "sentences": list(normalized),
+            "path": str(v_path),
+        })
+        session["script_versions"] = versions
+        session["script_version"] = new_version
 
         # لا يُعتبر معتمداً حتى يضغط زر الاعتماد
         session["awaiting_script_edit"] = False
         session["state"] = "IDLE"
         session["stage1_approved"] = False
+        session["episode_status"] = "awaiting_script_review"
 
         n = sentence_count
         first_three = normalized[:3]
@@ -1000,6 +1295,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         preview_lines = [
             "<b>✅ تم تنسيق السكريبت بنجاح</b>",
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            f"🆕 <b>الإصدار الجديد:</b> <code>v{new_version}</code>",
             f"🧩 <b>عدد الجمل:</b> <code>{n}</code>",
             "",
             "<b>أول 3 جمل:</b>",
@@ -1036,6 +1332,12 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode=ParseMode.HTML,
         )
+
+        # إرسال السكريبت الكامل مرة أخرى (لأنه نسخة جديدة)
+        ep = session.get("episode_data") or {}
+        await _send_full_script_for_review(
+            context, chat_id, ep_id, ep, normalized, version=new_version
+        )
         return
 
     if state == "WAITING_IMAGE_CORRECTION":
@@ -1058,6 +1360,11 @@ async def run_stage1_only(query, context, episode):
     session["stage1_approved"] = False
     session["stage1_result"] = None
     session["awaiting_script_edit"] = False
+    session["awaiting_script_replace"] = False
+    session["approved_script"] = None
+    session["script_version"] = 0
+    session["script_versions"] = []
+    session["episode_status"] = "generating_script"
 
     if _is_stale(chat_id, session):
         return
@@ -1066,7 +1373,7 @@ async def run_stage1_only(query, context, episode):
         f"<b>⚙️ [ 1/2 ] جاري تشغيل المرحلة الأولى للحلقة #{_esc(ep_id)}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"⏳ توليد السكربت الإنجليزي + هندسة الجمل القصيرة + الخطة الإبداعية...\n"
-        f"<i>لن تبدأ المرحلة الثانية حتى تعتمد الخطة بنفسك.</i>\n"
+        f"<i>لن تبدأ المرحلة الثانية حتى تعتمد السكريبت بنفسك.</i>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     )
     try:
@@ -1091,28 +1398,22 @@ async def run_stage1_only(query, context, episode):
         session["stage1_result"] = stage1_res
         session["sentences"] = sentences
 
-        summary_text = _build_stage1_summary(ep_id, episode, stage1_res)
-
-        keyboard = [
-            [InlineKeyboardButton(
-                "✅ اعتماد الخطة والانتقال للمرحلة الثانية",
-                callback_data=f"approve_stage1_{ep_id}",
-            )],
-            [InlineKeyboardButton(
-                "✏️ تعديل السكريبت يدويًا",
-                callback_data=f"edit_stage1_{ep_id}",
-            )],
-            [InlineKeyboardButton(
-                "🔄 إعادة توليد المرحلة الأولى",
-                callback_data=f"regenerate_stage1_{ep_id}",
-            )],
-            [InlineKeyboardButton("❌ إلغاء والعودة للقائمة", callback_data="btn_back_main")],
+        # ✅ حالة صريحة + تسجيل الإصدار الأول
+        session["episode_status"] = "awaiting_script_review"
+        session["stage1_approved"] = False
+        session["script_version"] = 1
+        v_path = _save_script_version(ep_id, 1, sentences)
+        session["script_versions"] = [
+            {"version": 1, "sentences": list(sentences), "path": str(v_path)}
         ]
 
-        await status_msg.edit_text(
-            summary_text,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode=ParseMode.HTML,
+        # ملخص مختصر داخل نفس رسالة الحالة
+        summary_text = _build_stage1_summary(ep_id, episode, stage1_res)
+        await status_msg.edit_text(summary_text, parse_mode=ParseMode.HTML)
+
+        # ثم إرسال السكريبت الكامل + الأزرار
+        await _send_full_script_for_review(
+            context, chat_id, ep_id, episode, sentences, version=1
         )
 
     except asyncio.CancelledError:
@@ -1145,6 +1446,18 @@ async def run_stage2_after_approval(query, context):
     if _is_stale(chat_id, session):
         return
 
+    # ✅ حماية صريحة: لا مرحلة ثانية بدون اعتماد السكريبت
+    if session.get("episode_status") != "script_approved":
+        try:
+            await query.edit_message_text(
+                "⛔ <b>لا يمكن بدء المرحلة الثانية قبل اعتماد السكريبت.</b>\n"
+                "استخدم زر <b>✅ اعتماد السكريبت</b> أولاً.",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        return
+
     if not ep_id:
         try:
             await query.edit_message_text("⚠️ لا توجد حلقة نشطة. اضغط /start للبدء.")
@@ -1175,7 +1488,10 @@ async def run_stage2_after_approval(query, context):
             pass
         return
 
-    sentences = _as_list(stage1_res.get("full_script_sentences"))
+    # ✅ نستخدم approved_script إن وُجد — وهو المصدر الوحيد المعتمد
+    sentences = list(session.get("approved_script") or [])
+    if not sentences:
+        sentences = _as_list(stage1_res.get("full_script_sentences"))
     if not sentences:
         sentences = session.get("sentences") or []
 
@@ -1329,6 +1645,22 @@ async def run_stage3(query, context):
     if _is_stale(chat_id, session):
         return
 
+    # ✅ حماية صريحة: لا صوت قبل اعتماد السكريبت
+    if session.get("episode_status") != "script_approved":
+        logger.warning(
+            f"⛔ محاولة توليد صوت للحلقة {ep_id} "
+            f"بحالة {session.get('episode_status')} — مرفوضة."
+        )
+        try:
+            await query.edit_message_text(
+                "⛔ <b>لا يمكن توليد الصوت قبل اعتماد السكريبت.</b>\n"
+                "هذه حماية صريحة لمنع استهلاك موارد على سكريبت غير مُعتمد.",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        return
+
     # ✅ تحقق من أن الصوت من القائمة المُعدَّة
     if voice not in AZURE_MALE_VOICES:
         try:
@@ -1341,6 +1673,8 @@ async def run_stage3(query, context):
         except Exception:
             pass
         return
+
+    session["episode_status"] = "processing_audio"
 
     try:
         wait_msg = await query.edit_message_text(
@@ -2692,6 +3026,7 @@ async def run_final_render(msg_obj, context):
     # ✅ إعادة ضبط الجلسة بعد اكتمال دورة الإنتاج بنجاح
     try:
         if not _is_stale(chat_id, session):
+            session["episode_status"] = "completed"
             session["cancelled"] = True
             user_sessions[chat_id] = _fresh_session()
             logger.info(f"♻️ تم إعادة ضبط الجلسة للمستخدم {chat_id} بعد اكتمال الحلقة {ep_id}")
@@ -2720,7 +3055,7 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_media_upload))
 
     print("=" * 60)
-    print("🚀 محرك Vot Studio Pro يعمل الآن — Complete-Render-Only + 60-80 Sentence Edit + Full Voice List + Image Review")
+    print("🚀 محرك Vot Studio Pro يعمل الآن — Human Script Review + Full-Script Fallback + Complete-Render-Only")
     print("=" * 60)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
