@@ -122,10 +122,10 @@ def _generate_initial_script(episode_data: Dict[str, Any]) -> str:
 
 
 # ===========================================================================
-# PHASE A REPAIR — expand / compress the frozen script (count repair)
+# PHASE C REPAIR — expand / compress the frozen script (count repair)
 # ===========================================================================
 
-PHASE_A_EXPAND_SYSTEM_PROMPT = """You are a script-repair specialist for a YouTube script pipeline.
+PHASE_C_EXPAND_SYSTEM_PROMPT = """You are a script-repair specialist for a YouTube script pipeline.
 You will receive a complete existing script that currently produces FEWER than 60 sentences.
 
 Your task: return a revised COMPLETE script that:
@@ -160,7 +160,7 @@ Return a single valid JSON object ONLY, no markdown, no commentary:
 }
 """
 
-PHASE_A_COMPRESS_SYSTEM_PROMPT = """You are a script-repair specialist for a YouTube script pipeline.
+PHASE_C_COMPRESS_SYSTEM_PROMPT = """You are a script-repair specialist for a YouTube script pipeline.
 You will receive a complete existing script that currently produces MORE than 80 sentences.
 
 Your task: return a revised COMPLETE script that:
@@ -215,7 +215,7 @@ def _repair_expand_script(episode_data: Dict[str, Any], script_text: str, curren
         "Return ONLY the revised script_text JSON object now."
     )
     raw = call_gemini_with_fallback(
-        system_instruction=PHASE_A_EXPAND_SYSTEM_PROMPT,
+        system_instruction=PHASE_C_EXPAND_SYSTEM_PROMPT,
         user_prompt=user_prompt,
     )
     parsed = _parse_json_safe(raw)
@@ -245,7 +245,7 @@ def _repair_compress_script(episode_data: Dict[str, Any], script_text: str, curr
         "Return ONLY the revised script_text JSON object now."
     )
     raw = call_gemini_with_fallback(
-        system_instruction=PHASE_A_COMPRESS_SYSTEM_PROMPT,
+        system_instruction=PHASE_C_COMPRESS_SYSTEM_PROMPT,
         user_prompt=user_prompt,
     )
     parsed = _parse_json_safe(raw)
@@ -279,8 +279,8 @@ def _split_into_sentences(text: str) -> List[str]:
 
     - Protects common abbreviations and decimal numbers.
     - Handles sentence-ending punctuation followed by closing quotation marks
-      or brackets (e.g. `".`, `?"`, `!)`, `.]`, `."`, `.)`, `.]`, `."}`),
-      then whitespace or end of text.
+      or brackets (e.g. `".`, `?"`, `!)`, `.]`, `.)`), then whitespace or
+      end of text.
     """
     protected = text.strip()
 
