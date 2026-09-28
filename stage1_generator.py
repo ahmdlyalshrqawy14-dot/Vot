@@ -24,21 +24,6 @@ MAX_PHASE_D_ROUNDS = 2
 
 CHARACTER_DNA = "Orange character, muscular body, smooth head, two big white eyes, no mouth, black shorts."
 
-APPROVED_VISUAL_BEATS = {
-    "establishing",
-    "symbolic_setup",
-    "development",
-    "escalation",
-    "pattern_interrupt",
-    "visual_reveal",
-    "metaphor_transformation",
-    "quiet_reflection",
-    "ending_tail",
-}
-
-MIN_ENDING_TAIL_SECONDS = 8
-MAX_ENDING_TAIL_SECONDS = 12
-
 
 # ===========================================================================
 # PHASE A — SCRIPT GENERATION (script_text only)
@@ -101,22 +86,6 @@ SCRIPT REQUIREMENTS:
   requirement; narrative coherence and sentence count are.
 - Preserve the meaning of the_truth, key_points, and actionable_solution. Do not invent facts beyond
   episode_data. Distinguish opinions, interpretations, and established findings.
-- The episode must contain a philosophical paradigm shift.
-- The ending must contain a new frame that changes the meaning of the opening problem.
-- The ending must leave the viewer with one deep reflective question.
-- Practical implications must not dominate the final section.
-
-ENDING AND PARADIGM SHIFT REQUIREMENTS:
-
-- Do not end the episode as a numbered self-help list.
-- Do not make the final section feel like generic personal-development advice.
-- If practical guidance is needed, embed it inside a broader philosophical reframing.
-- The ending must create a paradigm shift from the viewer's initial belief to a more nuanced understanding.
-- The final meaning must reframe the central problem instead of merely summarizing the solution.
-- End with a memorable reflective question that remains open after the video ends.
-- The final question must not be a promotional call to action.
-- Do not end with phrases such as "subscribe", "watch the next video", "like", "share", or "comment below".
-- The final sentences must feel contemplative, unresolved, and intellectually meaningful.
 
 OUTPUT FORMAT (CRITICAL):
 Return a single valid, parsable JSON object ONLY. No markdown, no backticks, no commentary.
@@ -299,13 +268,23 @@ _ABBREVIATIONS = [
 
 _PLACEHOLDER = "\uE000"
 
+# Matches one or more sentence-ending punctuation marks, optionally followed by
+# closing quotation marks or brackets. A valid boundary additionally requires
+# that the next character is whitespace or end of text (checked in code).
 _SENTENCE_END_PATTERN = re.compile(r'[.!?]+["\'”’\)\]\}]*')
 
 
 def _split_into_sentences(text: str) -> List[str]:
-    """Deterministic sentence splitter."""
+    """Deterministic sentence splitter.
+
+    - Protects common abbreviations and decimal numbers.
+    - Handles sentence-ending punctuation followed by closing quotation marks
+      or brackets (e.g. `".`, `?"`, `!)`, `.]`, `."`, `.)`, `.]`, `."}`),
+      then whitespace or end of text.
+    """
     protected = text.strip()
 
+    # Protect common abbreviations (case-insensitive) by hiding their periods.
     for abbr in _ABBREVIATIONS:
         pattern = re.compile(re.escape(abbr), re.IGNORECASE)
         protected_abbr = abbr.replace(".", _PLACEHOLDER)
@@ -315,6 +294,7 @@ def _split_into_sentences(text: str) -> List[str]:
 
         protected = pattern.sub(_replacer, protected)
 
+    # Protect decimal numbers like 3.14
     protected = re.sub(r"(\d)\.(\d)", r"\1" + _PLACEHOLDER + r"\2", protected)
 
     sentences: List[str] = []
@@ -323,6 +303,7 @@ def _split_into_sentences(text: str) -> List[str]:
 
     for m in _SENTENCE_END_PATTERN.finditer(protected):
         end_pos = m.end()
+        # Boundary requires whitespace or end-of-text right after the match.
         if end_pos < length and not protected[end_pos].isspace():
             continue
 
@@ -335,6 +316,7 @@ def _split_into_sentences(text: str) -> List[str]:
         while start < length and protected[start].isspace():
             start += 1
 
+    # Trailing text without terminal punctuation.
     if start < length:
         remainder = protected[start:].replace(_PLACEHOLDER, ".").strip()
         if remainder:
@@ -345,7 +327,14 @@ def _split_into_sentences(text: str) -> List[str]:
 
 def _has_terminal_punctuation(text: str) -> bool:
     """Return True if `text` ends with terminal punctuation, ignoring any
-    trailing closing quotation marks or brackets."""
+    trailing closing quotation marks or brackets.
+
+    Examples:
+        'He asked, "What do you fear?"'          -> True
+        'He said, "Courage begins with fear."'   -> True
+        'This is important.]'                     -> True
+        'He said, "Courage begins with fear."'    -> True
+    """
     stripped = text.rstrip()
     while stripped and stripped[-1] in "\"'”’)]}":
         stripped = stripped[:-1].rstrip()
@@ -353,7 +342,8 @@ def _has_terminal_punctuation(text: str) -> bool:
 
 
 def _validate_sentence_list(sentences: List[str]) -> List[str]:
-    """Clean sentences: strip whitespace, ensure ending punctuation, drop empties."""
+    """Clean sentences: strip whitespace, ensure ending punctuation, drop empties.
+    Does NOT enforce the min/max count — that is done by the caller."""
     cleaned: List[str] = []
     for s in sentences:
         if not isinstance(s, str):
@@ -431,8 +421,7 @@ OUT OF YOUR CONTROL. You must NOT alter, paraphrase, reorder, merge, split, tran
 sentence. Nothing you output may override, replace, or mutate the frozen sentence list.
 
 Your task is to produce ONLY the auxiliary structure around this frozen script:
-hook, sections, creative_brief, paradigm_shift, retention_plan, audio_arc, ending_tail,
-scene_plan, visual_bible, quality_report.
+hook, sections, creative_brief, retention_plan, scene_plan, visual_bible, quality_report.
 
 CHARACTER DNA (MUST NOT CHANGE):
 "Orange character, muscular body, smooth head, two big white eyes, no mouth, black shorts."
@@ -470,63 +459,6 @@ RETENTION_PLAN STRUCTURE RULES (CRITICAL):
 open_loops, pattern_interrupts, and escalation_points MUST always be real JSON arrays of non-empty
 strings, even if there is only one item (wrap it in an array). Never return them as a single string.
 
-PARADIGM SHIFT RULES:
-
-- The episode must contain one clear paradigm shift.
-- old_belief must describe the viewer's initial common belief.
-- hidden_assumption must expose the assumption underneath that belief.
-- new_frame must reinterpret the topic in a deeper and more nuanced way.
-- practical_implication must describe a consequence of the new frame without becoming a numbered checklist.
-- final_question must be philosophical and reflective.
-- final_question MUST be an actual interrogative sentence ending with a question mark ("?").
-- final_question must not be promotional.
-- final_question must not ask the viewer to subscribe, like, share, or comment.
-
-VISUAL METAPHOR ARC RULES:
-
-- The episode must have one central visual metaphor.
-- The central visual metaphor must evolve across the episode.
-- opening_state, development_state, escalation_state, revelation_state, and ending_state must describe different visual states.
-- The ending_state must not simply repeat the opening_state.
-- The visual metaphor must be symbolic rather than a literal illustration of the narration.
-- The visual metaphor must remain compatible with the existing Orange character DNA.
-
-VISUAL BEAT RULES (CRITICAL):
-
-- Every scene must contain exactly one visual_beat.
-- visual_beat must be one of the approved values:
-  establishing, symbolic_setup, development, escalation, pattern_interrupt,
-  visual_reveal, metaphor_transformation, quiet_reflection, ending_tail.
-- Do not assign the same visual_beat to every scene.
-- At least one scene must use visual_reveal or metaphor_transformation.
-- At least one scene must use quiet_reflection.
-- quiet_reflection MUST NOT be the final scene. It must appear before the ending_tail scene.
-- Exactly one scene MUST use ending_tail, and it MUST be either the final scene
-  or the scene immediately before the final scene.
-- visual_beat must describe the dramatic function of the image, not merely its subject.
-
-AUDIO ARC RULES:
-
-- audio_arc is a planning structure only.
-- dramatic_silence_sentence_indices must contain valid zero-based sentence indices.
-- music_drop_sentence_indices must contain valid zero-based sentence indices.
-- At least one valid dramatic silence index must be provided.
-- Do not place dramatic silence before every important sentence.
-- foley_motifs must relate to the central visual metaphor.
-- The audio arc must contain variation between opening, tension, revelation, reflection, and ending.
-- Do not describe one continuous music track with identical intensity from beginning to end.
-
-ENDING TAIL RULES:
-
-- ending_tail.duration_seconds must be between 8 and 12 inclusive.
-- The spoken narration must end before the ending tail begins.
-- The ending tail must not contain spoken promotional CTA.
-- visual_action must describe a quiet visual action.
-- camera_behavior must describe an almost imperceptible or very slow camera movement.
-- music_behavior must describe a gradual fade.
-- ambience_behavior must describe subtle ambience that may continue briefly after the music fades.
-- end_screen_safe_area must identify a visually calm area for a future end screen.
-
 OUTPUT FORMAT (CRITICAL):
 Return a single valid, parsable JSON object ONLY. No markdown, no backticks, no commentary.
 Do NOT include "full_script_sentences" in your output — it is supplied separately and frozen.
@@ -558,13 +490,6 @@ Required JSON schema:
     "tone": "string",
     "emotional_arc": "string"
   },
-  "paradigm_shift": {
-    "old_belief": "string",
-    "hidden_assumption": "string",
-    "new_frame": "string",
-    "practical_implication": "string",
-    "final_question": "string (must end with '?')"
-  },
   "retention_plan": {
     "hook_strategy": "string",
     "open_loops": ["string", "string"],
@@ -573,25 +498,6 @@ Required JSON schema:
     "main_reveal": "string",
     "payoff": "string",
     "ending_callback": "string"
-  },
-  "audio_arc": {
-    "opening_mode": "string",
-    "tension_mode": "string",
-    "revelation_mode": "string",
-    "reflection_mode": "string",
-    "ending_mode": "string",
-    "dramatic_silence_sentence_indices": [0],
-    "music_drop_sentence_indices": [0],
-    "foley_motifs": ["string"]
-  },
-  "ending_tail": {
-    "duration_seconds": 10,
-    "spoken_audio_ends_before_tail": true,
-    "visual_action": "string",
-    "camera_behavior": "string",
-    "music_behavior": "string",
-    "ambience_behavior": "string",
-    "end_screen_safe_area": "string"
   },
   "scene_plan": [
     {
@@ -608,8 +514,7 @@ Required JSON schema:
       "composition": "string",
       "motion_potential": "string",
       "transition": "string",
-      "continuity_notes": "string",
-      "visual_beat": "establishing"
+      "continuity_notes": "string"
     }
   ],
   "visual_bible": {
@@ -620,15 +525,7 @@ Required JSON schema:
     "camera_language": "string",
     "composition_rules": "string",
     "recurring_symbols": ["string"],
-    "visual_progression": "string",
-    "visual_metaphor_arc": {
-      "central_metaphor": "string",
-      "opening_state": "string",
-      "development_state": "string",
-      "escalation_state": "string",
-      "revelation_state": "string",
-      "ending_state": "string"
-    }
+    "visual_progression": "string"
   },
   "quality_report": {
     "hook_score": 0,
@@ -669,7 +566,7 @@ def _generate_auxiliary_structure(
 
 
 # ===========================================================================
-# PARTIAL-REPAIR SYSTEM PROMPTS
+# PARTIAL-REPAIR SYSTEM PROMPTS (scene_plan / retention_plan / visual_bible / quality_report)
 # ===========================================================================
 
 SCENE_PLAN_REPAIR_SYSTEM_PROMPT = """You are a scene-plan repair specialist for a YouTube script pipeline.
@@ -689,18 +586,7 @@ HARD RULES (CRITICAL):
 - Every scene MUST include these exact keys:
   scene_id, sentence_start, sentence_end, script_segment, narrative_purpose,
   emotion, visual_concept, character_action, environment, camera,
-  composition, motion_potential, transition, continuity_notes, visual_beat.
-- Every scene MUST include a visual_beat field.
-- visual_beat MUST be exactly one of:
-  establishing, symbolic_setup, development, escalation,
-  pattern_interrupt, visual_reveal, metaphor_transformation,
-  quiet_reflection, ending_tail.
-- At least one scene must use visual_reveal or metaphor_transformation.
-- At least one scene must use quiet_reflection.
-- quiet_reflection MUST NOT be the final scene; it must precede the ending_tail scene.
-- Exactly one scene MUST use ending_tail, and it MUST be either the final scene
-  or the scene immediately before the final scene.
-- Do not modify, reorder, paraphrase, merge, or split the frozen sentences.
+  composition, motion_potential, transition, continuity_notes.
 - Every scene must add a real VISUAL IDEA (not just literal illustration).
 - Character DNA must be consistent: Orange character, muscular body, smooth head, two big white eyes, no mouth, black shorts.
   This character is a VISUAL NARRATOR, not a fitness symbol. Avoid gym/fitness staging unless the episode
@@ -740,18 +626,6 @@ Return ONLY a valid "visual_bible" JSON object with EXACTLY these fields:
 - composition_rules (non-empty string)
 - recurring_symbols (JSON array of strings)
 - visual_progression (non-empty string)
-- visual_metaphor_arc (JSON object)
-
-- visual_bible MUST include visual_metaphor_arc.
-- visual_metaphor_arc MUST contain:
-  central_metaphor,
-  opening_state,
-  development_state,
-  escalation_state,
-  revelation_state,
-  ending_state.
-- All values must be non-empty strings.
-- The visual states must evolve and must not all describe the same image.
 
 NOTE: The character is a VISUAL NARRATOR, not a fitness symbol. Environment style should favor
 symbolic, idea-driven spaces (libraries, archives, theaters, ancient cities, classrooms, streets,
@@ -764,9 +638,6 @@ Return only the JSON object.
 
 
 QUALITY_REPORT_REPAIR_SYSTEM_PROMPT = """You are a quality-report repair specialist.
-You will receive the full auxiliary structure of an episode: creative_brief, paradigm_shift,
-retention_plan, audio_arc, ending_tail, scene_plan, and visual_bible, plus the frozen script.
-
 Return ONLY a valid "quality_report" JSON object with EXACTLY these fields:
 - hook_score (number between 0 and 10)
 - originality_score (number between 0 and 10)
@@ -777,75 +648,6 @@ Return ONLY a valid "quality_report" JSON object with EXACTLY these fields:
 - factual_caution_check (non-empty string)
 - final_issues (JSON array of strings — may be empty)
 - approved (boolean true/false)
-
-Your scores MUST take into account the paradigm_shift, the audio_arc, and the ending_tail,
-not only the script and the scene plan.
-
-No markdown. No backticks. No explanation.
-Return only the JSON object.
-"""
-
-
-_REPAIR_PARADIGM_SHIFT_SYSTEM_PROMPT = """You are a paradigm-shift repair specialist for a YouTube script pipeline.
-The frozen sentence list is authoritative.
-Do not modify the script.
-Return only the requested JSON field.
-Preserve all existing valid fields.
-
-Return ONLY a valid "paradigm_shift" JSON object with EXACTLY these fields:
-- old_belief (non-empty string) — the viewer's initial common belief.
-- hidden_assumption (non-empty string) — the assumption underneath that belief.
-- new_frame (non-empty string) — a deeper, more nuanced reinterpretation of the topic.
-- practical_implication (non-empty string) — a consequence of the new frame, not a numbered checklist.
-- final_question (non-empty string) — philosophical, reflective, non-promotional.
-  MUST be an actual interrogative sentence that ENDS WITH A QUESTION MARK ("?").
-  Must not ask the viewer to subscribe, like, share, or comment.
-
-No markdown. No backticks. No explanation.
-Return only the JSON object.
-"""
-
-
-_REPAIR_AUDIO_ARC_SYSTEM_PROMPT = """You are an audio-arc repair specialist for a YouTube script pipeline.
-The frozen sentence list is authoritative.
-Do not modify the script.
-Return only the requested JSON field.
-Preserve all existing valid fields.
-
-Return ONLY a valid "audio_arc" JSON object with EXACTLY these fields:
-- opening_mode (non-empty string)
-- tension_mode (non-empty string)
-- revelation_mode (non-empty string)
-- reflection_mode (non-empty string)
-- ending_mode (non-empty string)
-- dramatic_silence_sentence_indices (JSON array of valid zero-based sentence indices, at least one)
-- music_drop_sentence_indices (JSON array of valid zero-based sentence indices)
-- foley_motifs (JSON array of non-empty strings, at least one)
-
-All indices MUST be valid (0 <= index < N).
-Do not place dramatic silence before every important sentence.
-
-No markdown. No backticks. No explanation.
-Return only the JSON object.
-"""
-
-
-_REPAIR_ENDING_TAIL_SYSTEM_PROMPT = """You are an ending-tail repair specialist for a YouTube script pipeline.
-The frozen sentence list is authoritative.
-Do not modify the script.
-Return only the requested JSON field.
-Preserve all existing valid fields.
-
-Return ONLY a valid "ending_tail" JSON object with EXACTLY these fields:
-- duration_seconds (number between 8 and 12 inclusive)
-- spoken_audio_ends_before_tail (must be true)
-- visual_action (non-empty string, a quiet visual action)
-- camera_behavior (non-empty string, almost imperceptible or very slow camera movement)
-- music_behavior (non-empty string, gradual fade)
-- ambience_behavior (non-empty string, subtle ambience that may continue briefly after the music fades)
-- end_screen_safe_area (non-empty string, a visually calm area for a future end screen)
-
-Must not contain a spoken promotional CTA (no subscribe/like/share/comment).
 
 No markdown. No backticks. No explanation.
 Return only the JSON object.
@@ -1001,336 +803,6 @@ def _validate_quality_report(data: Dict[str, Any]) -> None:
 
 
 # ===========================================================================
-# NEW field-level validators (paradigm_shift / visual_metaphor_arc /
-# visual_beat / audio_arc / ending_tail)
-# ===========================================================================
-
-def _validate_paradigm_shift(data: Dict[str, Any]) -> None:
-    paradigm_shift = data.get("paradigm_shift")
-
-    if not isinstance(paradigm_shift, dict):
-        raise ValueError("paradigm_shift must be an object.")
-
-    required_keys = [
-        "old_belief",
-        "hidden_assumption",
-        "new_frame",
-        "practical_implication",
-        "final_question",
-    ]
-
-    for key in required_keys:
-        value = paradigm_shift.get(key)
-        if not isinstance(value, str) or not value.strip():
-            raise ValueError(
-                f"paradigm_shift.{key} must be a non-empty string."
-            )
-
-    final_question_raw = paradigm_shift["final_question"].strip()
-
-    if not final_question_raw.endswith("?"):
-        raise ValueError(
-            "paradigm_shift.final_question must end with a question mark ('?')."
-        )
-
-    final_question_lower = final_question_raw.lower()
-
-    prohibited_cta_terms = [
-        "subscribe",
-        "like",
-        "share",
-        "comment below",
-        "watch the next video",
-        "اشترك",
-        "إعجاب",
-        "شارك",
-        "اكتب تعليق",
-        "شاهد الفيديو التالي",
-    ]
-
-    if any(term in final_question_lower for term in prohibited_cta_terms):
-        raise ValueError(
-            "paradigm_shift.final_question must not be promotional."
-        )
-
-
-def _validate_visual_metaphor_arc(data: Dict[str, Any]) -> None:
-    visual_bible = data.get("visual_bible")
-
-    if not isinstance(visual_bible, dict):
-        raise ValueError("visual_bible must be an object.")
-
-    arc = visual_bible.get("visual_metaphor_arc")
-
-    if not isinstance(arc, dict):
-        raise ValueError(
-            "visual_bible.visual_metaphor_arc must be an object."
-        )
-
-    required_keys = [
-        "central_metaphor",
-        "opening_state",
-        "development_state",
-        "escalation_state",
-        "revelation_state",
-        "ending_state",
-    ]
-
-    for key in required_keys:
-        value = arc.get(key)
-        if not isinstance(value, str) or not value.strip():
-            raise ValueError(
-                f"visual_metaphor_arc.{key} must be a non-empty string."
-            )
-
-    states = [
-        arc["opening_state"].strip(),
-        arc["development_state"].strip(),
-        arc["escalation_state"].strip(),
-        arc["revelation_state"].strip(),
-        arc["ending_state"].strip(),
-    ]
-
-    if len(set(states)) < 3:
-        raise ValueError(
-            "visual_metaphor_arc must contain at least three distinct visual states."
-        )
-
-
-def _validate_visual_beats(data: Dict[str, Any]) -> None:
-    scene_plan = data.get("scene_plan")
-
-    if not isinstance(scene_plan, list) or not scene_plan:
-        raise ValueError("scene_plan must be a non-empty list.")
-
-    beats: List[str] = []
-
-    for index, scene in enumerate(scene_plan):
-        if not isinstance(scene, dict):
-            raise ValueError(
-                f"scene_plan[{index}] must be an object."
-            )
-
-        beat = scene.get("visual_beat")
-
-        if beat not in APPROVED_VISUAL_BEATS:
-            raise ValueError(
-                f"scene_plan[{index}].visual_beat is invalid: {beat!r}"
-            )
-
-        beats.append(beat)
-
-    if len(set(beats)) < 2:
-        raise ValueError(
-            "scene_plan must contain at least two different visual_beat values."
-        )
-
-    if not any(
-        beat in {"visual_reveal", "metaphor_transformation"}
-        for beat in beats
-    ):
-        raise ValueError(
-            "scene_plan must contain visual_reveal or metaphor_transformation."
-        )
-
-    last_index = len(beats) - 1
-
-    quiet_reflection_indices = [
-        index for index, beat in enumerate(beats)
-        if beat == "quiet_reflection"
-    ]
-
-    if not quiet_reflection_indices:
-        raise ValueError(
-            "scene_plan must contain at least one quiet_reflection beat."
-        )
-
-    if last_index in quiet_reflection_indices:
-        raise ValueError(
-            "scene_plan must not place quiet_reflection at the final scene; "
-            "quiet_reflection must precede the ending_tail scene."
-        )
-
-    ending_tail_indices = [
-        index for index, beat in enumerate(beats)
-        if beat == "ending_tail"
-    ]
-
-    if not ending_tail_indices:
-        raise ValueError(
-            "scene_plan must contain at least one ending_tail visual beat."
-        )
-
-    if any(
-        index not in {last_index, last_index - 1}
-        for index in ending_tail_indices
-    ):
-        raise ValueError(
-            "ending_tail visual beats are only allowed in the final scene "
-            "or the scene immediately before it."
-        )
-
-    first_ending_tail_index = min(ending_tail_indices)
-    if not any(
-        index < first_ending_tail_index
-        for index in quiet_reflection_indices
-    ):
-        raise ValueError(
-            "scene_plan must place at least one quiet_reflection beat before "
-            "the ending_tail scene."
-        )
-
-
-def _validate_audio_arc(data: Dict[str, Any], sentence_count: int) -> None:
-    audio_arc = data.get("audio_arc")
-
-    if not isinstance(audio_arc, dict):
-        raise ValueError("audio_arc must be an object.")
-
-    required_string_keys = [
-        "opening_mode",
-        "tension_mode",
-        "revelation_mode",
-        "reflection_mode",
-        "ending_mode",
-    ]
-
-    for key in required_string_keys:
-        value = audio_arc.get(key)
-        if not isinstance(value, str) or not value.strip():
-            raise ValueError(
-                f"audio_arc.{key} must be a non-empty string."
-            )
-
-    for key in [
-        "dramatic_silence_sentence_indices",
-        "music_drop_sentence_indices",
-    ]:
-        indices = audio_arc.get(key)
-
-        if not isinstance(indices, list):
-            raise ValueError(
-                f"audio_arc.{key} must be an array."
-            )
-
-        for index in indices:
-            if isinstance(index, bool) or not isinstance(index, int):
-                raise ValueError(
-                    f"audio_arc.{key} contains a non-integer index."
-                )
-
-            if index < 0 or index >= sentence_count:
-                raise ValueError(
-                    f"audio_arc.{key} contains an out-of-range index: {index}."
-                )
-
-    silence_indices = audio_arc["dramatic_silence_sentence_indices"]
-
-    if not silence_indices:
-        raise ValueError(
-            "audio_arc must contain at least one dramatic silence index."
-        )
-
-    foley_motifs = audio_arc.get("foley_motifs")
-
-    if not isinstance(foley_motifs, list) or not foley_motifs:
-        raise ValueError(
-            "audio_arc.foley_motifs must be a non-empty array."
-        )
-
-    for motif in foley_motifs:
-        if not isinstance(motif, str) or not motif.strip():
-            raise ValueError(
-                "audio_arc.foley_motifs must contain non-empty strings."
-            )
-
-
-def _validate_ending_tail(data: Dict[str, Any]) -> None:
-    ending_tail = data.get("ending_tail")
-
-    if not isinstance(ending_tail, dict):
-        raise ValueError("ending_tail must be an object.")
-
-    required_keys = [
-        "duration_seconds",
-        "spoken_audio_ends_before_tail",
-        "visual_action",
-        "camera_behavior",
-        "music_behavior",
-        "ambience_behavior",
-        "end_screen_safe_area",
-    ]
-
-    for key in required_keys:
-        if key not in ending_tail:
-            raise ValueError(
-                f"ending_tail.{key} is missing."
-            )
-
-    duration = ending_tail["duration_seconds"]
-
-    if isinstance(duration, bool) or not isinstance(duration, (int, float)):
-        raise ValueError(
-            "ending_tail.duration_seconds must be numeric."
-        )
-
-    if not (
-        MIN_ENDING_TAIL_SECONDS
-        <= float(duration)
-        <= MAX_ENDING_TAIL_SECONDS
-    ):
-        raise ValueError(
-            "ending_tail.duration_seconds must be between 8 and 12."
-        )
-
-    if ending_tail["spoken_audio_ends_before_tail"] is not True:
-        raise ValueError(
-            "spoken_audio_ends_before_tail must be true."
-        )
-
-    for key in [
-        "visual_action",
-        "camera_behavior",
-        "music_behavior",
-        "ambience_behavior",
-        "end_screen_safe_area",
-    ]:
-        value = ending_tail[key]
-        if not isinstance(value, str) or not value.strip():
-            raise ValueError(
-                f"ending_tail.{key} must be a non-empty string."
-            )
-
-    combined_text = " ".join(
-        str(ending_tail[key]).lower()
-        for key in [
-            "visual_action",
-            "camera_behavior",
-            "music_behavior",
-            "ambience_behavior",
-        ]
-    )
-
-    prohibited_cta_terms = [
-        "spoken cta",
-        "call to action",
-        "subscribe",
-        "like",
-        "share",
-        "comment below",
-        "اشترك",
-        "إعجاب",
-        "شارك",
-        "اكتب تعليق",
-    ]
-
-    if any(term in combined_text for term in prohibited_cta_terms):
-        raise ValueError(
-            "ending_tail must not contain a spoken promotional CTA."
-        )
-
-
-# ===========================================================================
 # Sentence validation (final gate — used on the frozen list)
 # ===========================================================================
 
@@ -1457,8 +929,7 @@ def _validate_scene_plan(data: Dict[str, Any], total_sentences: int) -> None:
 
 _REQUIRED_TOP_LEVEL_KEYS = [
     "id", "topic", "hook", "sections", "full_script_sentences",
-    "creative_brief", "paradigm_shift", "retention_plan", "audio_arc",
-    "ending_tail", "scene_plan", "visual_bible", "quality_report",
+    "creative_brief", "retention_plan", "scene_plan", "visual_bible", "quality_report",
 ]
 
 
@@ -1494,6 +965,7 @@ def validate_script_output(data: Dict[str, Any]) -> Dict[str, Any]:
             f"ℹ️ عدد الجمل: {sentence_count} (مقبول ضمن الحدود {MIN_SENTENCES}-{MAX_SENTENCES})."
         )
 
+    # Word count is informational only — no hard 800-900 rejection.
     logger.info(f"ℹ️ إجمالي عدد الكلمات: {total_words} (لا يوجد حد أقصى/أدنى إلزامي).")
 
     _validate_creative_brief(data)
@@ -1501,12 +973,6 @@ def validate_script_output(data: Dict[str, Any]) -> Dict[str, Any]:
     _validate_visual_bible(data)
     _validate_quality_report(data)
     _validate_scene_plan(data, sentence_count)
-
-    _validate_paradigm_shift(data)
-    _validate_visual_metaphor_arc(data)
-    _validate_visual_beats(data)
-    _validate_audio_arc(data, sentence_count)
-    _validate_ending_tail(data)
 
     return data
 
@@ -1546,15 +1012,7 @@ def _repair_scene_plan(
         f"The final scene MUST end at sentence_end = {N - 1}.\n"
         f"sentence_end = {N} is OUT OF RANGE and will be rejected.\n"
         "Scenes must be contiguous: each next scene's sentence_start = previous sentence_end + 1.\n"
-        "No gaps. No overlaps. scene_id must start at 1 and increment by 1.\n"
-        "Every scene MUST include visual_beat, one of:\n"
-        "establishing, symbolic_setup, development, escalation, pattern_interrupt, "
-        "visual_reveal, metaphor_transformation, quiet_reflection, ending_tail.\n"
-        "MANDATORY BEAT CONSTRAINTS:\n"
-        "- Exactly one scene (near the very end) MUST use ending_tail.\n"
-        "  It must be the final scene or the scene immediately before the final scene.\n"
-        "- At least one scene MUST use quiet_reflection, and quiet_reflection MUST NOT be\n"
-        "  the final scene — it must appear before the ending_tail scene.\n\n"
+        "No gaps. No overlaps. scene_id must start at 1 and increment by 1.\n\n"
         f"Previous validation failure:\n{error_msg}\n\n"
         f"Episode data (context only):\n{ep_json}\n\n"
         f"Frozen full_script_sentences (DO NOT MODIFY):\n{sentences_json}\n\n"
@@ -1618,10 +1076,7 @@ def _repair_visual_bible(
         "Return only the requested JSON field (visual_bible).\n"
         "Do not return the full episode object.\n"
         "Do not use markdown.\n\n"
-        f"Reminder: character_dna MUST be exactly: \"{CHARACTER_DNA}\"\n"
-        "visual_bible MUST also include visual_metaphor_arc with keys: "
-        "central_metaphor, opening_state, development_state, escalation_state, "
-        "revelation_state, ending_state.\n\n"
+        f"Reminder: character_dna MUST be exactly: \"{CHARACTER_DNA}\"\n\n"
         f"Previous validation failure:\n{error_msg}\n\n"
         f"Episode data (context only):\n{ep_json}\n\n"
         f"Frozen full_script_sentences (DO NOT MODIFY):\n{sentences_json}\n\n"
@@ -1639,67 +1094,13 @@ def _repair_visual_bible(
     return parsed
 
 
-# ---------------------------------------------------------------------------
-# QUALITY REPORT REPAIR
-# ---------------------------------------------------------------------------
-# IMPORTANT: the original `_repair_quality_report` signature is preserved
-# exactly as it was. The extended logic (which also takes paradigm_shift,
-# audio_arc, and ending_tail into account) lives in a NEW internal function
-# `_repair_quality_report_extended`. The public wrapper delegates to it,
-# passing None for the three new fields so existing callers stay compatible.
-# ---------------------------------------------------------------------------
-
 def _repair_quality_report(
-    full_script_sentences: List[str],
-    creative_brief: Any,
-    retention_plan: Any,
-    scene_plan: Any,
-    visual_bible: Any,
-    current_quality_report: Any,
-    error_msg: Any,
+    full_script_sentences: List[str], creative_brief: Any, retention_plan: Any,
+    scene_plan: Any, visual_bible: Any, current_quality_report: Any, error_msg: Any,
 ) -> Dict[str, Any]:
-    """
-    ORIGINAL signature — preserved unchanged.
-    Delegates to `_repair_quality_report_extended` with the new optional
-    fields (paradigm_shift / audio_arc / ending_tail) set to None.
-    """
-    return _repair_quality_report_extended(
-        full_script_sentences=full_script_sentences,
-        creative_brief=creative_brief,
-        paradigm_shift=None,
-        retention_plan=retention_plan,
-        audio_arc=None,
-        ending_tail=None,
-        scene_plan=scene_plan,
-        visual_bible=visual_bible,
-        current_quality_report=current_quality_report,
-        error_msg=error_msg,
-    )
-
-
-def _repair_quality_report_extended(
-    full_script_sentences: List[str],
-    creative_brief: Any,
-    paradigm_shift: Any,
-    retention_plan: Any,
-    audio_arc: Any,
-    ending_tail: Any,
-    scene_plan: Any,
-    visual_bible: Any,
-    current_quality_report: Any,
-    error_msg: Any,
-) -> Dict[str, Any]:
-    """
-    Internal extended version of the quality_report repair. Accepts
-    paradigm_shift, audio_arc, and ending_tail so the quality_report scores
-    reflect the full auxiliary structure — not only the script and scene plan.
-    """
     sentences_json = json.dumps(full_script_sentences, ensure_ascii=False, indent=2)
     cb_json = json.dumps(creative_brief, ensure_ascii=False, indent=2)
-    ps_json = json.dumps(paradigm_shift, ensure_ascii=False, indent=2)
     rp_json = json.dumps(retention_plan, ensure_ascii=False, indent=2)
-    aa_json = json.dumps(audio_arc, ensure_ascii=False, indent=2)
-    et_json = json.dumps(ending_tail, ensure_ascii=False, indent=2)
     sp_json = json.dumps(scene_plan, ensure_ascii=False, indent=2)
     vb_json = json.dumps(visual_bible, ensure_ascii=False, indent=2)
     current_json = json.dumps(current_quality_report, ensure_ascii=False, indent=2) if current_quality_report is not None else "null"
@@ -1709,16 +1110,11 @@ def _repair_quality_report_extended(
         "Return only the requested JSON field (quality_report).\n"
         "Do not return the full episode object.\n"
         "Do not use markdown.\n\n"
-        "Scores must be numbers between 0 and 10. approved must be a real boolean.\n"
-        "You MUST evaluate the paradigm_shift, audio_arc, and ending_tail as part of your scoring,\n"
-        "not only the script and the scene plan.\n\n"
+        "Scores must be numbers between 0 and 10. approved must be a real boolean.\n\n"
         f"Previous validation failure:\n{error_msg}\n\n"
         f"Frozen full_script_sentences:\n{sentences_json}\n\n"
         f"creative_brief:\n{cb_json}\n\n"
-        f"paradigm_shift:\n{ps_json}\n\n"
         f"retention_plan:\n{rp_json}\n\n"
-        f"audio_arc:\n{aa_json}\n\n"
-        f"ending_tail:\n{et_json}\n\n"
         f"scene_plan:\n{sp_json}\n\n"
         f"visual_bible:\n{vb_json}\n\n"
         f"Current (possibly broken) quality_report:\n{current_json}\n\n"
@@ -1732,108 +1128,6 @@ def _repair_quality_report_extended(
         raise ValueError("استجابة إصلاح quality_report يجب أن تكون كائن JSON.")
     if isinstance(parsed.get("quality_report"), dict):
         return parsed["quality_report"]
-    return parsed
-
-
-# ---------------------------------------------------------------------------
-# NEW individual repair calls: paradigm_shift / audio_arc / ending_tail
-# ---------------------------------------------------------------------------
-
-def _repair_paradigm_shift(
-    full_script_sentences: List[str], current_paradigm_shift: Any, episode_data: Dict[str, Any], error_msg: Any
-) -> Dict[str, Any]:
-    sentences_json = json.dumps(full_script_sentences, ensure_ascii=False, indent=2)
-    current_json = json.dumps(current_paradigm_shift, ensure_ascii=False, indent=2) if current_paradigm_shift is not None else "null"
-    ep_json = json.dumps(episode_data, ensure_ascii=False, indent=2)
-
-    user_prompt = (
-        "This is a fresh independent repair request.\n"
-        "The provided full_script_sentences is frozen and must not be changed.\n"
-        "Return only the requested JSON field (paradigm_shift).\n"
-        "Do not return the full episode object.\n"
-        "Do not use markdown.\n\n"
-        "CRITICAL: final_question MUST be an actual interrogative sentence ending with '?'.\n\n"
-        f"Previous validation failure:\n{error_msg}\n\n"
-        f"Episode data (context only):\n{ep_json}\n\n"
-        f"Frozen full_script_sentences (DO NOT MODIFY):\n{sentences_json}\n\n"
-        f"Current (possibly broken) paradigm_shift:\n{current_json}\n\n"
-        "Return ONLY the paradigm_shift JSON object now."
-    )
-
-    raw = call_gemini_with_fallback(system_instruction=_REPAIR_PARADIGM_SHIFT_SYSTEM_PROMPT, user_prompt=user_prompt)
-    parsed = _parse_json_safe(raw)
-
-    if not isinstance(parsed, dict):
-        raise ValueError("استجابة إصلاح paradigm_shift يجب أن تكون كائن JSON.")
-    if isinstance(parsed.get("paradigm_shift"), dict):
-        return parsed["paradigm_shift"]
-    return parsed
-
-
-def _repair_audio_arc(
-    full_script_sentences: List[str], current_audio_arc: Any, episode_data: Dict[str, Any], error_msg: Any
-) -> Dict[str, Any]:
-    N = len(full_script_sentences)
-    sentences_json = json.dumps(full_script_sentences, ensure_ascii=False, indent=2)
-    current_json = json.dumps(current_audio_arc, ensure_ascii=False, indent=2) if current_audio_arc is not None else "null"
-    ep_json = json.dumps(episode_data, ensure_ascii=False, indent=2)
-
-    user_prompt = (
-        "This is a fresh independent repair request.\n"
-        "The provided full_script_sentences is frozen and must not be changed.\n"
-        "Return only the requested JSON field (audio_arc).\n"
-        "Do not return the full episode object.\n"
-        "Do not use markdown.\n\n"
-        f"Number of sentences N = {N}. Valid indices are 0 through {N - 1}.\n"
-        "Reminder: dramatic_silence_sentence_indices and music_drop_sentence_indices must be JSON arrays of valid indices.\n"
-        "At least one dramatic silence index is required.\n\n"
-        f"Previous validation failure:\n{error_msg}\n\n"
-        f"Episode data (context only):\n{ep_json}\n\n"
-        f"Frozen full_script_sentences (DO NOT MODIFY):\n{sentences_json}\n\n"
-        f"Current (possibly broken) audio_arc:\n{current_json}\n\n"
-        "Return ONLY the audio_arc JSON object now."
-    )
-
-    raw = call_gemini_with_fallback(system_instruction=_REPAIR_AUDIO_ARC_SYSTEM_PROMPT, user_prompt=user_prompt)
-    parsed = _parse_json_safe(raw)
-
-    if not isinstance(parsed, dict):
-        raise ValueError("استجابة إصلاح audio_arc يجب أن تكون كائن JSON.")
-    if isinstance(parsed.get("audio_arc"), dict):
-        return parsed["audio_arc"]
-    return parsed
-
-
-def _repair_ending_tail(
-    full_script_sentences: List[str], current_ending_tail: Any, episode_data: Dict[str, Any], error_msg: Any
-) -> Dict[str, Any]:
-    sentences_json = json.dumps(full_script_sentences, ensure_ascii=False, indent=2)
-    current_json = json.dumps(current_ending_tail, ensure_ascii=False, indent=2) if current_ending_tail is not None else "null"
-    ep_json = json.dumps(episode_data, ensure_ascii=False, indent=2)
-
-    user_prompt = (
-        "This is a fresh independent repair request.\n"
-        "The provided full_script_sentences is frozen and must not be changed.\n"
-        "Return only the requested JSON field (ending_tail).\n"
-        "Do not return the full episode object.\n"
-        "Do not use markdown.\n\n"
-        "Reminder: duration_seconds must be between 8 and 12 inclusive.\n"
-        "spoken_audio_ends_before_tail must be true.\n"
-        "No spoken promotional CTA allowed.\n\n"
-        f"Previous validation failure:\n{error_msg}\n\n"
-        f"Episode data (context only):\n{ep_json}\n\n"
-        f"Frozen full_script_sentences (DO NOT MODIFY):\n{sentences_json}\n\n"
-        f"Current (possibly broken) ending_tail:\n{current_json}\n\n"
-        "Return ONLY the ending_tail JSON object now."
-    )
-
-    raw = call_gemini_with_fallback(system_instruction=_REPAIR_ENDING_TAIL_SYSTEM_PROMPT, user_prompt=user_prompt)
-    parsed = _parse_json_safe(raw)
-
-    if not isinstance(parsed, dict):
-        raise ValueError("استجابة إصلاح ending_tail يجب أن تكون كائن JSON.")
-    if isinstance(parsed.get("ending_tail"), dict):
-        return parsed["ending_tail"]
     return parsed
 
 
@@ -1853,7 +1147,6 @@ def _repair_scene_plan_with_attempts(
             test_data = copy.deepcopy(data)
             test_data["scene_plan"] = sp
             _validate_scene_plan(test_data, N)
-            _validate_visual_beats(test_data)
             return sp
         except Exception as e:
             last_err = e
@@ -1894,7 +1187,6 @@ def _repair_visual_bible_with_attempts(
             test_data = copy.deepcopy(data)
             test_data["visual_bible"] = vb
             _validate_visual_bible(test_data)
-            _validate_visual_metaphor_arc(test_data)
             return vb
         except Exception as e:
             last_err = e
@@ -1906,23 +1198,15 @@ def _repair_visual_bible_with_attempts(
 def _repair_quality_report_with_attempts(
     data: Dict[str, Any], episode_data: Dict[str, Any], first_error: Any,
 ) -> Dict[str, Any]:
-    """
-    Calls the EXTENDED quality_report repair internally, so paradigm_shift,
-    audio_arc, and ending_tail are properly considered in scoring.
-    The public `_repair_quality_report` signature remains unchanged.
-    """
     last_err: Any = first_error
     current = data.get("quality_report")
 
     for attempt in range(MAX_FIELD_REPAIR_ATTEMPTS):
         try:
-            qr = _repair_quality_report_extended(
+            qr = _repair_quality_report(
                 full_script_sentences=data["full_script_sentences"],
                 creative_brief=data.get("creative_brief"),
-                paradigm_shift=data.get("paradigm_shift"),
                 retention_plan=data.get("retention_plan"),
-                audio_arc=data.get("audio_arc"),
-                ending_tail=data.get("ending_tail"),
                 scene_plan=data.get("scene_plan"),
                 visual_bible=data.get("visual_bible"),
                 current_quality_report=current,
@@ -1939,71 +1223,6 @@ def _repair_quality_report_with_attempts(
     raise ValueError(f"فشل إصلاح quality_report بعد {MAX_FIELD_REPAIR_ATTEMPTS} محاولات. آخر خطأ: {last_err}")
 
 
-# ---------------------------------------------------------------------------
-# NEW retry wrappers for paradigm_shift / audio_arc / ending_tail
-# ---------------------------------------------------------------------------
-
-def _repair_paradigm_shift_with_attempts(
-    full_script_sentences: List[str], data: Dict[str, Any], episode_data: Dict[str, Any], first_error: Any,
-) -> Dict[str, Any]:
-    last_err: Any = first_error
-    current = data.get("paradigm_shift")
-
-    for attempt in range(MAX_FIELD_REPAIR_ATTEMPTS):
-        try:
-            ps = _repair_paradigm_shift(full_script_sentences, current, episode_data, last_err)
-            test_data = copy.deepcopy(data)
-            test_data["paradigm_shift"] = ps
-            _validate_paradigm_shift(test_data)
-            return ps
-        except Exception as e:
-            last_err = e
-            logger.warning(f"paradigm_shift repair attempt {attempt + 1}/{MAX_FIELD_REPAIR_ATTEMPTS} failed: {e}")
-
-    raise ValueError(f"فشل إصلاح paradigm_shift بعد {MAX_FIELD_REPAIR_ATTEMPTS} محاولات. آخر خطأ: {last_err}")
-
-
-def _repair_audio_arc_with_attempts(
-    full_script_sentences: List[str], data: Dict[str, Any], episode_data: Dict[str, Any], first_error: Any,
-) -> Dict[str, Any]:
-    last_err: Any = first_error
-    current = data.get("audio_arc")
-    N = len(full_script_sentences)
-
-    for attempt in range(MAX_FIELD_REPAIR_ATTEMPTS):
-        try:
-            aa = _repair_audio_arc(full_script_sentences, current, episode_data, last_err)
-            test_data = copy.deepcopy(data)
-            test_data["audio_arc"] = aa
-            _validate_audio_arc(test_data, N)
-            return aa
-        except Exception as e:
-            last_err = e
-            logger.warning(f"audio_arc repair attempt {attempt + 1}/{MAX_FIELD_REPAIR_ATTEMPTS} failed: {e}")
-
-    raise ValueError(f"فشل إصلاح audio_arc بعد {MAX_FIELD_REPAIR_ATTEMPTS} محاولات. آخر خطأ: {last_err}")
-
-
-def _repair_ending_tail_with_attempts(
-    full_script_sentences: List[str], data: Dict[str, Any], episode_data: Dict[str, Any], first_error: Any,
-) -> Dict[str, Any]:
-    last_err: Any = first_error
-    current = data.get("ending_tail")
-
-    for attempt in range(MAX_FIELD_REPAIR_ATTEMPTS):
-        try:
-            et = _repair_ending_tail(full_script_sentences, current, episode_data, last_err)
-            test_data = copy.deepcopy(data)
-            test_data["ending_tail"] = et
-            _validate_ending_tail(test_data)
-            return et
-        except Exception as e:
-            last_err = e
-            logger.warning(f"ending_tail repair attempt {attempt + 1}/{MAX_FIELD_REPAIR_ATTEMPTS} failed: {e}")
-
-    raise ValueError(f"فشل إصلاح ending_tail بعد {MAX_FIELD_REPAIR_ATTEMPTS} محاولات. آخر خطأ: {last_err}")
-
-
 # ===========================================================================
 # Merge + partial repair orchestrator (operates on the frozen sentence set)
 # ===========================================================================
@@ -2014,9 +1233,7 @@ def _merge_and_validate_partial_repairs(
     """
     base_data already has a valid, frozen full_script_sentences.
     Attempts to repair only the auxiliary fields that fail validation:
-      paradigm_shift / retention_plan / audio_arc / ending_tail /
-      visual_bible (including visual_metaphor_arc) /
-      scene_plan (including visual_beat) / quality_report.
+      retention_plan / visual_bible / scene_plan / quality_report.
     creative_brief has no repair path — its failure bubbles up so the caller
     can trigger a fresh auxiliary-generation attempt (Phase D), never touching
     the frozen sentences.
@@ -2031,15 +1248,6 @@ def _merge_and_validate_partial_repairs(
     if not _field_is_valid(_validate_creative_brief, data):
         _validate_creative_brief(data)  # raises with the real reason
 
-    if not _field_is_valid(_validate_paradigm_shift, data):
-        logger.info("Detected invalid paradigm_shift. Attempting partial repair...")
-        ps = _repair_paradigm_shift_with_attempts(
-            full_script_sentences=sentences, data=data, episode_data=episode_data,
-            first_error="paradigm_shift validation failed.",
-        )
-        data["paradigm_shift"] = ps
-        _validate_paradigm_shift(data)
-
     if not _field_is_valid(_validate_retention_plan, data):
         logger.info("Detected invalid retention_plan. Attempting partial repair...")
         rp = _repair_retention_plan_with_attempts(
@@ -2049,55 +1257,28 @@ def _merge_and_validate_partial_repairs(
         data["retention_plan"] = rp
         _validate_retention_plan(data)
 
-    if not _field_is_valid(_validate_audio_arc, data, N):
-        logger.info("Detected invalid audio_arc. Attempting partial repair...")
-        aa = _repair_audio_arc_with_attempts(
-            full_script_sentences=sentences, data=data, episode_data=episode_data,
-            first_error="audio_arc validation failed.",
-        )
-        data["audio_arc"] = aa
-        _validate_audio_arc(data, N)
-
-    if not _field_is_valid(_validate_ending_tail, data):
-        logger.info("Detected invalid ending_tail. Attempting partial repair...")
-        et = _repair_ending_tail_with_attempts(
-            full_script_sentences=sentences, data=data, episode_data=episode_data,
-            first_error="ending_tail validation failed.",
-        )
-        data["ending_tail"] = et
-        _validate_ending_tail(data)
-
-    if not _field_is_valid(_validate_visual_bible, data) or not _field_is_valid(_validate_visual_metaphor_arc, data):
+    if not _field_is_valid(_validate_visual_bible, data):
         logger.info("Detected invalid visual_bible. Attempting partial repair...")
-        first_err: Any = "visual_bible validation failed."
-        try:
-            _validate_visual_bible(data)
-            _validate_visual_metaphor_arc(data)
-        except ValueError as e:
-            first_err = e
         vb = _repair_visual_bible_with_attempts(
             full_script_sentences=sentences, data=data, episode_data=episode_data,
-            first_error=first_err,
+            first_error="visual_bible validation failed.",
         )
         data["visual_bible"] = vb
         _validate_visual_bible(data)
-        _validate_visual_metaphor_arc(data)
 
-    if not _field_is_valid(_validate_scene_plan, data, N) or not _field_is_valid(_validate_visual_beats, data):
+    if not _field_is_valid(_validate_scene_plan, data, N):
         logger.info("Detected invalid scene_plan. Attempting partial repair...")
-        first_err_sp: Any = "scene_plan validation failed."
+        first_err: Any = "scene_plan validation failed."
         try:
             _validate_scene_plan(data, N)
-            _validate_visual_beats(data)
         except ValueError as e:
-            first_err_sp = e
+            first_err = e
 
         sp = _repair_scene_plan_with_attempts(
-            full_script_sentences=sentences, data=data, episode_data=episode_data, first_error=first_err_sp,
+            full_script_sentences=sentences, data=data, episode_data=episode_data, first_error=first_err,
         )
         data["scene_plan"] = sp
         _validate_scene_plan(data, N)
-        _validate_visual_beats(data)
 
     if not _field_is_valid(_validate_quality_report, data):
         logger.info("Detected invalid quality_report. Attempting partial repair...")
