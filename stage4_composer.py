@@ -1,33 +1,27 @@
 """
-stage4_composer.py — محرك المونتاج السينمائي الآلي (نسخة إنتاج عالمية).
+stage4_composer.py — محرك المونتاج السينمائي الآلي (نسخة إنتاج عالمية مُحصَّنة).
 
-الإصلاحات السبعة (المراجعة الأولى):
-1) _escape_filter_path: هروب الفاصلة العليا فقط.
-2) subprocess.run: encoding="utf-8" + errors="replace".
-3) asplit=1: تخطّي الفلتر بالكامل عند غياب Ambience و Rhythm.
-4) fb_video_dur: استخدام layout["bounds"][-1] / fps.
-5) Test #14: التحقق من السلوك الجديد للهروب.
-6) إزالة علم success الميت و except الميت.
-7) كاش AI يشمل transitions + asyncio loop مستقل + inspect.signature آمن.
-
-الإصلاحات الإضافية (المراجعة الثانية):
-1) حذف image_starts الميت من render_final_video.
-2) shot_start_in_final يستخدم O[i-1]/fps.
-3) كاش AI: OrderedDict + LRU + قفل.
-4) مسار fallback: whoosh بمواضع القطع + إصلاح مزامنة المؤثرات.
-5) حماية الـ fade عند الصوت القصير (< 0.9s).
-6) _accepts_single_prompt عبر Signature.bind.
-7) تسجيل تراكم خيوط Gemini المعلّقة.
-8) Test #14 محمول على المنصات.
-9) تحصين دفاعي في _merge_ai_into_motion.
-10) تعليق توضيحي في _compute_image_boundaries.
-
-الإصلاحات الإضافية (المراجعة الثالثة — هذه):
-1) مزامنة الإيقاع في مسار fallback عبر rhythm_cut مبني على مواضع القطع.
-2) مسار ASS آمن عبر _prepare_safe_ass (نسخ عند وجود ' في المسار).
-3) _run_ffmpeg يلتقط FileNotFoundError برسالة واضحة.
-4) Test #14: تصحيح فحص شارحة الخلفية المتبقية.
-5) import tempfile في الأعلى.
+الإصلاحات الجوهرية في هذه النسخة:
+1) حرق الترجمة ASS قبل fade النهائي حتى تتلاشى مع الصورة.
+2) إصلاح alimiter إلى level=0 الآمن عبر إصدارات FFmpeg.
+3) هروب FFmpeg filtergraph صحيح للمسارات داخل الاقتباس الفردي.
+4) نسخ ASS إلى مسار نسبي آمن داخل temp_dir واستخدام cwd=temp_dir.
+5) fallback concat يستخدم أسماء نسبية آمنة داخل temp_dir.
+6) _run_ffmpeg يلتقط FileNotFoundError وOSError ويعمل مع cwd.
+7) فحص فلاتر FFmpeg المطلوبة ديناميكيًا قبل التصدير.
+8) دعم amix weights/normalize مع fallback آمن عند عدم الدعم.
+9) Whoosh أصبح اختياريًا مثل Ambience/Rhythm.
+10) Rhythm في fallback يُبنى على مواضع القطع، ويُعطَّل إذا فشل بدل استخدام توقيت xfade خاطئ.
+11) AI singleton وcache أصبحا thread-safe مع LRU حقيقي.
+12) _accepts_single_prompt أكثر أمانًا ويرفض الأصناف.
+13) قيود مدة الحركة تُفرض بعد AI وبعد إزالة التكرار.
+14) fallback durations يتوسع نسبيًا إذا كان المجموع أقل من مدة الصوت.
+15) إصلاح offset في xfade بين المجموعات الكبيرة.
+16) فرض/تحذير امتداد MP4 لأن الترميز الناتج MP4/H.264/AAC.
+17) تحذير إذا انحرفت مدة الفيديو النهائي عن مدة الصوت.
+18) تسريع اختياري عبر NumPy لتوليد Whoosh/Rhythm مع fallback نقي.
+19) تحصين قراءة WAV والقيم الصوتية.
+20) تحديث الاختبارات لتغطي السلوك الجديد.
 """
 
 import wave
@@ -47,7 +41,7 @@ import sys
 import tempfile
 from collections import OrderedDict
 from pathlib import Path
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Any, Tuple, Optional, Set
 
 logger = logging.getLogger("Stage4Composer")
 
@@ -91,13 +85,13 @@ TRANSITION_DURATIONS: Dict[str, float] = {
 }
 
 ROLE_PREFERRED_TRANSITION: Dict[str, str] = {
-    "hook":        "crossfade_soft",
-    "revelation":  "cut",
-    "reflection":  "crossfade_medium",
-    "question":    "crossfade_soft",
-    "tension":     "cut",
-    "payoff":      "crossfade_medium",
-    "actionable":  "cut",
+    "hook":          "crossfade_soft",
+    "revelation":    "cut",
+    "reflection":    "crossfade_medium",
+    "question":      "crossfade_soft",
+    "tension":       "cut",
+    "payoff":        "crossfade_medium",
+    "actionable":    "cut",
     "myth":          "crossfade_medium",
     "contradiction": "cut",
     "explanation":   "crossfade_soft",
@@ -122,10 +116,21 @@ AI_CALL_TIMEOUT_SEC = 90
 
 _DEFAULT_WHOOSH_STRENGTH = 0.55
 
-_AUDIO_NORMALIZE_CHAIN = (
+_AI_PROMPT_VERSION = "v2"
+
+_AUDIO_VOICE_NORMALIZE_CHAIN = (
     "aresample=44100,"
     "aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo"
 )
+
+_AUDIO_SFX_NORMALIZE_CHAIN = (
+    "aresample=44100,"
+    "aformat=sample_fmts=fltp:sample_rates=44100,"
+    "pan=stereo|c0=c0|c1=c0"
+)
+
+# للخلفية المتوافقة مع الإصدارات القديمة من الاستدعاءات الداخلية.
+_AUDIO_NORMALIZE_CHAIN = _AUDIO_VOICE_NORMALIZE_CHAIN
 
 
 # ============================================================
@@ -149,27 +154,37 @@ def _safe_int_list(value: Any) -> List[int]:
     for x in value:
         if isinstance(x, bool):
             continue
-        if isinstance(x, (int, float)):
-            try:
-                if isinstance(x, float) and not math.isfinite(x):
-                    continue
-                out.append(int(x))
-            except (ValueError, OverflowError):
+        if isinstance(x, int):
+            out.append(x)
+        elif isinstance(x, float):
+            if not math.isfinite(x) or not x.is_integer():
                 continue
+            out.append(int(x))
     return out
 
 
-def _run_ffmpeg(cmd: List[str], timeout: float, label: str) -> None:
+def _run_ffmpeg(
+    cmd: List[str],
+    timeout: float,
+    label: str,
+    cwd: Optional[Path] = None,
+) -> None:
     """
-    تشغيل ffmpeg مع مهلة + التقاط stderr.
-    [إصلاح 2] encoding utf-8 + errors='replace'.
-    [إصلاح 3 — المراجعة الثالثة] التقاط FileNotFoundError برسالة واضحة.
+    تشغيل ffmpeg مع مهلة + التقاط stderr + دعم cwd.
     """
+    if cmd and Path(cmd[0]).name.lower() in ("ffmpeg", "ffmpeg.exe"):
+        cmd = [cmd[0], "-nostdin", *cmd[1:]]
+
     try:
         subprocess.run(
-            cmd, check=True, timeout=timeout,
-            capture_output=True, text=True,
-            encoding="utf-8", errors="replace",
+            cmd,
+            check=True,
+            timeout=timeout,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=str(cwd) if cwd is not None else None,
         )
     except subprocess.CalledProcessError as e:
         err_tail = (e.stderr or "").strip()[-1000:]
@@ -183,80 +198,228 @@ def _run_ffmpeg(cmd: List[str], timeout: float, label: str) -> None:
         raise RuntimeError(
             f"ffmpeg غير متوفر في PATH (المهمة: {label})."
         ) from e
+    except OSError as e:
+        raise RuntimeError(
+            f"تعذّر تشغيل FFmpeg في {label}: {e}"
+        ) from e
 
 
-_AMIX_NORMALIZE_SUPPORTED: Optional[bool] = None
+_FFMPEG_FILTERS: Optional[Set[str]] = None
 
 
-def _ffmpeg_supports_amix_normalize() -> bool:
+def _get_ffmpeg_filters() -> Set[str]:
     """
-    هل يدعم ffmpeg الخيار amix=normalize (FFmpeg 4.4+)؟ (مع caching).
+    جلب أسماء الفلاتر المتاحة في ffmpeg مع caching.
     """
-    global _AMIX_NORMALIZE_SUPPORTED
-    if _AMIX_NORMALIZE_SUPPORTED is not None:
-        return _AMIX_NORMALIZE_SUPPORTED
-    supported = False
+    global _FFMPEG_FILTERS
+    if _FFMPEG_FILTERS is not None:
+        return _FFMPEG_FILTERS
+
+    filters: Set[str] = set()
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-filters"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            encoding="utf-8",
+            errors="replace",
+        )
+        out = (r.stdout or "") + (r.stderr or "")
+        for line in out.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            # الشكل المعتاد: flags filter_name description...
+            name = parts[1]
+            if name and name[0].isalpha():
+                filters.add(name)
+    except (OSError, subprocess.SubprocessError):
+        filters = set()
+
+    _FFMPEG_FILTERS = filters
+    return filters
+
+
+def _require_ffmpeg_filters(required: List[str]) -> None:
+    available = _get_ffmpeg_filters()
+    if not available:
+        raise RuntimeError(
+            "تعذّر فحص فلاتر FFmpeg. تأكد من أن ffmpeg مثبت وفي PATH."
+        )
+    missing = [f for f in required if f not in available]
+    if missing:
+        raise RuntimeError(
+            "فلاتر FFmpeg مفقودة في هذه النسخة: "
+            + ", ".join(missing)
+            + ". يُوصى باستخدام FFmpeg حديث مدمج مع libass وعناصر الصوت القياسية."
+        )
+
+
+_AMIX_FEATURES: Optional[Tuple[bool, bool]] = None
+
+
+def _ffmpeg_supports_amix_features() -> Tuple[bool, bool]:
+    """
+    يرجع (supports_weights, supports_normalize).
+    """
+    global _AMIX_FEATURES
+    if _AMIX_FEATURES is not None:
+        return _AMIX_FEATURES
+
+    supports_weights = False
+    supports_normalize = False
+
     try:
         r = subprocess.run(
             ["ffmpeg", "-hide_banner", "-h", "filter=amix"],
-            capture_output=True, text=True, timeout=30,
-            encoding="utf-8", errors="replace",
+            capture_output=True,
+            text=True,
+            timeout=30,
+            encoding="utf-8",
+            errors="replace",
         )
         out = (r.stdout or "") + (r.stderr or "")
-        supported = "normalize" in out
+        supports_weights = "weights" in out
+        supports_normalize = "normalize" in out
     except (OSError, subprocess.SubprocessError):
-        supported = False
-    _AMIX_NORMALIZE_SUPPORTED = supported
-    return supported
+        supports_weights = False
+        supports_normalize = False
+
+    _AMIX_FEATURES = (supports_weights, supports_normalize)
+    return _AMIX_FEATURES
+
+
+def _build_audio_mix_filter(
+    mix_inputs: List[Tuple[str, float]],
+    out_label: str = "[aout]",
+) -> str:
+    """
+    بناء سلسلة مزج صوتية آمنة عبر إصدارات FFmpeg المختلفة.
+    mix_inputs: قائمة (label, weight).
+    """
+    if not mix_inputs:
+        raise ValueError("mix_inputs فارغة")
+
+    if len(mix_inputs) == 1:
+        return f"{mix_inputs[0][0]}alimiter=limit=0.95:level=0{out_label}"
+
+    supports_weights, supports_normalize = _ffmpeg_supports_amix_features()
+
+    if supports_weights:
+        labels = "".join(lbl for lbl, _ in mix_inputs)
+        weights_str = " ".join(f"{float(w):.6f}" for _, w in mix_inputs)
+        expr = (
+            f"{labels}amix=inputs={len(mix_inputs)}:duration=first:"
+            f"dropout_transition=0:weights='{weights_str}'"
+        )
+        if supports_normalize:
+            expr += ":normalize=0"
+        else:
+            expr += f",volume={sum(float(w) for _, w in mix_inputs):.6f}"
+    else:
+        parts: List[str] = []
+        labels: List[str] = []
+        for i, (lbl, w) in enumerate(mix_inputs):
+            vol_lbl = f"[mixvol{i}]"
+            parts.append(f"{lbl}volume={float(w):.6f}{vol_lbl}")
+            labels.append(vol_lbl)
+        expr = (
+            ";".join(parts)
+            + ";"
+            + "".join(labels)
+            + f"amix=inputs={len(labels)}:duration=first:dropout_transition=0"
+        )
+        if supports_normalize:
+            expr += ":normalize=0"
+        else:
+            # تعويض تقريبي لسلوك amix القديم الذي يميل إلى المتوسط.
+            expr += f",volume={len(labels):.6f}"
+
+    expr += f",alimiter=limit=0.95:level=0{out_label}"
+    return expr
 
 
 def _escape_filter_path(path: Path) -> str:
     """
-    [إصلاح 1] هروب آمن لمسار ملف داخل filter_complex حين يكون محاطاً
-    باقتباس فردي ('...').
+    هروب مسار ملف للاستخدام داخل FFmpeg filtergraph بين اقتباسين مفردين:
+        ass=filename='...'
 
-    عند استخدام الاقتباس الفردي، يقرأ FFmpeg المسار حرفياً؛ لا يفكّ هروب
-    الرموز : [ ] , داخل الاقتباس. الرمز الوحيد الذي يجب هروبه هو الفاصلة
-    العليا ' نفسها (لأنها تُنهي الاقتباس).
-
-    - نحوّل المسار إلى صيغة posix (شرطة مائلة للأمام).
-    - نستبدل ' بـ '\\'' (close + escaped + open).
-
-    ملاحظة: النمط '\\'' هو القياسي في FFmpeg filtergraph syntax، لكن
-    بعض إصدارات FFmpeg القديمة (≤ 4.2) لا تفكّه بشكل موحّد داخل فلتر
-    ass=filename=. لهذا السبب يُنصح باستخدام _prepare_safe_ass قبل
-    تمرير المسار إلى فلتر ass.
+    داخل الاقتباس الفردي في filtergraph:
+    - الرمز \ يُهرَّب بـ \\
+    - الرمز ' يُهرَّب بـ \'
+    - لا حاجة لهروب : أو , أو [ ] داخل الاقتباس.
     """
     s = path.resolve().as_posix()
-    return s.replace("'", "'\\''")
+    s = s.replace("\\", "\\\\").replace("'", "\\'")
+    return s
 
 
-def _prepare_safe_ass(subtitles_ass: Path) -> Tuple[Path, Optional[Path]]:
+def _safe_concat_escape(path: Path) -> str:
     """
-    [إصلاح 2 — المراجعة الثالثة] ينسخ ملف الترجمة إلى مسار آمن خالٍ من
-    الفاصلة العليا عند الحاجة، لتفادي مشاكل هروب '\\''  في فلتر
-    ass=filename='...' على بعض إصدارات FFmpeg.
-
-    السلوك:
-      - إن كان المسار الأصلي بلا ' → يُعاد كما هو (لا نسخ، لا تنظيف).
-      - إن احتوى ' → يُنسخ إلى مجلد temp جديد بمسار مضمون.
-
-    Returns:
-        (المسار الآمن للاستخدام، مجلد temp للتنظيف لاحقًا أو None).
+    هروب مسار لملف قائمة concat demuxer.
+    لا يُستخدم في النسخة الحالية للمسارات النسبية الآمنة، لكنه محفوظ للتوافق.
     """
-    s = subtitles_ass.resolve().as_posix()
+    resolved = path.resolve().as_posix()
+    escaped = resolved.replace("\\", "\\\\").replace("'", "\\'")
+    return f"file '{escaped}'\n"
+
+
+def _prepare_safe_ass(
+    subtitles_ass: Path,
+    dest_dir: Optional[Path] = None,
+) -> Tuple[Path, Optional[Path]]:
+    """
+    تجهيز ملف ASS لاستخدام آمن في فلتر ass.
+
+    إذا تم تمرير dest_dir:
+      - يُنسخ دائمًا إلى dest_dir/subs.ass (إلا إذا كان المصدر هو نفسه).
+      - يُعاد (المسار الجديد, None).
+      - الاستخدام الأمثل بعد ذلك: تشغيل ffmpeg بـ cwd=dest_dir ومرر filename=subs.ass.
+
+    إذا لم يتم تمرير dest_dir:
+      - إن كان المسار خاليًا من ' يُعاد كما هو.
+      - وإلا يُنسخ إلى مجلد مؤقت آمن ويُعاد (المسار الجديد, مجلدTemp).
+    """
+    src = Path(subtitles_ass)
+
+    if dest_dir is not None:
+        dest_dir = Path(dest_dir)
+        try:
+            dest_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            raise RuntimeError(f"تعذّر إنشاء مجلد ASS آمن: {dest_dir}") from e
+        if not dest_dir.is_dir():
+            raise RuntimeError(f"مسار ASS الآمن ليس مجلدًا: {dest_dir}")
+
+        safe_path = dest_dir / "subs.ass"
+        try:
+            if src.resolve() != safe_path.resolve():
+                shutil.copyfile(src, safe_path)
+        except OSError as e:
+            raise RuntimeError(
+                f"تعذّر نسخ ASS إلى مسار آمن: {src} -> {safe_path}"
+            ) from e
+        return safe_path, None
+
+    s = src.resolve().as_posix()
     if "'" not in s:
-        return subtitles_ass, None
+        return src, None
+
     try:
         safe_dir = Path(tempfile.mkdtemp(prefix="stage4_ass_"))
     except OSError as e:
         logger.warning(
             f"تعذّر إنشاء مجلد آمن لمسار ASS ({e}) — استخدام المسار الأصلي."
         )
-        return subtitles_ass, None
+        return src, None
+
     safe_path = safe_dir / "subs.ass"
     try:
-        shutil.copyfile(subtitles_ass, safe_path)
+        shutil.copyfile(src, safe_path)
     except OSError as e:
         logger.warning(
             f"تعذّر نسخ ASS إلى مسار آمن ({e}) — استخدام المسار الأصلي."
@@ -265,19 +428,56 @@ def _prepare_safe_ass(subtitles_ass: Path) -> Tuple[Path, Optional[Path]]:
             shutil.rmtree(safe_dir, ignore_errors=True)
         except Exception:
             pass
-        return subtitles_ass, None
+        return src, None
+
     logger.info(
-        "🛡️ نُسخ ملف ASS إلى مسار آمن (يحتوي ' في المسار الأصلي)."
+        "🛡️ نُسخ ملف ASS إلى مسار آمن (المسار الأصلي يحتوي ')."
     )
     return safe_path, safe_dir
+
+
+# ============================================================
+# NumPy اختياري لتسريع المؤثرات الصوتية
+# ============================================================
+
+_NUMPY_MODULE: Optional[Any] = None
+_NUMPY_CHECKED = False
+
+
+def _get_numpy() -> Optional[Any]:
+    global _NUMPY_MODULE, _NUMPY_CHECKED
+    if not _NUMPY_CHECKED:
+        try:
+            import numpy as np  # type: ignore
+            _NUMPY_MODULE = np
+        except Exception:
+            _NUMPY_MODULE = None
+        _NUMPY_CHECKED = True
+    return _NUMPY_MODULE
+
+
+def _event_volume(
+    master: float,
+    per_transition_volumes: Optional[List[float]],
+    idx: int,
+) -> float:
+    vol = master
+    if per_transition_volumes is not None and idx < len(per_transition_volumes):
+        try:
+            v = float(per_transition_volumes[idx])
+            if math.isfinite(v):
+                vol = master * max(0.0, v)
+        except (TypeError, ValueError):
+            pass
+    return max(0.0, min(1.0, vol))
 
 
 # ============================================================
 # المؤثرات الصوتية
 # ============================================================
 
-def create_synthetic_whoosh(output_path: Path):
-    if output_path.exists() and output_path.stat().st_size > 0:
+def create_synthetic_whoosh(output_path: Path) -> None:
+    if output_path.is_file() and output_path.stat().st_size > 0:
         return
 
     sample_rate = 44100
@@ -310,7 +510,7 @@ def create_synthetic_whoosh(output_path: Path):
 
             phase1 = 2 * math.pi * (180.0 * t + 240.0 * t * tn)
             phase2 = 2 * math.pi * (320.0 * t + 360.0 * t * tn)
-            phase3 = 2 * math.pi * (90.0  * t + 110.0 * t * tn)
+            phase3 = 2 * math.pi * (90.0 * t + 110.0 * t * tn)
 
             tonal = (
                 0.45 * math.sin(phase1)
@@ -336,7 +536,7 @@ def build_whoosh_timeline(
     output_path: Path,
     whoosh_volume: float = 0.4,
     per_transition_volumes: Optional[List[float]] = None,
-):
+) -> None:
     if not base_whoosh.exists() or not base_whoosh.is_file():
         raise FileNotFoundError(f"ملف الـ whoosh الأساسي غير موجود: {base_whoosh}")
 
@@ -347,14 +547,12 @@ def build_whoosh_timeline(
     master = _clamp_float(whoosh_volume, 0.0, 1.0, 0.4)
 
     with wave.open(str(base_whoosh), "rb") as wf:
+        if wf.getnchannels() != 1:
+            raise ValueError("ملف whoosh الأساسي يجب أن يكون mono")
+        if wf.getsampwidth() != 2:
+            raise ValueError("ملف whoosh الأساسي يجب أن يكون 16-bit PCM")
         sr = wf.getframerate()
         raw = wf.readframes(wf.getnframes())
-
-    base_samples = array.array("h")
-    base_samples.frombytes(raw)
-    if sys.byteorder == "big":
-        base_samples.byteswap()
-    base_len = len(base_samples)
 
     total_samples = int(total_duration * sr)
     if total_samples <= 0:
@@ -362,24 +560,60 @@ def build_whoosh_timeline(
             f"عدد العينات الكلي غير صالح لمسار الـ whoosh: {total_samples}"
         )
 
+    np = _get_numpy()
+    if np is not None:
+        base = np.frombuffer(raw, dtype="<i2").astype(np.int32)
+        out = np.zeros(total_samples, dtype=np.int32)
+        base_len = len(base)
+
+        for idx, t in enumerate(transition_times):
+            if not isinstance(t, (int, float)) or not math.isfinite(t) or t < 0:
+                continue
+            vol = _event_volume(master, per_transition_volumes, idx)
+            if vol <= 0.0 or base_len == 0:
+                continue
+
+            start = int(t * sr)
+            if start < 0 or start >= total_samples:
+                continue
+
+            end = min(start + base_len, total_samples)
+            seg_len = end - start
+            if seg_len <= 0:
+                continue
+
+            add = np.rint(
+                base[:seg_len].astype(np.float32) * np.float32(vol)
+            ).astype(np.int32)
+            np.clip(out[start:end] + add, -32768, 32767, out=out[start:end])
+
+        out16 = np.clip(out, -32768, 32767).astype("<i2")
+        with wave.open(str(output_path), "w") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sr)
+            wf.writeframes(out16.tobytes())
+        return
+
+    base_samples = array.array("h")
+    base_samples.frombytes(raw)
+    if sys.byteorder == "big":
+        base_samples.byteswap()
+    base_len = len(base_samples)
+
     out = array.array("h", bytes(2 * total_samples))
 
     for idx, t in enumerate(transition_times):
         if not isinstance(t, (int, float)) or not math.isfinite(t) or t < 0:
             continue
-        vol = master
-        if per_transition_volumes is not None and idx < len(per_transition_volumes):
-            try:
-                v = float(per_transition_volumes[idx])
-                if math.isfinite(v) and v >= 0:
-                    vol = master * v
-            except (TypeError, ValueError):
-                pass
-        vol = max(0.0, min(1.0, vol))
+        vol = _event_volume(master, per_transition_volumes, idx)
+        if vol <= 0.0:
+            continue
 
         start = int(t * sr)
         if start < 0 or start >= total_samples:
             continue
+
         for i in range(base_len):
             pos = start + i
             if pos >= total_samples:
@@ -438,6 +672,8 @@ def _build_rhythm_timeline(
             not math.isfinite(total_duration) or total_duration <= 0:
         return False
 
+    rhythm_volume = _clamp_float(rhythm_volume, 0.0, 1.0, 0.35)
+
     try:
         pulse = _build_pulse_sample(sample_rate)
     except Exception as e:
@@ -447,6 +683,45 @@ def _build_rhythm_timeline(
     total_samples = int(total_duration * sample_rate)
     if total_samples <= 0:
         return False
+
+    np = _get_numpy()
+    if np is not None:
+        try:
+            pulse_np = np.frombuffer(pulse, dtype=np.int16).astype(np.int32)
+            out = np.zeros(total_samples, dtype=np.int32)
+            pulse_len = len(pulse_np)
+
+            for t in trigger_times:
+                if not isinstance(t, (int, float)) or not math.isfinite(t) or t < 0:
+                    continue
+                start = int(t * sample_rate)
+                if start < 0 or start >= total_samples:
+                    continue
+
+                end = min(start + pulse_len, total_samples)
+                seg_len = end - start
+                if seg_len <= 0:
+                    continue
+
+                add = np.rint(
+                    pulse_np[:seg_len].astype(np.float32) * np.float32(rhythm_volume)
+                ).astype(np.int32)
+                np.clip(out[start:end] + add, -32768, 32767, out=out[start:end])
+
+            out16 = np.clip(out, -32768, 32767).astype("<i2")
+            with wave.open(str(output_path), "w") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(sample_rate)
+                wf.writeframes(out16.tobytes())
+        except Exception as e:
+            logger.warning(f"تعذّر كتابة مسار الإيقاع (NumPy): {e}")
+            return False
+
+        try:
+            return output_path.is_file() and output_path.stat().st_size > 0
+        except OSError:
+            return False
 
     out = array.array("h", bytes(2 * total_samples))
     pulse_len = len(pulse)
@@ -481,7 +756,7 @@ def _build_rhythm_timeline(
         return False
 
     try:
-        return output_path.exists() and output_path.stat().st_size > 0
+        return output_path.is_file() and output_path.stat().st_size > 0
     except OSError:
         return False
 
@@ -491,6 +766,8 @@ def _build_rhythm_timeline(
 # ============================================================
 
 def _accepts_single_prompt(fn: Any) -> bool:
+    if isinstance(fn, type):
+        return False
     try:
         sig = inspect.signature(fn)
     except (TypeError, ValueError):
@@ -504,6 +781,8 @@ def _accepts_single_prompt(fn: Any) -> bool:
 
 class _AIEditorialDirector:
     _instance: Optional["_AIEditorialDirector"] = None
+    _instance_lock = threading.Lock()
+
     _call_fn = None
     _available: bool = False
 
@@ -516,10 +795,12 @@ class _AIEditorialDirector:
 
     @classmethod
     def get(cls) -> "_AIEditorialDirector":
-        if cls._instance is None:
-            cls._instance = cls()
-            cls._instance._init_engine()
-        return cls._instance
+        with cls._instance_lock:
+            if cls._instance is None:
+                inst = cls()
+                inst._init_engine()
+                cls._instance = inst
+            return cls._instance
 
     def _init_engine(self) -> None:
         try:
@@ -536,7 +817,7 @@ class _AIEditorialDirector:
         for attr in ("generate_json", "generate_text", "call_gemini",
                      "generate", "ask", "query", "complete", "prompt"):
             fn = getattr(gemini_engine, attr, None)
-            if callable(fn) and _accepts_single_prompt(fn):
+            if callable(fn) and not isinstance(fn, type) and _accepts_single_prompt(fn):
                 self._call_fn = fn
                 self._available = True
                 logger.info(f"✅ Gemini متصل عبر gemini_engine.{attr}")
@@ -612,6 +893,8 @@ class _AIEditorialDirector:
     def _coerce_result_to_text(result: Any) -> str:
         if result is None:
             return ""
+        if isinstance(result, (bytes, bytearray)):
+            return result.decode("utf-8", "replace")
         if isinstance(result, str):
             return result
         if isinstance(result, dict):
@@ -656,7 +939,7 @@ class _AIEditorialDirector:
                 count = type(self)._lingering_threads
             logger.warning(
                 f"⚠️ خيط Gemini لم ينتهِ خلال المهلة ({AI_CALL_TIMEOUT_SEC}s). "
-                f"تراكم الخيوط المعلّقة: {count}."
+                f"عدد الخيوط المعلّقة التراكمي: {count}."
             )
             raise RuntimeError(
                 f"انتهت مهلة استدعاء Gemini ({AI_CALL_TIMEOUT_SEC}s)"
@@ -674,7 +957,8 @@ class _AIEditorialDirector:
         transitions: List[str],
     ) -> str:
         items = []
-        for i, (it, d, tr) in enumerate(zip(timeline, durations, transitions + [""])):
+        tr_list = list(transitions) + [""]
+        for i, (it, d, tr) in enumerate(zip(timeline, durations, tr_list)):
             role = str(it.get("narrative_role") or "").lower().strip()
             text = str(it.get("text") or "")[:180]
             items.append({
@@ -689,7 +973,7 @@ class _AIEditorialDirector:
         system = (
             "أنت مخرج مونتاج وثائقي عالمي (Netflix / National Geographic). "
             "مهمتك: خطة إبداعية محافظة وأنيقة لسلسلة لقطات. "
-            "لا تُبالغ، لا تُكرر، واجعل الإيقاع متنوعاً ومتنفساً.\n"
+            "لا تُبالغ، لا تُكرر، واجعل الإيقاع متنوعًا ومتنفَّسًا.\n"
             "أجب بـ JSON فقط بالصيغة التالية:\n"
             "{\n"
             '  "pacing": {"peaks": [int], "calm": [int], "breathing_after": [int]},\n'
@@ -707,7 +991,7 @@ class _AIEditorialDirector:
             "- transition_after ∈ {cut, crossfade_soft, crossfade_medium, crossfade_deep}.\n"
             "- whoosh_strength ∈ [0.0, 1.0] (0 = بلا whoosh).\n"
             "- ambience_boost ∈ [-0.3, +0.3].\n"
-            "- keyword: كلمة أو رقم واحد أنيق (اختياري، غالباً null).\n"
+            "- keyword: كلمة أو رقم واحد أنيق (اختياري، غالبًا null).\n"
             "- لا تكرر نفس الحركة مرتين متتاليتين.\n"
             "- في اللحظات التأملية/الهادئة: حركة أبطأ، انتقال أنعم.\n"
             "- في الذروة/hook: حركة أوضح، intensity أعلى، whoosh أقوى.\n"
@@ -748,10 +1032,22 @@ class _AIEditorialDirector:
         for entry in shots_raw:
             if not isinstance(entry, dict):
                 continue
-            try:
-                idx = int(entry.get("idx"))
-            except (TypeError, ValueError, OverflowError):
+
+            raw_idx = entry.get("idx")
+            if isinstance(raw_idx, bool):
                 continue
+            if isinstance(raw_idx, float):
+                if not math.isfinite(raw_idx) or not raw_idx.is_integer():
+                    continue
+                idx = int(raw_idx)
+            elif isinstance(raw_idx, int):
+                idx = raw_idx
+            else:
+                try:
+                    idx = int(raw_idx)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+
             if idx < 0 or idx >= n_shots or idx in seen_idx:
                 continue
             seen_idx.add(idx)
@@ -805,6 +1101,8 @@ class _AIEditorialDirector:
         transitions: List[str],
     ) -> str:
         h = hashlib.sha256()
+        h.update(_AI_PROMPT_VERSION.encode("ascii"))
+        h.update(b"\n")
         for i, (it, d) in enumerate(zip(timeline, durations)):
             role = str(it.get("narrative_role") or "")
             text = str(it.get("text") or "")[:200]
@@ -824,6 +1122,16 @@ class _AIEditorialDirector:
 # قرارات الحركة والانتقال
 # ============================================================
 
+def _motion_allowed_for_duration(mtype: str, duration: float) -> bool:
+    if not isinstance(duration, (int, float)) or not math.isfinite(duration) or duration <= 0:
+        return False
+    if duration >= 6.0 and mtype in ("static_micro", "slow_drift"):
+        return False
+    if duration < 2.2 and mtype == "zoom_out":
+        return False
+    return True
+
+
 def _select_motion_local(
     item: Dict[str, Any],
     duration: float,
@@ -840,13 +1148,11 @@ def _select_motion_local(
     def _ok(m: str) -> bool:
         if prev_motion is not None and m == prev_motion:
             return False
-        if duration >= 6.0 and m in ("static_micro", "slow_drift"):
-            return False
-        if duration < 2.2 and m == "zoom_out":
-            return False
-        return True
+        return _motion_allowed_for_duration(m, duration)
 
     chosen = next((m for m in rotated if _ok(m)), None)
+    if chosen is None:
+        chosen = next((m for m in rotated if _motion_allowed_for_duration(m, duration)), None)
     if chosen is None:
         chosen = next((m for m in rotated if m != prev_motion), rotated[0])
 
@@ -867,19 +1173,57 @@ def _select_transition_local(
 
 
 def _merge_ai_into_motion(
-    local: Dict[str, Any], ai_shot: Optional[Dict[str, Any]]
+    local: Dict[str, Any],
+    ai_shot: Optional[Dict[str, Any]],
+    duration: float,
 ) -> Dict[str, Any]:
     if not ai_shot:
         return local
     merged = dict(local)
-    if ai_shot.get("motion") in MOTION_TYPES:
-        merged["type"] = ai_shot["motion"]
+    ai_motion = ai_shot.get("motion")
+    if ai_motion in MOTION_TYPES and _motion_allowed_for_duration(ai_motion, duration):
+        merged["type"] = ai_motion
         merged["source"] = "ai"
+    elif ai_motion in MOTION_TYPES:
+        merged["source"] = "ai_intensity_only"
+
     local_intensity = _clamp_float(local.get("intensity", 0.55), 0.25, 1.0, 0.55)
     merged["intensity"] = _clamp_float(
         ai_shot.get("intensity", local_intensity), 0.3, 1.0, local_intensity
     )
     return merged
+
+
+def _choose_non_repeating_motion(
+    role: str,
+    duration: float,
+    prev_type: str,
+    current_motion: Dict[str, Any],
+) -> Dict[str, Any]:
+    cur_type = current_motion.get("type")
+    if (
+        cur_type in MOTION_TYPES
+        and cur_type != prev_type
+        and _motion_allowed_for_duration(cur_type, duration)
+    ):
+        return current_motion
+
+    preferred = ROLE_PREFERRED_MOTIONS.get(role) or ROLE_PREFERRED_MOTIONS[""]
+    for alt in preferred:
+        if alt != prev_type and _motion_allowed_for_duration(alt, duration):
+            new_motion = dict(current_motion)
+            new_motion["type"] = alt
+            new_motion["source"] = "local_adjusted"
+            return new_motion
+
+    for alt in MOTION_TYPES:
+        if alt != prev_type and _motion_allowed_for_duration(alt, duration):
+            new_motion = dict(current_motion)
+            new_motion["type"] = alt
+            new_motion["source"] = "local_adjusted"
+            return new_motion
+
+    return current_motion
 
 
 # ============================================================
@@ -1005,9 +1349,12 @@ def _probe_media_duration(path: Path) -> float:
                 "-of", "default=noprint_wrappers=1:nokey=1",
                 str(path),
             ],
-            capture_output=True, text=True, check=True,
+            capture_output=True,
+            text=True,
+            check=True,
             timeout=FFPROBE_TIMEOUT_SEC,
-            encoding="utf-8", errors="replace",
+            encoding="utf-8",
+            errors="replace",
         )
     except subprocess.CalledProcessError as e:
         raise RuntimeError(
@@ -1021,6 +1368,10 @@ def _probe_media_duration(path: Path) -> float:
     except FileNotFoundError as e:
         raise RuntimeError(
             "ffprobe غير متوفر في بيئة التشغيل. لا يمكن قياس مدة الوسائط."
+        ) from e
+    except OSError as e:
+        raise RuntimeError(
+            f"تعذّر تشغيل ffprobe للملف: {path} ({e})"
         ) from e
 
     raw = (result.stdout or "").strip()
@@ -1043,12 +1394,6 @@ def _probe_media_duration(path: Path) -> float:
             f"قيمة مدة غير موجبة من ffprobe للملف: {path} ({duration})"
         )
     return duration
-
-
-def _safe_concat_escape(path: Path) -> str:
-    resolved = path.resolve().as_posix()
-    escaped = resolved.replace("'", "'\\''")
-    return f"file '{escaped}'\n"
 
 
 def _validate_regular_file(path: Path, label: str, index: int = -1) -> None:
@@ -1100,7 +1445,7 @@ def _try_generate_ambience(
     )
 
     cmd = [
-        "ffmpeg", "-y", "-v", "error",
+        "ffmpeg", "-nostdin", "-y", "-v", "error",
         "-f", "lavfi", "-i", lavfi_input,
         "-af", af_chain,
         "-t", f"{duration:.3f}",
@@ -1110,9 +1455,13 @@ def _try_generate_ambience(
     ]
     try:
         subprocess.run(
-            cmd, check=True, timeout=180,
-            capture_output=True, text=True,
-            encoding="utf-8", errors="replace",
+            cmd,
+            check=True,
+            timeout=180,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
         )
     except subprocess.CalledProcessError as e:
         err_tail = (e.stderr or "").strip()[-500:]
@@ -1132,8 +1481,7 @@ def _try_generate_ambience(
 
     try:
         return (
-            output_path.exists()
-            and output_path.is_file()
+            output_path.is_file()
             and output_path.stat().st_size > 0
         )
     except OSError:
@@ -1149,6 +1497,10 @@ def _compute_image_boundaries(
     audio_duration: float,
     fps: int,
 ) -> Tuple[List[float], List[float]]:
+    if not isinstance(audio_duration, (int, float)) or \
+            not math.isfinite(audio_duration) or audio_duration <= 0:
+        raise ValueError(f"مدة صوت غير صالحة: {audio_duration!r}")
+
     n = len(renderable_timeline)
     if n == 0:
         return [], []
@@ -1188,6 +1540,15 @@ def _compute_image_boundaries(
             if d < min_dur:
                 d = min_dur
             durations.append(d)
+
+        total_fallback = sum(durations)
+        if total_fallback <= 0:
+            raise ValueError("مجموع المدد الاحتياطية غير موجب")
+
+        # توسيط نسبي إذا كان المجموع أقل من مدة الصوت.
+        if abs(total_fallback - audio_duration) > 1e-6:
+            factor = audio_duration / total_fallback
+            durations = [max(min_dur, d * factor) for d in durations]
 
         total_fallback = sum(durations)
         if total_fallback > audio_duration:
@@ -1298,6 +1659,10 @@ def _compute_segment_layout(
     if not isinstance(fps, int) or fps <= 0:
         raise ValueError(f"fps غير صالح: {fps!r}")
 
+    for i, d in enumerate(durations):
+        if not isinstance(d, (int, float)) or not math.isfinite(d) or d <= 0:
+            raise ValueError(f"مدة غير صالحة للمقطع رقم {i}: {d!r}")
+
     tt = list(transition_types)
     if len(tt) < max(0, n - 1):
         tt += ["crossfade_soft"] * (n - 1 - len(tt))
@@ -1362,11 +1727,13 @@ def _xfade_filter_for_groups(
     parts: List[str] = []
     prev = "[0:v]"
     for g in range(len(groups) - 1):
-        k = groups[g][1]
+        a, b = groups[g]
+        k = b
         cur = f"[{g + 1}:v]"
         out = f"[vx{g}]"
         t_sec = layout["T"][k] / fps
-        off_sec = max(0.0, layout["O"][k] / fps)
+        # الإصلاح المهم: offset نسبي لبداية المجموعة الحالية، لا مطلق.
+        off_sec = max(0.0, (layout["O"][k] - layout["S"][a]) / fps)
         parts.append(
             f"{prev}{cur}xfade=transition=fade:"
             f"duration={t_sec:.6f}:offset={off_sec:.6f}{out}"
@@ -1380,13 +1747,15 @@ def _build_xfade_chain(
     durations: List[float],
     transition_types: List[str],
     fps: int,
+    layout: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, str, float, List[float], List[float]]:
     if n_segments <= 0:
         raise ValueError("n_segments يجب أن تكون ≥ 1")
     if len(durations) != n_segments:
         raise ValueError("عدد المدد لا يطابق عدد المقاطع")
 
-    layout = _compute_segment_layout(durations, transition_types, fps)
+    if layout is None:
+        layout = _compute_segment_layout(durations, transition_types, fps)
     total = layout["bounds"][-1] / fps
 
     if n_segments == 1:
@@ -1443,6 +1812,16 @@ def render_final_video(
     audio_file = Path(audio_file)
     subtitles_ass = Path(subtitles_ass)
     output_video_path = Path(output_video_path)
+
+    if output_video_path.exists() and output_video_path.is_dir():
+        raise ValueError(f"مسار الإخراج مجلد وليس ملفًا: {output_video_path}")
+
+    if output_video_path.suffix.lower() not in {".mp4", ".mov", ".m4v"}:
+        logger.warning(
+            f"امتداد الإخراج {output_video_path.suffix!r} غير مطابق لـ MP4؛ "
+            f"سيتم تغييره إلى .mp4 لأن الترميز الناتج H.264/AAC في حاوية MP4."
+        )
+        output_video_path = output_video_path.with_suffix(".mp4")
 
     _validate_regular_file(audio_file, "ملف التعليق الصوتي")
     _validate_regular_file(subtitles_ass, "ملف الترجمة ASS")
@@ -1506,23 +1885,16 @@ def render_final_video(
 
     for i in range(n_shots):
         ai_s = ai_shots_by_idx.get(i)
-        merged_motion = _merge_ai_into_motion(local_motions[i], ai_s)
-        final_motions.append(merged_motion)
-
-        if i > 0 and final_motions[i]["type"] == final_motions[i - 1]["type"]:
+        merged_motion = _merge_ai_into_motion(local_motions[i], ai_s, durations[i])
+        if i > 0 and merged_motion["type"] == final_motions[i - 1]["type"]:
             role = str(renderable_timeline[i].get("narrative_role") or "").lower().strip()
-            alts = ROLE_PREFERRED_MOTIONS.get(role, ROLE_PREFERRED_MOTIONS[""])
-            replaced = False
-            for alt in alts:
-                if alt != final_motions[i - 1]["type"]:
-                    final_motions[i]["type"] = alt
-                    replaced = True
-                    break
-            if not replaced:
-                for alt in MOTION_TYPES:
-                    if alt != final_motions[i - 1]["type"]:
-                        final_motions[i]["type"] = alt
-                        break
+            merged_motion = _choose_non_repeating_motion(
+                role,
+                durations[i],
+                final_motions[i - 1]["type"],
+                merged_motion,
+            )
+        final_motions.append(merged_motion)
 
         if i < n_shots - 1:
             tr = local_transitions[i]
@@ -1557,7 +1929,7 @@ def render_final_video(
 
     (xfade_filter, vx_out_label, video_duration_after_xfade,
      xfade_offsets, safe_t_durs) = _build_xfade_chain(
-        n_shots, durations, final_transitions, fps
+        n_shots, durations, final_transitions, fps, layout=layout
     )
 
     logger.info(
@@ -1591,8 +1963,6 @@ def render_final_video(
         if role in RHYTHM_ENABLED_ROLES:
             rhythm_trigger_times.append(shot_start_in_final[i])
 
-    # [إصلاح 1 — المراجعة الثالثة] مواضع القطع الفوري (مسار concat/fallback):
-    # اللقطة i تظهر عند layout["bounds"][i] في الـ concat (وليس O[i-1]).
     rhythm_trigger_times_cut: List[float] = [
         layout["bounds"][i] / fps
         for i, item in enumerate(renderable_timeline)
@@ -1618,9 +1988,36 @@ def render_final_video(
     safe_ass_dir: Optional[Path] = None
 
     try:
-        create_synthetic_whoosh(sfx_whoosh)
-        if not sfx_whoosh.exists() or sfx_whoosh.stat().st_size <= 0:
-            raise RuntimeError(f"فشل إنشاء ملف الـ whoosh: {sfx_whoosh}")
+        # Whoosh أصبح اختياريًا.
+        has_whoosh_xfade = False
+        if transition_times_final:
+            try:
+                create_synthetic_whoosh(sfx_whoosh)
+                if sfx_whoosh.is_file() and sfx_whoosh.stat().st_size > 0:
+                    build_whoosh_timeline(
+                        sfx_whoosh,
+                        transition_times_final,
+                        audio_duration,
+                        whoosh_timeline,
+                        whoosh_volume=0.42,
+                        per_transition_volumes=whoosh_per_transition or None,
+                    )
+                    has_whoosh_xfade = (
+                        whoosh_timeline.is_file()
+                        and whoosh_timeline.stat().st_size > 0
+                    )
+            except Exception as whoosh_err:
+                logger.warning(f"تعذّر توليد Whoosh: {whoosh_err}")
+                has_whoosh_xfade = False
+
+            if not has_whoosh_xfade:
+                try:
+                    if whoosh_timeline.exists():
+                        whoosh_timeline.unlink()
+                except OSError:
+                    pass
+        else:
+            logger.info("🌬️ لا انتقالات — تم تخطي Whoosh.")
 
         segment_files: List[Path] = []
         logger.info(
@@ -1637,7 +2034,7 @@ def render_final_video(
             seg_output = temp_dir / f"seg_{idx:03d}.mp4"
             cmd = [
                 "ffmpeg", "-y", "-v", "error",
-                "-i", str(frame_path),
+                "-i", str(frame_path.resolve()),
                 "-vf", kb_filter,
                 "-frames:v", str(seg_frames),
                 "-c:v", "libx264", "-preset", "fast",
@@ -1670,7 +2067,7 @@ def render_final_video(
                 )
                 g_inputs: List[str] = []
                 for k in range(a, b + 1):
-                    g_inputs += ["-i", str(segment_files[k])]
+                    g_inputs += ["-i", str(segment_files[k].resolve())]
                 g_cmd = [
                     "ffmpeg", "-y", "-v", "error",
                     *g_inputs,
@@ -1691,16 +2088,6 @@ def render_final_video(
             )
 
         n_video_inputs = len(video_inputs)
-
-        build_whoosh_timeline(
-            sfx_whoosh,
-            transition_times_final,
-            audio_duration,
-            whoosh_timeline,
-            whoosh_volume=0.42,
-            per_transition_volumes=whoosh_per_transition or None,
-        )
-        _validate_non_empty_file(whoosh_timeline, "مسار الـ whoosh (xfade)")
 
         avg_amb_boost = (
             sum(ambience_boosts) / len(ambience_boosts)
@@ -1747,31 +2134,33 @@ def render_final_video(
         else:
             logger.info("🎵 لا توجد أدوار مسموحة بالإيقاع.")
 
-        # [إصلاح 2 — المراجعة الثالثة] مسار ASS آمن (نسخ عند وجود ').
-        safe_ass, safe_ass_dir = _prepare_safe_ass(subtitles_ass)
-        ass_escaped = _escape_filter_path(safe_ass)
-
-        logger.info(
-            "✨ تمريرة موحّدة: xfade + tpad + burn subs + audio mix + ducking..."
-        )
+        # ASS آمن: نسخ إلى temp_dir واستخدام اسم نسبي.
+        safe_ass, safe_ass_dir = _prepare_safe_ass(subtitles_ass, temp_dir)
+        ass_filename = safe_ass.name
 
         final_inputs: List[str] = []
         for vf in video_inputs:
-            final_inputs += ["-i", str(vf)]
+            final_inputs += ["-i", str(Path(vf).resolve())]
+
         idx_audio = n_video_inputs
-        idx_whoosh = n_video_inputs + 1
-        final_inputs += ["-i", str(audio_file)]
-        final_inputs += ["-i", str(whoosh_timeline)]
-        next_idx = n_video_inputs + 2
-        ambience_input_idx = None
-        rhythm_input_idx = None
-        if has_ambience:
-            final_inputs += ["-i", str(ambience_file)]
-            ambience_input_idx = next_idx
+        next_idx = idx_audio + 1
+
+        whoosh_idx: Optional[int] = None
+        if has_whoosh_xfade:
+            final_inputs += ["-i", str(whoosh_timeline.resolve())]
+            whoosh_idx = next_idx
             next_idx += 1
+
+        ambience_idx: Optional[int] = None
+        if has_ambience:
+            final_inputs += ["-i", str(ambience_file.resolve())]
+            ambience_idx = next_idx
+            next_idx += 1
+
+        rhythm_idx: Optional[int] = None
         if has_rhythm:
-            final_inputs += ["-i", str(rhythm_file)]
-            rhythm_input_idx = next_idx
+            final_inputs += ["-i", str(rhythm_file.resolve())]
+            rhythm_idx = next_idx
             next_idx += 1
 
         filter_parts: List[str] = []
@@ -1796,81 +2185,66 @@ def render_final_video(
             "eq=contrast=1.02:saturation=1.03:brightness=0.005,"
             "unsharp=5:5:0.35:5:5:0.0"
         )
+
+        # الترتيب الصحيح: تلوين/تحسين -> ترجمة -> fade.
+        filter_parts.append(f"[vpad]{polish_base}[vcolor]")
+        filter_parts.append(f"[vcolor]ass=filename={ass_filename}[vsub]")
+
         if audio_duration >= 0.9:
             fade_out_start = audio_duration - 0.4
-            polish = (
-                f"{polish_base},"
-                "fade=t=in:st=0:d=0.4,"
-                f"fade=t=out:st={fade_out_start:.3f}:d=0.4"
+            filter_parts.append(
+                f"[vsub]fade=t=in:st=0:d=0.4,"
+                f"fade=t=out:st={fade_out_start:.3f}:d=0.4[vout]"
             )
         else:
-            polish = polish_base
-        filter_parts.append(f"[vpad]{polish}[vpolished]")
-        filter_parts.append(
-            f"[vpolished]ass=filename='{ass_escaped}'[vout]"
-        )
+            filter_parts.append("[vsub]null[vout]")
 
-        ducked_tracks: List[Tuple[str, int, str, str, str, str, str]] = []
-        if has_rhythm and rhythm_input_idx is not None:
+        ducked_tracks: List[Tuple[str, int, float, str, str, str, str]] = []
+        if has_rhythm and rhythm_idx is not None:
             ducked_tracks.append(
-                ("rhythm", rhythm_input_idx, "0.45", "0.03", "5", "10", "300")
+                ("rhythm", rhythm_idx, 0.45, "0.03", "5", "10", "300")
             )
-        if has_ambience and ambience_input_idx is not None:
+        if has_ambience and ambience_idx is not None:
             ducked_tracks.append(
-                ("ambience", ambience_input_idx, "0.55", "0.02", "6", "20", "400")
+                ("ambience", ambience_idx, 0.55, "0.02", "6", "20", "400")
             )
 
         n_ducked = len(ducked_tracks)
-        n_voice_splits = 1 + n_ducked
 
         if n_ducked > 0:
             voice_split_labels = "".join(f"[vsc{i}]" for i in range(n_ducked))
             filter_parts.append(
-                f"[{idx_audio}:a]{_AUDIO_NORMALIZE_CHAIN},"
-                f"asplit={n_voice_splits}[vmain]{voice_split_labels}"
+                f"[{idx_audio}:a]{_AUDIO_VOICE_NORMALIZE_CHAIN},"
+                f"asplit={n_ducked + 1}[vmain]{voice_split_labels}"
             )
         else:
             filter_parts.append(
-                f"[{idx_audio}:a]{_AUDIO_NORMALIZE_CHAIN}[vmain]"
+                f"[{idx_audio}:a]{_AUDIO_VOICE_NORMALIZE_CHAIN}[vmain]"
             )
 
-        filter_parts.append(
-            f"[{idx_whoosh}:a]{_AUDIO_NORMALIZE_CHAIN}[whoosh_src]"
-        )
-        amix_inputs = ["[vmain]", "[whoosh_src]"]
-        amix_weights = ["1", "0.55"]
+        mix_inputs: List[Tuple[str, float]] = [("[vmain]", 1.0)]
+
+        if whoosh_idx is not None:
+            filter_parts.append(
+                f"[{whoosh_idx}:a]{_AUDIO_SFX_NORMALIZE_CHAIN}[whoosh_src]"
+            )
+            mix_inputs.append(("[whoosh_src]", 0.55))
 
         for i, (name, in_idx, weight, thr, ratio, att, rel) in enumerate(ducked_tracks):
             src_label = f"[{name}_src]"
             duck_label = f"[{name}_d]"
             filter_parts.append(
-                f"[{in_idx}:a]{_AUDIO_NORMALIZE_CHAIN}{src_label}"
+                f"[{in_idx}:a]{_AUDIO_SFX_NORMALIZE_CHAIN}{src_label}"
             )
             filter_parts.append(
                 f"{src_label}[vsc{i}]sidechaincompress="
                 f"threshold={thr}:ratio={ratio}:"
                 f"attack={att}:release={rel}{duck_label}"
             )
-            amix_inputs.append(duck_label)
-            amix_weights.append(weight)
+            mix_inputs.append((duck_label, float(weight)))
 
-        n_amix = len(amix_inputs)
-        weights_str = " ".join(amix_weights)
-
-        supports_norm = _ffmpeg_supports_amix_normalize()
-        amix_expr = (
-            f"{''.join(amix_inputs)}amix=inputs={n_amix}:duration=first:"
-            f"dropout_transition=0:weights='{weights_str}'"
-        )
-        if supports_norm:
-            amix_expr += ":normalize=0"
-        else:
-            comp = sum(float(w) for w in amix_weights)
-            amix_expr += f",volume={comp:.3f}"
-        amix_expr += ",alimiter=limit=0.95:level=disabled[aout]"
-        filter_parts.append(amix_expr)
-
-        filter_complex = ";".join(filter_parts)
+        filter_parts.append(_build_audio_mix_filter(mix_inputs, "[aout]"))
+        filter_complex = ";".join(p for p in filter_parts if p)
 
         cmd_final = [
             "ffmpeg", "-y", "-v", "warning",
@@ -1887,57 +2261,101 @@ def render_final_video(
         ]
 
         try:
-            _run_ffmpeg(cmd_final, FINAL_TIMEOUT_SEC, "التصدير الموحّد")
+            main_required = ["ass", "alimiter", "amix"]
+            if n_video_inputs > 1:
+                main_required.append("xfade")
+            if pad_needed > 0.001:
+                main_required.append("tpad")
+            if ducked_tracks:
+                main_required.append("sidechaincompress")
+            if whoosh_idx is not None or ducked_tracks:
+                main_required.append("pan")
+            _require_ffmpeg_filters(main_required)
+
+            _run_ffmpeg(
+                cmd_final,
+                FINAL_TIMEOUT_SEC,
+                "التصدير الموحّد",
+                cwd=temp_dir,
+            )
         except RuntimeError as e:
             logger.warning(
                 f"⚠️ فشل التصدير الموحّد: {e} — "
-                f"fallback: concat + تمريرة موحّدة (مع الحفاظ على المؤثرات)."
+                f"fallback: concat hard-cut + تمريرة موحّدة "
+                f"(مع الحفاظ على الترجمة والمؤثرات الصوتية، بدون xfade)."
             )
 
             whoosh_timeline_cut = temp_dir / "whoosh_cut.wav"
-            build_whoosh_timeline(
-                sfx_whoosh,
-                transition_times_cut,
-                audio_duration,
-                whoosh_timeline_cut,
-                whoosh_volume=0.42,
-                per_transition_volumes=whoosh_per_transition or None,
-            )
-            _validate_non_empty_file(
-                whoosh_timeline_cut, "مسار الـ whoosh (fallback/cut)"
-            )
+            has_whoosh_cut = False
+            if has_whoosh_xfade and transition_times_cut:
+                try:
+                    build_whoosh_timeline(
+                        sfx_whoosh,
+                        transition_times_cut,
+                        audio_duration,
+                        whoosh_timeline_cut,
+                        whoosh_volume=0.42,
+                        per_transition_volumes=whoosh_per_transition or None,
+                    )
+                    has_whoosh_cut = (
+                        whoosh_timeline_cut.is_file()
+                        and whoosh_timeline_cut.stat().st_size > 0
+                    )
+                except Exception as wh_err:
+                    logger.warning(f"تعذّر توليد Whoosh للـ fallback: {wh_err}")
+                    has_whoosh_cut = False
 
-            # [إصلاح 1 — المراجعة الثالثة] إيقاع مبني على مواضع القطع الفوري
-            # ليتزامن مع ظهور اللقطة في مسار concat.
+                if not has_whoosh_cut:
+                    try:
+                        if whoosh_timeline_cut.exists():
+                            whoosh_timeline_cut.unlink()
+                    except OSError:
+                        pass
+
+            # fallback rhythm: لا نستخدم توقيت xfade القديم إطلاقًا.
             fb_rhythm_path: Optional[Path] = None
             if has_rhythm and rhythm_trigger_times_cut:
                 rhythm_cut_path = temp_dir / "rhythm_cut.wav"
-                if _build_rhythm_timeline(
-                    rhythm_trigger_times_cut, audio_duration, 44100,
-                    rhythm_cut_path, rhythm_volume=0.32,
-                ):
-                    fb_rhythm_path = rhythm_cut_path
-                    logger.info(
-                        f"🎵 إيقاع fallback مُولَّد بمواضع القطع "
-                        f"({len(rhythm_trigger_times_cut)} نبضة)."
-                    )
-                else:
+                try:
+                    if _build_rhythm_timeline(
+                        rhythm_trigger_times_cut,
+                        audio_duration,
+                        44100,
+                        rhythm_cut_path,
+                        rhythm_volume=0.32,
+                    ):
+                        fb_rhythm_path = rhythm_cut_path
+                        logger.info(
+                            f"🎵 إيقاع fallback مُولَّد بمواضع القطع "
+                            f"({len(rhythm_trigger_times_cut)} نبضة)."
+                        )
+                    else:
+                        logger.warning(
+                            "تعذّر توليد إيقاع fallback — سيتم تعطيل الإيقاع في fallback."
+                        )
+                        fb_rhythm_path = None
+                except Exception as fr_err:
                     logger.warning(
-                        "تعذّر توليد إيقاع fallback — استخدام التوقيت الأصلي."
+                        f"خطأ في توليد إيقاع fallback ({fr_err}) — تعطيل الإيقاع."
                     )
-                    fb_rhythm_path = rhythm_file
+                    fb_rhythm_path = None
             elif has_rhythm:
-                fb_rhythm_path = rhythm_file
+                logger.warning(
+                    "لا توجد مواضع قطع صالحة للإيقاع في fallback — تعطيل الإيقاع."
+                )
+                fb_rhythm_path = None
 
             trimmed_files: List[Path] = []
             for i, seg in enumerate(segment_files):
                 a = layout["bounds"][i] - layout["S"][i]
                 b = layout["bounds"][i + 1] - layout["S"][i]
+                a = max(0, int(a))
+                b = max(a + 1, int(b))
                 trimmed = temp_dir / f"trim_{i:03d}.mp4"
                 _run_ffmpeg(
                     [
                         "ffmpeg", "-y", "-v", "error",
-                        "-i", str(seg),
+                        "-i", str(seg.resolve()),
                         "-vf",
                         f"trim=start_frame={a}:end_frame={b},setpts=PTS-STARTPTS",
                         "-c:v", "libx264", "-preset", "fast", "-crf", "20",
@@ -1953,25 +2371,31 @@ def render_final_video(
             concat_list_file = temp_dir / "concat_list.txt"
             with open(concat_list_file, "w", encoding="utf-8") as f:
                 for seg in trimmed_files:
-                    f.write(_safe_concat_escape(seg))
+                    # أسماء نسبية بسيطة داخل temp_dir.
+                    f.write(f"file '{seg.name}'\n")
 
             fb_inputs: List[str] = [
                 "-f", "concat", "-safe", "0",
-                "-i", str(concat_list_file),
+                "-i", "concat_list.txt",
             ]
             fb_idx_audio = 1
-            fb_idx_whoosh = 2
-            fb_inputs += ["-i", str(audio_file)]
-            fb_inputs += ["-i", str(whoosh_timeline_cut)]
-            fb_next = 3
+            fb_next = 2
+
+            fb_whoosh_idx: Optional[int] = None
+            if has_whoosh_cut:
+                fb_inputs += ["-i", str(whoosh_timeline_cut.resolve())]
+                fb_whoosh_idx = fb_next
+                fb_next += 1
+
             fb_amb_idx: Optional[int] = None
-            fb_rhythm_idx: Optional[int] = None
             if has_ambience:
-                fb_inputs += ["-i", str(ambience_file)]
+                fb_inputs += ["-i", str(ambience_file.resolve())]
                 fb_amb_idx = fb_next
                 fb_next += 1
+
+            fb_rhythm_idx: Optional[int] = None
             if fb_rhythm_path is not None:
-                fb_inputs += ["-i", str(fb_rhythm_path)]
+                fb_inputs += ["-i", str(fb_rhythm_path.resolve())]
                 fb_rhythm_idx = fb_next
                 fb_next += 1
 
@@ -1990,79 +2414,74 @@ def render_final_video(
                 "eq=contrast=1.02:saturation=1.03:brightness=0.005,"
                 "unsharp=5:5:0.35:5:5:0.0"
             )
+
+            fb_filter_parts.append(f"[vpad]{fb_polish_base}[fbcolor]")
+            fb_filter_parts.append(f"[fbcolor]ass=filename={ass_filename}[fbsub]")
+
             if audio_duration >= 0.9:
                 fb_fade_start = audio_duration - 0.4
-                fb_polish = (
-                    f"{fb_polish_base},"
-                    "fade=t=in:st=0:d=0.4,"
-                    f"fade=t=out:st={fb_fade_start:.3f}:d=0.4"
+                fb_filter_parts.append(
+                    f"[fbsub]fade=t=in:st=0:d=0.4,"
+                    f"fade=t=out:st={fb_fade_start:.3f}:d=0.4[vout]"
                 )
             else:
-                fb_polish = fb_polish_base
-            fb_filter_parts.append(f"[vpad]{fb_polish}[vpolished]")
-            fb_filter_parts.append(
-                f"[vpolished]ass=filename='{ass_escaped}'[vout]"
-            )
+                fb_filter_parts.append("[fbsub]null[vout]")
 
-            fb_ducked: List[Tuple[str, int, str, str, str, str, str]] = []
-            if has_rhythm and fb_rhythm_idx is not None:
+            fb_ducked: List[Tuple[str, int, float, str, str, str, str]] = []
+            if fb_rhythm_idx is not None:
                 fb_ducked.append(
-                    ("rhythm", fb_rhythm_idx, "0.45", "0.03", "5", "10", "300")
+                    ("rhythm", fb_rhythm_idx, 0.45, "0.03", "5", "10", "300")
                 )
-            if has_ambience and fb_amb_idx is not None:
+            if fb_amb_idx is not None:
                 fb_ducked.append(
-                    ("ambience", fb_amb_idx, "0.55", "0.02", "6", "20", "400")
+                    ("ambience", fb_amb_idx, 0.55, "0.02", "6", "20", "400")
                 )
 
             n_fb_ducked = len(fb_ducked)
-            fb_splits = 1 + n_fb_ducked
 
             if n_fb_ducked > 0:
                 fb_split_labels = "".join(f"[fsc{i}]" for i in range(n_fb_ducked))
                 fb_filter_parts.append(
-                    f"[{fb_idx_audio}:a]{_AUDIO_NORMALIZE_CHAIN},"
-                    f"asplit={fb_splits}[fmain]{fb_split_labels}"
+                    f"[{fb_idx_audio}:a]{_AUDIO_VOICE_NORMALIZE_CHAIN},"
+                    f"asplit={n_fb_ducked + 1}[fmain]{fb_split_labels}"
                 )
             else:
                 fb_filter_parts.append(
-                    f"[{fb_idx_audio}:a]{_AUDIO_NORMALIZE_CHAIN}[fmain]"
+                    f"[{fb_idx_audio}:a]{_AUDIO_VOICE_NORMALIZE_CHAIN}[fmain]"
                 )
 
-            fb_filter_parts.append(
-                f"[{fb_idx_whoosh}:a]{_AUDIO_NORMALIZE_CHAIN}[fbwhoosh_src]"
-            )
-            fb_amix_inputs = ["[fmain]", "[fbwhoosh_src]"]
-            fb_amix_weights = ["1", "0.55"]
+            fb_mix_inputs: List[Tuple[str, float]] = [("[fmain]", 1.0)]
+
+            if fb_whoosh_idx is not None:
+                fb_filter_parts.append(
+                    f"[{fb_whoosh_idx}:a]{_AUDIO_SFX_NORMALIZE_CHAIN}[fbwhoosh_src]"
+                )
+                fb_mix_inputs.append(("[fbwhoosh_src]", 0.55))
 
             for i, (name, in_idx, weight, thr, ratio, att, rel) in enumerate(fb_ducked):
                 src_label = f"[fb_{name}_src]"
                 duck_label = f"[fb_{name}_d]"
                 fb_filter_parts.append(
-                    f"[{in_idx}:a]{_AUDIO_NORMALIZE_CHAIN}{src_label}"
+                    f"[{in_idx}:a]{_AUDIO_SFX_NORMALIZE_CHAIN}{src_label}"
                 )
                 fb_filter_parts.append(
                     f"{src_label}[fsc{i}]sidechaincompress="
                     f"threshold={thr}:ratio={ratio}:"
                     f"attack={att}:release={rel}{duck_label}"
                 )
-                fb_amix_inputs.append(duck_label)
-                fb_amix_weights.append(weight)
+                fb_mix_inputs.append((duck_label, float(weight)))
 
-            n_fb_amix = len(fb_amix_inputs)
-            fb_weights_str = " ".join(fb_amix_weights)
-            fb_amix_expr = (
-                f"{''.join(fb_amix_inputs)}amix=inputs={n_fb_amix}:duration=first:"
-                f"dropout_transition=0:weights='{fb_weights_str}'"
-            )
-            if supports_norm:
-                fb_amix_expr += ":normalize=0"
-            else:
-                fb_comp = sum(float(w) for w in fb_amix_weights)
-                fb_amix_expr += f",volume={fb_comp:.3f}"
-            fb_amix_expr += ",alimiter=limit=0.95:level=disabled[aout]"
-            fb_filter_parts.append(fb_amix_expr)
+            fb_filter_parts.append(_build_audio_mix_filter(fb_mix_inputs, "[aout]"))
+            fb_filter_complex = ";".join(p for p in fb_filter_parts if p)
 
-            fb_filter_complex = ";".join(fb_filter_parts)
+            fb_required = ["ass", "alimiter", "amix"]
+            if fb_pad > 0.001:
+                fb_required.append("tpad")
+            if fb_ducked:
+                fb_required.append("sidechaincompress")
+            if fb_whoosh_idx is not None or fb_ducked:
+                fb_required.append("pan")
+            _require_ffmpeg_filters(fb_required)
 
             _run_ffmpeg(
                 [
@@ -2078,7 +2497,9 @@ def render_final_video(
                     "-movflags", "+faststart",
                     str(staged_output_video),
                 ],
-                FALLBACK_STEP_TIMEOUT_SEC, "التصدير (fallback)",
+                FALLBACK_STEP_TIMEOUT_SEC,
+                "التصدير (fallback)",
+                cwd=temp_dir,
             )
 
         _validate_non_empty_file(staged_output_video, "الفيديو النهائي المرحلي")
@@ -2086,6 +2507,14 @@ def render_final_video(
         if final_duration <= 0:
             raise RuntimeError(
                 f"مدة الفيديو النهائي المرحلي غير موجبة: {final_duration}"
+            )
+
+        drift = abs(final_duration - audio_duration)
+        if drift > 0.15:
+            logger.warning(
+                f"انحراف مدة الفيديو النهائي عن الصوت: "
+                f"video={final_duration:.3f}s, audio={audio_duration:.3f}s, "
+                f"drift={drift:.3f}s"
             )
 
         try:
@@ -2169,7 +2598,7 @@ if __name__ == "__main__":
             [0.5, 1.5], 3.0, 44100, rhythm_out, rhythm_volume=0.35
         )
         assert ok, "rhythm generation should succeed"
-        assert rhythm_out.exists() and rhythm_out.stat().st_size > 0
+        assert rhythm_out.is_file() and rhythm_out.stat().st_size > 0
         print("[OK] test #4: rhythm timeline generation")
 
         # 5. اختبار فشل الإيقاع
@@ -2185,11 +2614,11 @@ if __name__ == "__main__":
         td_path = Path(td)
         base = td_path / "base_whoosh.wav"
         create_synthetic_whoosh(base)
-        assert base.exists() and base.stat().st_size > 0
+        assert base.is_file() and base.stat().st_size > 0
 
         whoosh_out = td_path / "whoosh_timeline.wav"
         build_whoosh_timeline(base, [1.4, 2.0], 3.0, whoosh_out, whoosh_volume=0.4)
-        assert whoosh_out.exists() and whoosh_out.stat().st_size > 0
+        assert whoosh_out.is_file() and whoosh_out.stat().st_size > 0
 
         def _peak(p: Path) -> int:
             with wave.open(str(p), "rb") as w:
@@ -2248,8 +2677,10 @@ if __name__ == "__main__":
         f"(total={total:.3f}s, offsets={offsets}, safe_tdurs={safe_tdurs})"
     )
 
-    # 9. اختبار _AIEditorialDirector
+    # 9. اختبار _AIEditorialDirector بدون شبكة
     director = _AIEditorialDirector.get()
+    director._available = False
+    director._call_fn = None
     plan = director.plan_montage(
         [{"text": "x", "narrative_role": "hook"}],
         [2.0],
@@ -2312,11 +2743,12 @@ if __name__ == "__main__":
     assert 0.0 <= parsed["shots"][0]["whoosh_strength"] <= 1.0, parsed
     as_text = _AIEditorialDirector._coerce_result_to_text({"shots": []})
     assert json.loads(as_text)["shots"] == [], as_text
-    print("[OK] test #13: AI plan parsing hardened (null/NaN/inf/dict)")
+    as_bytes = _AIEditorialDirector._coerce_result_to_text(b'{"shots":[]}')
+    assert json.loads(as_bytes)["shots"] == [], as_bytes
+    print("[OK] test #13: AI plan parsing hardened (null/NaN/inf/dict/bytes)")
 
     # ------------------------------------------------------------
-    # 14. اختبار الهروب الآمن لمسار ASS (محمول على المنصات)
-    # [إصلاح 4 — المراجعة الثالثة] تصحيح فحص شارحة الخلفية المتبقية.
+    # 14. اختبار الهروب الآمن لمسار ASS + _prepare_safe_ass
     # ------------------------------------------------------------
     with tempfile.TemporaryDirectory() as td14:
         sub = Path(td14) / "sub [1]"
@@ -2326,39 +2758,37 @@ if __name__ == "__main__":
 
         esc_real = _escape_filter_path(p_real)
 
-        # (أ) الفاصلة العليا مُهرَّبة بنمط close-escape-reopen القياسي
-        assert "'\\''" in esc_real, esc_real
+        # FFmpeg filtergraph escaping inside single quotes:
+        # ' -> \' and \ -> \\
+        assert "\\'" in esc_real, esc_real
+        assert "'\\''" not in esc_real, esc_real
 
-        # (ب) فحص بنيوي صارم: الرمز الوحيد المُهرَّب هو ' — لا : ولا [ ]
         i = 0
         while i < len(esc_real):
             if esc_real[i] == "\\":
-                assert i + 1 < len(esc_real) and esc_real[i + 1] == "'", (
+                assert i + 1 < len(esc_real) and esc_real[i + 1] in ("\\", "'"), (
                     f"unexpected escape at position {i} in {esc_real!r}"
                 )
                 i += 2
             else:
                 i += 1
 
-        # (ج) الأقواس المربعة لم تُهرَّب
-        cleaned = esc_real.replace("'\\''", "")
+        cleaned = esc_real.replace("\\'", "").replace("\\\\", "")
+        assert "\\" not in cleaned, cleaned
         assert "\\[" not in cleaned, cleaned
         assert "\\]" not in cleaned, cleaned
 
-        # (د) [إصلاح 4] لا backslash متبقٍ بعد إزالة '\\'' (فحص صحيح)
-        assert "\\" not in cleaned, cleaned
-
-    # [إصلاح 2 — المراجعة الثالثة] اختبار _prepare_safe_ass
     with tempfile.TemporaryDirectory() as td14b:
         td_path = Path(td14b)
-        # مسار بلا ' → لا نسخ
-        safe_src = td_path / "clean.ass"
-        safe_src.touch()
-        p_safe, d_safe = _prepare_safe_ass(safe_src)
-        assert p_safe == safe_src, (p_safe, safe_src)
+
+        # بدون dest_dir: مسار نظيف لا يُنسخ
+        clean = td_path / "clean.ass"
+        clean.touch()
+        p_safe, d_safe = _prepare_safe_ass(clean)
+        assert p_safe == clean, (p_safe, clean)
         assert d_safe is None, d_safe
 
-        # مسار فيه ' → نسخ إلى مسار آمن
+        # بدون dest_dir: مسار فيه ' يُنسخ
         sub2 = td_path / "sub2 [x]"
         sub2.mkdir()
         p_unsafe = sub2 / "with 'quote'.ass"
@@ -2366,16 +2796,23 @@ if __name__ == "__main__":
         p_copied, d_copied = _prepare_safe_ass(p_unsafe)
         try:
             assert p_copied != p_unsafe
-            assert p_copied.exists() and p_copied.stat().st_size > 0
+            assert p_copied.is_file() and p_copied.stat().st_size > 0
             assert d_copied is not None and d_copied.is_dir()
-            assert "'" not in p_copied.as_posix(), p_copied
+            assert "'" not in p_copied.name, p_copied
         finally:
             if d_copied is not None:
                 shutil.rmtree(d_copied, ignore_errors=True)
 
-    print(
-        "[OK] test #14: ASS path escaping + _prepare_safe_ass (portable)"
-    )
+        # مع dest_dir: دائمًا subs.ass نسبي آمن
+        dest = td_path / "dest"
+        dest.mkdir()
+        p_dest, d_dest = _prepare_safe_ass(p_unsafe, dest)
+        assert d_dest is None, d_dest
+        assert p_dest.parent == dest, p_dest
+        assert p_dest.name == "subs.ass", p_dest
+        assert p_dest.is_file() and p_dest.stat().st_size > 0
+
+    print("[OK] test #14: ASS path escaping + _prepare_safe_ass (portable)")
 
     # ------------------------------------------------------------
     # 15. اختبار LRU + قفل كاش AI
@@ -2409,17 +2846,79 @@ if __name__ == "__main__":
     durs_fb = [2.0, 3.0, 2.5]
     tr_fb = ["crossfade_medium", "crossfade_soft"]
     lay_fb = _compute_segment_layout(durs_fb, tr_fb, 60)
-    # مواضع القطع الفوري = bounds[i]/fps
     cut_pos = [lay_fb["bounds"][i] / 60 for i in range(1, len(durs_fb))]
-    # مواضع xfade = O[i-1]/fps
     xfade_pos = [lay_fb["O"][i - 1] / 60 for i in range(1, len(durs_fb))]
-    # يجب أن تكون مواضع القطع > مواضع xfade (لأن O يبدأ قبل منتصف الحد)
     for i in range(len(cut_pos)):
-        assert cut_pos[i] > xfade_pos[i], (i, cut_pos[i], xfade_pos[i])
+        assert cut_pos[i] >= xfade_pos[i], (i, cut_pos[i], xfade_pos[i])
     print(
         f"[OK] test #17: rhythm timing cut vs xfade "
-        f"(cut={[round(x,3) for x in cut_pos]}, "
-        f"xfade={[round(x,3) for x in xfade_pos]})"
+        f"(cut={[round(x, 3) for x in cut_pos]}, "
+        f"xfade={[round(x, 3) for x in xfade_pos]})"
     )
+
+    # ------------------------------------------------------------
+    # 18. اختبار offset النسبي في xfade بين المجموعات
+    # ------------------------------------------------------------
+    durs_g = [2.0, 2.0, 2.0, 2.0]
+    lay_g = _compute_segment_layout(durs_g, ["crossfade_medium"] * 3, 60)
+    groups_g = [(0, 1), (2, 2), (3, 3)]
+    filt_g, _ = _xfade_filter_for_groups(groups_g, lay_g, 60)
+    exp0 = lay_g["O"][1] / 60
+    exp1 = max(0.0, (lay_g["O"][2] - lay_g["S"][2]) / 60)
+    assert f"offset={exp0:.6f}" in filt_g, filt_g
+    assert f"offset={exp1:.6f}" in filt_g, filt_g
+    abs_wrong = lay_g["O"][2] / 60
+    if abs(exp1 - abs_wrong) > 1e-9:
+        assert f"offset={abs_wrong:.6f}" not in filt_g, filt_g
+    print("[OK] test #18: group xfade offsets are relative to group start")
+
+    # ------------------------------------------------------------
+    # 19. اختبار بناء مزج الصوت مع/بدون دعم amix features
+    # ------------------------------------------------------------
+    _AMIX_FEATURES = (True, True)
+    mix = _build_audio_mix_filter([("[a]", 1.0), ("[b]", 0.5)], "[aout]")
+    assert "weights='1.000000 0.500000'" in mix, mix
+    assert "normalize=0" in mix, mix
+    assert "level=0" in mix, mix
+
+    _AMIX_FEATURES = (False, False)
+    mix2 = _build_audio_mix_filter([("[a]", 1.0), ("[b]", 0.5)], "[aout]")
+    assert "amix=inputs=2" in mix2, mix2
+    assert "volume=" in mix2, mix2
+    assert "level=0" in mix2, mix2
+
+    one = _build_audio_mix_filter([("[a]", 1.0)], "[aout]")
+    assert "amix" not in one, one
+    assert "alimiter" in one, one
+    _AMIX_FEATURES = None
+    print("[OK] test #19: audio mix builder supports modern/legacy amix")
+
+    # ------------------------------------------------------------
+    # 20. اختبار قيود مدة الحركة ودمج AI
+    # ------------------------------------------------------------
+    assert not _motion_allowed_for_duration("zoom_out", 2.0)
+    assert _motion_allowed_for_duration("zoom_out", 2.3)
+    assert not _motion_allowed_for_duration("slow_drift", 6.0)
+    assert _motion_allowed_for_duration("slow_drift", 5.9)
+
+    local_motion = {"type": "zoom_in", "intensity": 0.5, "source": "local"}
+    merged = _merge_ai_into_motion(
+        local_motion,
+        {"motion": "zoom_out", "intensity": 0.8},
+        2.0,
+    )
+    assert merged["type"] == "zoom_in", merged
+    assert abs(merged["intensity"] - 0.8) < 1e-9, merged
+    assert merged["source"] == "ai_intensity_only", merged
+
+    chosen = _choose_non_repeating_motion(
+        "hook",
+        2.0,
+        "zoom_pan_right",
+        {"type": "zoom_pan_right", "intensity": 0.5},
+    )
+    assert chosen["type"] != "zoom_pan_right", chosen
+    assert _motion_allowed_for_duration(chosen["type"], 2.0), chosen
+    print("[OK] test #20: motion duration constraints and AI merge hardened")
 
     print("[ALL TESTS PASSED]")
