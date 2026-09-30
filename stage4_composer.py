@@ -1,27 +1,5 @@
 """
 stage4_composer.py — محرك المونتاج السينمائي الآلي (نسخة إنتاج عالمية مُحصَّنة).
-
-الإصلاحات الجوهرية في هذه النسخة:
-1) حرق الترجمة ASS قبل fade النهائي حتى تتلاشى مع الصورة.
-2) إصلاح alimiter إلى level=0 الآمن عبر إصدارات FFmpeg.
-3) هروب FFmpeg filtergraph صحيح للمسارات داخل الاقتباس الفردي.
-4) نسخ ASS إلى مسار نسبي آمن داخل temp_dir واستخدام cwd=temp_dir.
-5) fallback concat يستخدم أسماء نسبية آمنة داخل temp_dir.
-6) _run_ffmpeg يلتقط FileNotFoundError وOSError ويعمل مع cwd.
-7) فحص فلاتر FFmpeg المطلوبة ديناميكيًا قبل التصدير.
-8) دعم amix weights/normalize مع fallback آمن عند عدم الدعم.
-9) Whoosh أصبح اختياريًا مثل Ambience/Rhythm.
-10) Rhythm في fallback يُبنى على مواضع القطع، ويُعطَّل إذا فشل بدل استخدام توقيت xfade خاطئ.
-11) AI singleton وcache أصبحا thread-safe مع LRU حقيقي.
-12) _accepts_single_prompt أكثر أمانًا ويرفض الأصناف.
-13) قيود مدة الحركة تُفرض بعد AI وبعد إزالة التكرار.
-14) fallback durations يتوسع نسبيًا إذا كان المجموع أقل من مدة الصوت.
-15) إصلاح offset في xfade بين المجموعات الكبيرة.
-16) فرض/تحذير امتداد MP4 لأن الترميز الناتج MP4/H.264/AAC.
-17) تحذير إذا انحرفت مدة الفيديو النهائي عن مدة الصوت.
-18) تسريع اختياري عبر NumPy لتوليد Whoosh/Rhythm مع fallback نقي.
-19) تحصين قراءة WAV والقيم الصوتية.
-20) تحديث الاختبارات لتغطي السلوك الجديد.
 """
 
 import wave
@@ -116,7 +94,7 @@ AI_CALL_TIMEOUT_SEC = 90
 
 _DEFAULT_WHOOSH_STRENGTH = 0.55
 
-_AI_PROMPT_VERSION = "v2"
+_AI_PROMPT_VERSION = "v3"  # رُفع بعد توضيح دلالة whoosh_strength.
 
 _AUDIO_VOICE_NORMALIZE_CHAIN = (
     "aresample=44100,"
@@ -265,6 +243,11 @@ _AMIX_FEATURES: Optional[Tuple[bool, bool]] = None
 def _ffmpeg_supports_amix_features() -> Tuple[bool, bool]:
     """
     يرجع (supports_weights, supports_normalize).
+
+    الاستراتيجية:
+    1) فحص وصف الفلتر عبر `ffmpeg -h filter=amix` (سريع).
+    2) تأكيد باختبار فعلي قصير (يضمن عدم الاعتماد على نص وصفي قد يتغير).
+    النتيجة مُخزَّنة مؤقتًا في _AMIX_FEATURES.
     """
     global _AMIX_FEATURES
     if _AMIX_FEATURES is not None:
@@ -289,6 +272,33 @@ def _ffmpeg_supports_amix_features() -> Tuple[bool, bool]:
         supports_weights = False
         supports_normalize = False
 
+    # تأكيد باختبار فعلي عند الاشتباه بدعم weights.
+    if supports_weights:
+        try:
+            probe = subprocess.run(
+                [
+                    "ffmpeg", "-hide_banner", "-v", "error",
+                    "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+                    "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+                    "-filter_complex",
+                    "[0:a][1:a]amix=inputs=2:duration=first:"
+                    "dropout_transition=0:weights='1 1'[aout]",
+                    "-map", "[aout]", "-t", "0.05",
+                    "-f", "null", "-",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                encoding="utf-8",
+                errors="replace",
+            )
+            if probe.returncode != 0:
+                supports_weights = False
+                supports_normalize = False
+        except (OSError, subprocess.SubprocessError):
+            supports_weights = False
+            supports_normalize = False
+
     _AMIX_FEATURES = (supports_weights, supports_normalize)
     return _AMIX_FEATURES
 
@@ -300,6 +310,12 @@ def _build_audio_mix_filter(
     """
     بناء سلسلة مزج صوتية آمنة عبر إصدارات FFmpeg المختلفة.
     mix_inputs: قائمة (label, weight).
+
+    ملاحظة حول alimiter=level=0:
+      - limit=0.95 يمنع التجاوز فوق ‎-0.45 dBFS تقريبًا (سقف آمن قبل AAC).
+      - level=0 يعطّل auto-leveling الداخلي لـ alimiter (وهو الافتراضي في معظم
+        الإصدارات لكن نصرّح به للثبات)، فلا يُعاد رفع الإشارة تلقائيًا بعد القص.
+      - الغرض: منع clipping صاخب دون تشويه ديناميكي غير متوقع.
     """
     if not mix_inputs:
         raise ValueError("mix_inputs فارغة")
@@ -356,16 +372,6 @@ def _escape_filter_path(path: Path) -> str:
     s = path.resolve().as_posix()
     s = s.replace("\\", "\\\\").replace("'", "\\'")
     return s
-
-
-def _safe_concat_escape(path: Path) -> str:
-    """
-    هروب مسار لملف قائمة concat demuxer.
-    لا يُستخدم في النسخة الحالية للمسارات النسبية الآمنة، لكنه محفوظ للتوافق.
-    """
-    resolved = path.resolve().as_posix()
-    escaped = resolved.replace("\\", "\\\\").replace("'", "\\'")
-    return f"file '{escaped}'\n"
 
 
 def _prepare_safe_ass(
@@ -912,6 +918,15 @@ class _AIEditorialDirector:
         return str(result)
 
     def _call_engine_safe(self, prompt: str) -> str:
+        """
+        تشغيل استدعاء AI في خيط منفصل مع مهلة.
+
+        ملاحظة مهمة: Python لا تسمح بإيقاف خيط قسريًا. إذا انتهت المهلة
+        والخيط ما زال يعمل (عادة بسبب استدعاء شبكة بطيء)، يستمر الخيط
+        في الخلفية حتى ينتهي من تلقاء نفسه. نحن نستخدم daemon=True حتى
+        لا يمنع الخيط من إغلاق العملية، ونسجّل عدادًا تراكميًا للخيوط
+        المعلّقة لمراقبة أي تسرّب.
+        """
         box: Dict[str, Any] = {}
         fn = self._call_fn
 
@@ -989,7 +1004,8 @@ class _AIEditorialDirector:
             "zoom_pan_right, zoom_pan_up, zoom_pan_down, slow_drift, static_micro}.\n"
             "- intensity ∈ [0.3, 1.0].\n"
             "- transition_after ∈ {cut, crossfade_soft, crossfade_medium, crossfade_deep}.\n"
-            "- whoosh_strength ∈ [0.0, 1.0] (0 = بلا whoosh).\n"
+            "- whoosh_strength: قوة الـ whoosh المُصاحب للانتقال بعد هذه اللقطة، "
+            "∈ [0.0, 1.0] (0 = بلا whoosh).\n"
             "- ambience_boost ∈ [-0.3, +0.3].\n"
             "- keyword: كلمة أو رقم واحد أنيق (اختياري، غالبًا null).\n"
             "- لا تكرر نفس الحركة مرتين متتاليتين.\n"
@@ -1185,6 +1201,7 @@ def _merge_ai_into_motion(
         merged["type"] = ai_motion
         merged["source"] = "ai"
     elif ai_motion in MOTION_TYPES:
+        # الحركة المقترحة من AI غير مسموحة للمدة، لكن نُبقي شدتها.
         merged["source"] = "ai_intensity_only"
 
     local_intensity = _clamp_float(local.get("intensity", 0.55), 0.25, 1.0, 0.55)
@@ -1699,6 +1716,13 @@ def _xfade_filter_for_range(
     fps: int,
     time_base_frames: int,
 ) -> Tuple[str, str]:
+    """
+    سلسلة xfade داخل نطاق مقاطع متتالي [first..last].
+
+    المعامل time_base_frames يُطرح من O[k] ليصبح الإزاحة نسبية لأصل النطاق.
+    - عند الاستخدام على كامل السلسلة: time_base_frames=0 (إزاحة مطلقة).
+    - عند الاستخدام داخل مجموعة: time_base_frames=S[first] (إزاحة نسبية لبداية المجموعة).
+    """
     if first == last:
         return "", "[0:v]"
     parts: List[str] = []
@@ -1722,18 +1746,31 @@ def _xfade_filter_for_groups(
     layout: Dict[str, Any],
     fps: int,
 ) -> Tuple[str, str]:
+    """
+    سلسلة xfade بين مجموعات مُدمجة مسبقًا (بعد رندرة كل مجموعة إلى ملف).
+
+    المدخلات هي مخرجات المجموعات، وكل مجموعة مُخرَجها يحمل:
+      - محتوى المجموعة على محورها المحلي الخاص (المجموعة g تبدأ محليًا من 0).
+
+    عندما نُسلسل: vx0 = xfade(grp_0, grp_1)، ثم vx1 = xfade(vx0, grp_2)، ...
+    يصبح محور vx{g} محاذيًا للمحور المطلق (بالزمن الحقيقي) للفيديو النهائي.
+
+    ==> الإزاحة في كل xfade يجب أن تكون **مطلقة** (نسبةً لبداية التراكم)،
+        أي O[k]/fps، وليس (O[k] - S[a])/fps.
+        الأخيرة صحيحة فقط للمجموعة الأولى (a=0) حيث S[0]=0، وهي خطأ لما بعدها.
+    """
     if len(groups) == 1:
         return "", "[0:v]"
     parts: List[str] = []
     prev = "[0:v]"
     for g in range(len(groups) - 1):
-        a, b = groups[g]
+        _a, b = groups[g]
         k = b
         cur = f"[{g + 1}:v]"
         out = f"[vx{g}]"
         t_sec = layout["T"][k] / fps
-        # الإصلاح المهم: offset نسبي لبداية المجموعة الحالية، لا مطلق.
-        off_sec = max(0.0, (layout["O"][k] - layout["S"][a]) / fps)
+        # التصحيح الحرج: offset مطلق زمنيًا (vx{g} مُراكم، محوره = المحور المطلق).
+        off_sec = max(0.0, layout["O"][k] / fps)
         parts.append(
             f"{prev}{cur}xfade=transition=fade:"
             f"duration={t_sec:.6f}:offset={off_sec:.6f}{out}"
@@ -1947,6 +1984,7 @@ def render_final_video(
 
     whoosh_per_transition: List[float] = []
     for i in range(n_shots - 1):
+        # whoosh_strengths[i] هو المطلوب للانتقال التالي للقطة i (بعد i).
         base = whoosh_strengths[i] if i < len(whoosh_strengths) else _DEFAULT_WHOOSH_STRENGTH
         if final_transitions[i] == "cut":
             base *= 0.7
@@ -2857,20 +2895,27 @@ if __name__ == "__main__":
     )
 
     # ------------------------------------------------------------
-    # 18. اختبار offset النسبي في xfade بين المجموعات
+    # 18. اختبار offset المطلق في xfade بين المجموعات (الإصلاح الحرج)
     # ------------------------------------------------------------
     durs_g = [2.0, 2.0, 2.0, 2.0]
     lay_g = _compute_segment_layout(durs_g, ["crossfade_medium"] * 3, 60)
     groups_g = [(0, 1), (2, 2), (3, 3)]
     filt_g, _ = _xfade_filter_for_groups(groups_g, lay_g, 60)
-    exp0 = lay_g["O"][1] / 60
-    exp1 = max(0.0, (lay_g["O"][2] - lay_g["S"][2]) / 60)
+
+    # الإزاحتان يجب أن تكونا **مطلقتين** (نسبةً لبداية التراكم = الزمن المطلق).
+    exp0 = lay_g["O"][1] / 60     # 232/60 = 3.866667
+    exp1 = lay_g["O"][2] / 60     # 352/60 = 5.866667
     assert f"offset={exp0:.6f}" in filt_g, filt_g
     assert f"offset={exp1:.6f}" in filt_g, filt_g
-    abs_wrong = lay_g["O"][2] / 60
-    if abs(exp1 - abs_wrong) > 1e-9:
-        assert f"offset={abs_wrong:.6f}" not in filt_g, filt_g
-    print("[OK] test #18: group xfade offsets are relative to group start")
+
+    # نتأكد أن الخطأ القديم (الطرح النسبي) لم يعد موجودًا.
+    wrong1 = (lay_g["O"][2] - lay_g["S"][2]) / 60
+    if abs(exp1 - wrong1) > 1e-9:
+        assert f"offset={wrong1:.6f}" not in filt_g, filt_g
+    print(
+        f"[OK] test #18: group xfade offsets are absolute "
+        f"(exp0={exp0:.4f}, exp1={exp1:.4f})"
+    )
 
     # ------------------------------------------------------------
     # 19. اختبار بناء مزج الصوت مع/بدون دعم amix features
