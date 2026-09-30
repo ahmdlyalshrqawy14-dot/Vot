@@ -1,15 +1,33 @@
 """
 stage4_composer.py — محرك المونتاج السينمائي الآلي (نسخة إنتاج عالمية).
 
-الإصلاحات السبع (هذه المراجعة):
-1) _escape_filter_path: هروب الفاصلة العليا فقط (المسار محاط بـ '...'،
-   فلا حاجة لهروب : أو [ ] لأن FFmpeg لا يفك هروبها داخل الاقتباس الفردي).
-2) subprocess.run: encoding="utf-8" + errors="replace" لتفادي UnicodeDecodeError.
+الإصلاحات السبعة (المراجعة الأولى):
+1) _escape_filter_path: هروب الفاصلة العليا فقط.
+2) subprocess.run: encoding="utf-8" + errors="replace".
 3) asplit=1: تخطّي الفلتر بالكامل عند غياب Ambience و Rhythm.
-4) fb_video_dur: استخدام layout["bounds"][-1] / fps بدلاً من sum(durations).
-5) Test #14: التحقق من السلوك الجديد للهروب (اقتباس فردي آمن) + محمول على المنصات.
+4) fb_video_dur: استخدام layout["bounds"][-1] / fps.
+5) Test #14: التحقق من السلوك الجديد للهروب.
 6) إزالة علم success الميت و except الميت.
 7) كاش AI يشمل transitions + asyncio loop مستقل + inspect.signature آمن.
+
+الإصلاحات الإضافية (المراجعة الثانية):
+1) حذف image_starts الميت من render_final_video.
+2) shot_start_in_final يستخدم O[i-1]/fps.
+3) كاش AI: OrderedDict + LRU + قفل.
+4) مسار fallback: whoosh بمواضع القطع + إصلاح مزامنة المؤثرات.
+5) حماية الـ fade عند الصوت القصير (< 0.9s).
+6) _accepts_single_prompt عبر Signature.bind.
+7) تسجيل تراكم خيوط Gemini المعلّقة.
+8) Test #14 محمول على المنصات.
+9) تحصين دفاعي في _merge_ai_into_motion.
+10) تعليق توضيحي في _compute_image_boundaries.
+
+الإصلاحات الإضافية (المراجعة الثالثة — هذه):
+1) مزامنة الإيقاع في مسار fallback عبر rhythm_cut مبني على مواضع القطع.
+2) مسار ASS آمن عبر _prepare_safe_ass (نسخ عند وجود ' في المسار).
+3) _run_ffmpeg يلتقط FileNotFoundError برسالة واضحة.
+4) Test #14: تصحيح فحص شارحة الخلفية المتبقية.
+5) import tempfile في الأعلى.
 """
 
 import wave
@@ -26,6 +44,8 @@ import inspect
 import asyncio
 import threading
 import sys
+import tempfile
+from collections import OrderedDict
 from pathlib import Path
 from typing import List, Dict, Any, Tuple, Optional
 
@@ -142,8 +162,8 @@ def _safe_int_list(value: Any) -> List[int]:
 def _run_ffmpeg(cmd: List[str], timeout: float, label: str) -> None:
     """
     تشغيل ffmpeg مع مهلة + التقاط stderr.
-    [إصلاح 2] encoding utf-8 + errors='replace' لتفادي UnicodeDecodeError
-    عند طباعة FFmpeg لنصوص غير قياسية أو عربية.
+    [إصلاح 2] encoding utf-8 + errors='replace'.
+    [إصلاح 3 — المراجعة الثالثة] التقاط FileNotFoundError برسالة واضحة.
     """
     try:
         subprocess.run(
@@ -159,6 +179,10 @@ def _run_ffmpeg(cmd: List[str], timeout: float, label: str) -> None:
         ) from e
     except subprocess.TimeoutExpired as e:
         raise RuntimeError(f"انتهت مهلة {label} ({timeout:.0f}s).") from e
+    except FileNotFoundError as e:
+        raise RuntimeError(
+            f"ffmpeg غير متوفر في PATH (المهمة: {label})."
+        ) from e
 
 
 _AMIX_NORMALIZE_SUPPORTED: Optional[bool] = None
@@ -167,7 +191,6 @@ _AMIX_NORMALIZE_SUPPORTED: Optional[bool] = None
 def _ffmpeg_supports_amix_normalize() -> bool:
     """
     هل يدعم ffmpeg الخيار amix=normalize (FFmpeg 4.4+)؟ (مع caching).
-    [إصلاح 2] encoding utf-8 + errors='replace'.
     """
     global _AMIX_NORMALIZE_SUPPORTED
     if _AMIX_NORMALIZE_SUPPORTED is not None:
@@ -196,20 +219,57 @@ def _escape_filter_path(path: Path) -> str:
     الرموز : [ ] , داخل الاقتباس. الرمز الوحيد الذي يجب هروبه هو الفاصلة
     العليا ' نفسها (لأنها تُنهي الاقتباس).
 
-    - نحوّل المسار إلى صيغة posix (شرطة مائلة للأمام) لتفادي مشاكل
-      Windows حيث الشرطة الخلفية قد تُفسَّر كهروب.
-    - نستبدل ' بـ '\\'' (close + escaped + open) وهي طريقة الاقتباس القياسية
-      في FFmpeg filtergraph syntax (انظر توثيق av_get_token: "The quote
-      character ' itself cannot be quoted, so you may need to close the
-      quote and escape it."). ملاحظة: \\' داخل '...' لا يعمل، لأن FFmpeg
-      ينسخ الـ backslash حرفياً ثم يُغلق الاقتباس عند الفاصلة.
+    - نحوّل المسار إلى صيغة posix (شرطة مائلة للأمام).
+    - نستبدل ' بـ '\\'' (close + escaped + open).
 
-    مثال:
-        C:\\test\\my 'subs' [1]:draft.ass
-        → C:/test/my '\\''subs'\\'' [1]:draft.ass
+    ملاحظة: النمط '\\'' هو القياسي في FFmpeg filtergraph syntax، لكن
+    بعض إصدارات FFmpeg القديمة (≤ 4.2) لا تفكّه بشكل موحّد داخل فلتر
+    ass=filename=. لهذا السبب يُنصح باستخدام _prepare_safe_ass قبل
+    تمرير المسار إلى فلتر ass.
     """
     s = path.resolve().as_posix()
     return s.replace("'", "'\\''")
+
+
+def _prepare_safe_ass(subtitles_ass: Path) -> Tuple[Path, Optional[Path]]:
+    """
+    [إصلاح 2 — المراجعة الثالثة] ينسخ ملف الترجمة إلى مسار آمن خالٍ من
+    الفاصلة العليا عند الحاجة، لتفادي مشاكل هروب '\\''  في فلتر
+    ass=filename='...' على بعض إصدارات FFmpeg.
+
+    السلوك:
+      - إن كان المسار الأصلي بلا ' → يُعاد كما هو (لا نسخ، لا تنظيف).
+      - إن احتوى ' → يُنسخ إلى مجلد temp جديد بمسار مضمون.
+
+    Returns:
+        (المسار الآمن للاستخدام، مجلد temp للتنظيف لاحقًا أو None).
+    """
+    s = subtitles_ass.resolve().as_posix()
+    if "'" not in s:
+        return subtitles_ass, None
+    try:
+        safe_dir = Path(tempfile.mkdtemp(prefix="stage4_ass_"))
+    except OSError as e:
+        logger.warning(
+            f"تعذّر إنشاء مجلد آمن لمسار ASS ({e}) — استخدام المسار الأصلي."
+        )
+        return subtitles_ass, None
+    safe_path = safe_dir / "subs.ass"
+    try:
+        shutil.copyfile(subtitles_ass, safe_path)
+    except OSError as e:
+        logger.warning(
+            f"تعذّر نسخ ASS إلى مسار آمن ({e}) — استخدام المسار الأصلي."
+        )
+        try:
+            shutil.rmtree(safe_dir, ignore_errors=True)
+        except Exception:
+            pass
+        return subtitles_ass, None
+    logger.info(
+        "🛡️ نُسخ ملف ASS إلى مسار آمن (يحتوي ' في المسار الأصلي)."
+    )
+    return safe_path, safe_dir
 
 
 # ============================================================
@@ -292,7 +352,6 @@ def build_whoosh_timeline(
 
     base_samples = array.array("h")
     base_samples.frombytes(raw)
-    # [إصلاح 4] WAV قياسي little-endian؛ نُحوّل إلى التمثيل الأصلي عند BE.
     if sys.byteorder == "big":
         base_samples.byteswap()
     base_len = len(base_samples)
@@ -332,7 +391,6 @@ def build_whoosh_timeline(
                 v = -32768
             out[pos] = v
 
-    # [إصلاح 4] WAV قياسي little-endian؛ نُحوّل عند الكتابة على BE.
     if sys.byteorder == "big":
         out.byteswap()
     with wave.open(str(output_path), "w") as wf:
@@ -411,7 +469,6 @@ def _build_rhythm_timeline(
                     v = -32768
                 out[idx] = v
 
-        # [إصلاح 4] WAV قياسي little-endian؛ نُحوّل عند الكتابة على BE.
         if sys.byteorder == "big":
             out.byteswap()
         with wave.open(str(output_path), "w") as wf:
@@ -434,38 +491,28 @@ def _build_rhythm_timeline(
 # ============================================================
 
 def _accepts_single_prompt(fn: Any) -> bool:
-    # [إصلاح 7] عند فشل التحقق نرفض الدالة (بدل قبولها ثم الفشل عند الاستدعاء).
     try:
         sig = inspect.signature(fn)
     except (TypeError, ValueError):
         return False
-
-    required_positional = 0
-    required_kwonly = 0
-    can_take_one = False
-    for p in sig.parameters.values():
-        if p.kind == inspect.Parameter.VAR_POSITIONAL:
-            can_take_one = True
-            continue
-        if p.kind == inspect.Parameter.VAR_KEYWORD:
-            continue
-        if p.kind in (inspect.Parameter.POSITIONAL_ONLY,
-                      inspect.Parameter.POSITIONAL_OR_KEYWORD):
-            can_take_one = True
-            if p.default is inspect.Parameter.empty:
-                required_positional += 1
-        elif p.kind == inspect.Parameter.KEYWORD_ONLY:
-            if p.default is inspect.Parameter.empty:
-                required_kwonly += 1
-    return can_take_one and required_kwonly == 0 and required_positional <= 1
+    try:
+        sig.bind("__prompt_probe__")
+    except TypeError:
+        return False
+    return True
 
 
 class _AIEditorialDirector:
     _instance: Optional["_AIEditorialDirector"] = None
     _call_fn = None
     _available: bool = False
-    _plan_cache: Dict[str, Dict[str, Any]] = {}
+
+    _plan_cache: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+    _cache_lock = threading.Lock()
     _MAX_PLAN_CACHE = 32
+
+    _lingering_threads: int = 0
+    _linger_lock = threading.Lock()
 
     @classmethod
     def get(cls) -> "_AIEditorialDirector":
@@ -531,22 +578,28 @@ class _AIEditorialDirector:
         if not self.is_available():
             return {}
 
-        # [إصلاح 3] transitions جزء من مفتاح الكاش لأنها تُستخدم في بناء الـ prompt.
         cache_key = self._timeline_signature(
             renderable_timeline, durations, transitions
         )
-        cached = self._plan_cache.get(cache_key)
-        if cached is not None:
-            return cached
+
+        with self._cache_lock:
+            cached = self._plan_cache.get(cache_key)
+            if cached is not None:
+                self._plan_cache.move_to_end(cache_key)
+                return cached
 
         try:
-            prompt = self._build_prompt(renderable_timeline, durations, transitions)
+            prompt = self._build_prompt(
+                renderable_timeline, durations, transitions
+            )
             raw = self._call_engine_safe(prompt)
             plan = self._parse_plan(raw, len(renderable_timeline))
             if plan:
-                if len(self._plan_cache) >= self._MAX_PLAN_CACHE:
-                    self._plan_cache.clear()
-                self._plan_cache[cache_key] = plan
+                with self._cache_lock:
+                    self._plan_cache[cache_key] = plan
+                    self._plan_cache.move_to_end(cache_key)
+                    while len(self._plan_cache) > self._MAX_PLAN_CACHE:
+                        self._plan_cache.popitem(last=False)
                 logger.info(
                     f"🎬 Gemini: خطة مونتاج لـ {len(plan.get('shots', []))} لقطة."
                 )
@@ -583,8 +636,6 @@ class _AIEditorialDirector:
             try:
                 res = fn(prompt)
                 if inspect.isawaitable(res):
-                    # [إصلاح 6] حلقة أحداث مستقلة بدل asyncio.run (تفشل داخل
-                    # حلقة قائمة مثل Jupyter / uvicorn).
                     loop = asyncio.new_event_loop()
                     try:
                         res = loop.run_until_complete(res)
@@ -594,15 +645,26 @@ class _AIEditorialDirector:
             except Exception as exc:  # noqa: BLE001
                 box["error"] = exc
 
-        th = threading.Thread(target=_worker, name="gemini-director", daemon=True)
+        th = threading.Thread(
+            target=_worker, name="gemini-director", daemon=True
+        )
         th.start()
         th.join(AI_CALL_TIMEOUT_SEC)
         if th.is_alive():
+            with type(self)._linger_lock:
+                type(self)._lingering_threads += 1
+                count = type(self)._lingering_threads
+            logger.warning(
+                f"⚠️ خيط Gemini لم ينتهِ خلال المهلة ({AI_CALL_TIMEOUT_SEC}s). "
+                f"تراكم الخيوط المعلّقة: {count}."
+            )
             raise RuntimeError(
                 f"انتهت مهلة استدعاء Gemini ({AI_CALL_TIMEOUT_SEC}s)"
             )
         if "error" in box:
-            raise RuntimeError(f"استدعاء Gemini فشل: {box['error']}") from box["error"]
+            raise RuntimeError(
+                f"استدعاء Gemini فشل: {box['error']}"
+            ) from box["error"]
         return self._coerce_result_to_text(box.get("result"))
 
     def _build_prompt(
@@ -742,7 +804,6 @@ class _AIEditorialDirector:
         durations: List[float],
         transitions: List[str],
     ) -> str:
-        # [إصلاح 3] transitions جزء من التوقيع لأنها تؤثر في الـ prompt.
         h = hashlib.sha256()
         for i, (it, d) in enumerate(zip(timeline, durations)):
             role = str(it.get("narrative_role") or "")
@@ -814,8 +875,9 @@ def _merge_ai_into_motion(
     if ai_shot.get("motion") in MOTION_TYPES:
         merged["type"] = ai_shot["motion"]
         merged["source"] = "ai"
+    local_intensity = _clamp_float(local.get("intensity", 0.55), 0.25, 1.0, 0.55)
     merged["intensity"] = _clamp_float(
-        ai_shot.get("intensity", local["intensity"]), 0.3, 1.0, local["intensity"]
+        ai_shot.get("intensity", local_intensity), 0.3, 1.0, local_intensity
     )
     return merged
 
@@ -935,9 +997,6 @@ def get_ken_burns_filter(
 # ============================================================
 
 def _probe_media_duration(path: Path) -> float:
-    """
-    [إصلاح 2] encoding utf-8 + errors='replace' لتفادي UnicodeDecodeError.
-    """
     try:
         result = subprocess.run(
             [
@@ -1050,7 +1109,6 @@ def _try_generate_ambience(
         str(output_path),
     ]
     try:
-        # [إصلاح 2 — موسّع] كتم المخرجات + ترميز UTF-8 متين، على غرار _run_ffmpeg.
         subprocess.run(
             cmd, check=True, timeout=180,
             capture_output=True, text=True,
@@ -1400,7 +1458,7 @@ def render_final_video(
     audio_duration = _probe_media_duration(audio_file)
 
     fps = 60
-    durations, image_starts = _compute_image_boundaries(
+    durations, _ = _compute_image_boundaries(
         renderable_timeline, audio_duration, fps
     )
     if len(durations) != len(validated_pairs):
@@ -1511,6 +1569,10 @@ def render_final_video(
     for i, off in enumerate(xfade_offsets):
         transition_times_final.append(max(0.0, off + safe_t_durs[i] / 2.0))
 
+    transition_times_cut: List[float] = [
+        layout["bounds"][i + 1] / fps for i in range(n_shots - 1)
+    ]
+
     whoosh_per_transition: List[float] = []
     for i in range(n_shots - 1):
         base = whoosh_strengths[i] if i < len(whoosh_strengths) else _DEFAULT_WHOOSH_STRENGTH
@@ -1519,7 +1581,8 @@ def render_final_video(
         whoosh_per_transition.append(min(1.6, base / _DEFAULT_WHOOSH_STRENGTH))
 
     shot_start_in_final: List[float] = [
-        layout["bounds"][i] / fps for i in range(n_shots)
+        0.0 if i == 0 else layout["O"][i - 1] / fps
+        for i in range(n_shots)
     ]
 
     rhythm_trigger_times: List[float] = []
@@ -1527,6 +1590,15 @@ def render_final_video(
         role = str(item.get("narrative_role") or "").lower().strip()
         if role in RHYTHM_ENABLED_ROLES:
             rhythm_trigger_times.append(shot_start_in_final[i])
+
+    # [إصلاح 1 — المراجعة الثالثة] مواضع القطع الفوري (مسار concat/fallback):
+    # اللقطة i تظهر عند layout["bounds"][i] في الـ concat (وليس O[i-1]).
+    rhythm_trigger_times_cut: List[float] = [
+        layout["bounds"][i] / fps
+        for i, item in enumerate(renderable_timeline)
+        if str(item.get("narrative_role") or "").lower().strip()
+        in RHYTHM_ENABLED_ROLES
+    ]
 
     run_id = uuid.uuid4().hex
     temp_dir = output_dir / f"temp_segments_{run_id}"
@@ -1542,6 +1614,8 @@ def render_final_video(
     ambience_file = temp_dir / "ambience.wav"
     rhythm_file = temp_dir / "rhythm.wav"
     staged_output_video = temp_dir / "final_output_staged.mp4"
+
+    safe_ass_dir: Optional[Path] = None
 
     try:
         create_synthetic_whoosh(sfx_whoosh)
@@ -1626,7 +1700,7 @@ def render_final_video(
             whoosh_volume=0.42,
             per_transition_volumes=whoosh_per_transition or None,
         )
-        _validate_non_empty_file(whoosh_timeline, "مسار الـ whoosh الموحد")
+        _validate_non_empty_file(whoosh_timeline, "مسار الـ whoosh (xfade)")
 
         avg_amb_boost = (
             sum(ambience_boosts) / len(ambience_boosts)
@@ -1673,12 +1747,13 @@ def render_final_video(
         else:
             logger.info("🎵 لا توجد أدوار مسموحة بالإيقاع.")
 
+        # [إصلاح 2 — المراجعة الثالثة] مسار ASS آمن (نسخ عند وجود ').
+        safe_ass, safe_ass_dir = _prepare_safe_ass(subtitles_ass)
+        ass_escaped = _escape_filter_path(safe_ass)
+
         logger.info(
             "✨ تمريرة موحّدة: xfade + tpad + burn subs + audio mix + ducking..."
         )
-
-        # [إصلاح 1] المسار الآن محاط باقتباس فردي → هروب الفاصلة العليا فقط.
-        ass_escaped = _escape_filter_path(subtitles_ass)
 
         final_inputs: List[str] = []
         for vf in video_inputs:
@@ -1717,13 +1792,19 @@ def render_final_video(
         else:
             filter_parts.append(f"{vx_label}null[vpad]")
 
-        fade_out_start = max(0.0, audio_duration - 0.4)
-        polish = (
+        polish_base = (
             "eq=contrast=1.02:saturation=1.03:brightness=0.005,"
-            "unsharp=5:5:0.35:5:5:0.0,"
-            "fade=t=in:st=0:d=0.4,"
-            f"fade=t=out:st={fade_out_start:.3f}:d=0.4"
+            "unsharp=5:5:0.35:5:5:0.0"
         )
+        if audio_duration >= 0.9:
+            fade_out_start = audio_duration - 0.4
+            polish = (
+                f"{polish_base},"
+                "fade=t=in:st=0:d=0.4,"
+                f"fade=t=out:st={fade_out_start:.3f}:d=0.4"
+            )
+        else:
+            polish = polish_base
         filter_parts.append(f"[vpad]{polish}[vpolished]")
         filter_parts.append(
             f"[vpolished]ass=filename='{ass_escaped}'[vout]"
@@ -1742,7 +1823,6 @@ def render_final_video(
         n_ducked = len(ducked_tracks)
         n_voice_splits = 1 + n_ducked
 
-        # [إصلاح 3] تجنّب asplit=1 غير القياسي عند غياب Ducking.
         if n_ducked > 0:
             voice_split_labels = "".join(f"[vsc{i}]" for i in range(n_ducked))
             filter_parts.append(
@@ -1806,8 +1886,6 @@ def render_final_video(
             str(staged_output_video),
         ]
 
-        # [إصلاح 2] _run_ffmpeg يحوّل CalledProcessError إلى RuntimeError،
-        # لذا الالتقاط هنا يقتصر على RuntimeError.
         try:
             _run_ffmpeg(cmd_final, FINAL_TIMEOUT_SEC, "التصدير الموحّد")
         except RuntimeError as e:
@@ -1815,6 +1893,42 @@ def render_final_video(
                 f"⚠️ فشل التصدير الموحّد: {e} — "
                 f"fallback: concat + تمريرة موحّدة (مع الحفاظ على المؤثرات)."
             )
+
+            whoosh_timeline_cut = temp_dir / "whoosh_cut.wav"
+            build_whoosh_timeline(
+                sfx_whoosh,
+                transition_times_cut,
+                audio_duration,
+                whoosh_timeline_cut,
+                whoosh_volume=0.42,
+                per_transition_volumes=whoosh_per_transition or None,
+            )
+            _validate_non_empty_file(
+                whoosh_timeline_cut, "مسار الـ whoosh (fallback/cut)"
+            )
+
+            # [إصلاح 1 — المراجعة الثالثة] إيقاع مبني على مواضع القطع الفوري
+            # ليتزامن مع ظهور اللقطة في مسار concat.
+            fb_rhythm_path: Optional[Path] = None
+            if has_rhythm and rhythm_trigger_times_cut:
+                rhythm_cut_path = temp_dir / "rhythm_cut.wav"
+                if _build_rhythm_timeline(
+                    rhythm_trigger_times_cut, audio_duration, 44100,
+                    rhythm_cut_path, rhythm_volume=0.32,
+                ):
+                    fb_rhythm_path = rhythm_cut_path
+                    logger.info(
+                        f"🎵 إيقاع fallback مُولَّد بمواضع القطع "
+                        f"({len(rhythm_trigger_times_cut)} نبضة)."
+                    )
+                else:
+                    logger.warning(
+                        "تعذّر توليد إيقاع fallback — استخدام التوقيت الأصلي."
+                    )
+                    fb_rhythm_path = rhythm_file
+            elif has_rhythm:
+                fb_rhythm_path = rhythm_file
+
             trimmed_files: List[Path] = []
             for i, seg in enumerate(segment_files):
                 a = layout["bounds"][i] - layout["S"][i]
@@ -1848,7 +1962,7 @@ def render_final_video(
             fb_idx_audio = 1
             fb_idx_whoosh = 2
             fb_inputs += ["-i", str(audio_file)]
-            fb_inputs += ["-i", str(whoosh_timeline)]
+            fb_inputs += ["-i", str(whoosh_timeline_cut)]
             fb_next = 3
             fb_amb_idx: Optional[int] = None
             fb_rhythm_idx: Optional[int] = None
@@ -1856,13 +1970,11 @@ def render_final_video(
                 fb_inputs += ["-i", str(ambience_file)]
                 fb_amb_idx = fb_next
                 fb_next += 1
-            if has_rhythm:
-                fb_inputs += ["-i", str(rhythm_file)]
+            if fb_rhythm_path is not None:
+                fb_inputs += ["-i", str(fb_rhythm_path)]
                 fb_rhythm_idx = fb_next
                 fb_next += 1
 
-            # [إصلاح 4] مدة فيديو Fallback = مدة المخطط الإطاري الفعلي،
-            # لا المجموع العشري (sum(durations)).
             fb_video_dur = layout["bounds"][-1] / fps
             fb_pad = max(0.0, audio_duration - fb_video_dur)
 
@@ -1874,13 +1986,19 @@ def render_final_video(
             else:
                 fb_filter_parts.append("[0:v]null[vpad]")
 
-            fb_fade_start = max(0.0, audio_duration - 0.4)
-            fb_polish = (
+            fb_polish_base = (
                 "eq=contrast=1.02:saturation=1.03:brightness=0.005,"
-                "unsharp=5:5:0.35:5:5:0.0,"
-                "fade=t=in:st=0:d=0.4,"
-                f"fade=t=out:st={fb_fade_start:.3f}:d=0.4"
+                "unsharp=5:5:0.35:5:5:0.0"
             )
+            if audio_duration >= 0.9:
+                fb_fade_start = audio_duration - 0.4
+                fb_polish = (
+                    f"{fb_polish_base},"
+                    "fade=t=in:st=0:d=0.4,"
+                    f"fade=t=out:st={fb_fade_start:.3f}:d=0.4"
+                )
+            else:
+                fb_polish = fb_polish_base
             fb_filter_parts.append(f"[vpad]{fb_polish}[vpolished]")
             fb_filter_parts.append(
                 f"[vpolished]ass=filename='{ass_escaped}'[vout]"
@@ -1899,7 +2017,6 @@ def render_final_video(
             n_fb_ducked = len(fb_ducked)
             fb_splits = 1 + n_fb_ducked
 
-            # [إصلاح 3] تجنّب asplit=1 في مسار الـ Fallback.
             if n_fb_ducked > 0:
                 fb_split_labels = "".join(f"[fsc{i}]" for i in range(n_fb_ducked))
                 fb_filter_parts.append(
@@ -1986,6 +2103,14 @@ def render_final_video(
         )
 
     finally:
+        if safe_ass_dir is not None:
+            try:
+                if safe_ass_dir.exists() and safe_ass_dir.is_dir():
+                    shutil.rmtree(safe_ass_dir, ignore_errors=True)
+            except Exception as cleanup_err:
+                logger.warning(
+                    f"تعذّر تنظيف مجلد ASS المؤقت {safe_ass_dir}: {cleanup_err}"
+                )
         try:
             if temp_dir.exists() and temp_dir.is_dir():
                 shutil.rmtree(temp_dir, ignore_errors=True)
@@ -1999,7 +2124,6 @@ def render_final_video(
 # الاختبارات الإلزامية
 # ============================================================
 if __name__ == "__main__":
-    import tempfile
     logging.basicConfig(level=logging.INFO)
 
     # 1. اختبار _compute_image_durations
@@ -2191,25 +2315,111 @@ if __name__ == "__main__":
     print("[OK] test #13: AI plan parsing hardened (null/NaN/inf/dict)")
 
     # ------------------------------------------------------------
-    # [إصلاح 5] 14. اختبار الهروب الآمن لمسار ASS
+    # 14. اختبار الهروب الآمن لمسار ASS (محمول على المنصات)
+    # [إصلاح 4 — المراجعة الثالثة] تصحيح فحص شارحة الخلفية المتبقية.
     # ------------------------------------------------------------
-    # ملاحظة مهمة: النمط المُستخدم '\'' (close-escape-reopen) هو القياسي
-    # في FFmpeg filtergraph syntax، وليس مقتصراً على الشل. توثيق FFmpeg
-    # ينص: "The quote character ' itself cannot be quoted, so you may
-    # need to close the quote and escape it." — انظر av_get_token() في
-    # libavutil/avstring.c. ملاحظة: استخدام \' داخل '...' لا يعمل، لأن
-    # FFmpeg ينسخ الـ backslash حرفياً ثم يُغلق الاقتباس عند الفاصلة،
-    # مما يُنتج "Unterminated quote in filtergraph".
-    #
-    # ملاحظة إضافية: نستخدم مسارًا بشرطة مائلة أمامية ليكون الاختبار
-    # محمولاً على Linux/macOS؛ _escape_filter_path يستدعي .as_posix()
-    # فينتج دائمًا شرطات مائلة أمامية بغض النظر عن المنصة.
-    esc_win = _escape_filter_path(Path("C:/test/my 'subs' [1]:draft.ass"))
-    assert "C:/test" in esc_win, esc_win                    # تحويل للشرطة المائلة
-    assert "'\\''" in esc_win, esc_win                       # هروب الفاصلة العليا
-    assert "\\:" not in esc_win, esc_win                     # لا تشويه للنقطتين
-    assert "\\[" not in esc_win, esc_win                     # لا تشويه للأقواس
-    assert "\\\\" not in esc_win.replace("'\\''", ""), esc_win  # لا مضاعفة للشرطة
-    print("[OK] test #14: ASS path escaping (single-pass, safe quoted)")
+    with tempfile.TemporaryDirectory() as td14:
+        sub = Path(td14) / "sub [1]"
+        sub.mkdir()
+        p_real = sub / "my 'draft'.ass"
+        p_real.touch()
+
+        esc_real = _escape_filter_path(p_real)
+
+        # (أ) الفاصلة العليا مُهرَّبة بنمط close-escape-reopen القياسي
+        assert "'\\''" in esc_real, esc_real
+
+        # (ب) فحص بنيوي صارم: الرمز الوحيد المُهرَّب هو ' — لا : ولا [ ]
+        i = 0
+        while i < len(esc_real):
+            if esc_real[i] == "\\":
+                assert i + 1 < len(esc_real) and esc_real[i + 1] == "'", (
+                    f"unexpected escape at position {i} in {esc_real!r}"
+                )
+                i += 2
+            else:
+                i += 1
+
+        # (ج) الأقواس المربعة لم تُهرَّب
+        cleaned = esc_real.replace("'\\''", "")
+        assert "\\[" not in cleaned, cleaned
+        assert "\\]" not in cleaned, cleaned
+
+        # (د) [إصلاح 4] لا backslash متبقٍ بعد إزالة '\\'' (فحص صحيح)
+        assert "\\" not in cleaned, cleaned
+
+    # [إصلاح 2 — المراجعة الثالثة] اختبار _prepare_safe_ass
+    with tempfile.TemporaryDirectory() as td14b:
+        td_path = Path(td14b)
+        # مسار بلا ' → لا نسخ
+        safe_src = td_path / "clean.ass"
+        safe_src.touch()
+        p_safe, d_safe = _prepare_safe_ass(safe_src)
+        assert p_safe == safe_src, (p_safe, safe_src)
+        assert d_safe is None, d_safe
+
+        # مسار فيه ' → نسخ إلى مسار آمن
+        sub2 = td_path / "sub2 [x]"
+        sub2.mkdir()
+        p_unsafe = sub2 / "with 'quote'.ass"
+        p_unsafe.write_text("[Script Info]\n", encoding="utf-8")
+        p_copied, d_copied = _prepare_safe_ass(p_unsafe)
+        try:
+            assert p_copied != p_unsafe
+            assert p_copied.exists() and p_copied.stat().st_size > 0
+            assert d_copied is not None and d_copied.is_dir()
+            assert "'" not in p_copied.as_posix(), p_copied
+        finally:
+            if d_copied is not None:
+                shutil.rmtree(d_copied, ignore_errors=True)
+
+    print(
+        "[OK] test #14: ASS path escaping + _prepare_safe_ass (portable)"
+    )
+
+    # ------------------------------------------------------------
+    # 15. اختبار LRU + قفل كاش AI
+    # ------------------------------------------------------------
+    d_lru = _AIEditorialDirector()
+    d_lru._plan_cache.clear()
+    d_lru._MAX_PLAN_CACHE = 3
+    for k in ("a", "b", "c"):
+        d_lru._plan_cache[k] = {"shots": [{"idx": 0}]}
+    d_lru._plan_cache["d"] = {"shots": [{"idx": 0}]}
+    while len(d_lru._plan_cache) > d_lru._MAX_PLAN_CACHE:
+        d_lru._plan_cache.popitem(last=False)
+    assert list(d_lru._plan_cache.keys()) == ["b", "c", "d"], \
+        list(d_lru._plan_cache.keys())
+    d_lru._plan_cache.clear()
+    print("[OK] test #15: AI plan cache LRU eviction")
+
+    # ------------------------------------------------------------
+    # 16. اختبار _run_ffmpeg FileNotFoundError
+    # ------------------------------------------------------------
+    try:
+        _run_ffmpeg(["definitely-not-ffmpeg-xyz"], 5, "اختبار عدم التوفر")
+        raise AssertionError("should have raised RuntimeError")
+    except RuntimeError as e:
+        assert "غير متوفر" in str(e), str(e)
+    print("[OK] test #16: _run_ffmpeg reports missing binary clearly")
+
+    # ------------------------------------------------------------
+    # 17. اختبار مزامنة إيقاع الـ fallback
+    # ------------------------------------------------------------
+    durs_fb = [2.0, 3.0, 2.5]
+    tr_fb = ["crossfade_medium", "crossfade_soft"]
+    lay_fb = _compute_segment_layout(durs_fb, tr_fb, 60)
+    # مواضع القطع الفوري = bounds[i]/fps
+    cut_pos = [lay_fb["bounds"][i] / 60 for i in range(1, len(durs_fb))]
+    # مواضع xfade = O[i-1]/fps
+    xfade_pos = [lay_fb["O"][i - 1] / 60 for i in range(1, len(durs_fb))]
+    # يجب أن تكون مواضع القطع > مواضع xfade (لأن O يبدأ قبل منتصف الحد)
+    for i in range(len(cut_pos)):
+        assert cut_pos[i] > xfade_pos[i], (i, cut_pos[i], xfade_pos[i])
+    print(
+        f"[OK] test #17: rhythm timing cut vs xfade "
+        f"(cut={[round(x,3) for x in cut_pos]}, "
+        f"xfade={[round(x,3) for x in xfade_pos]})"
+    )
 
     print("[ALL TESTS PASSED]")
