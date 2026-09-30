@@ -1,13 +1,15 @@
 """
 stage4_composer.py — محرك المونتاج السينمائي الآلي (نسخة إنتاج عالمية).
 
-الإصلاحات الخمسة (هذه المراجعة):
+الإصلاحات السبع (هذه المراجعة):
 1) _escape_filter_path: هروب الفاصلة العليا فقط (المسار محاط بـ '...'،
    فلا حاجة لهروب : أو [ ] لأن FFmpeg لا يفك هروبها داخل الاقتباس الفردي).
 2) subprocess.run: encoding="utf-8" + errors="replace" لتفادي UnicodeDecodeError.
 3) asplit=1: تخطّي الفلتر بالكامل عند غياب Ambience و Rhythm.
 4) fb_video_dur: استخدام layout["bounds"][-1] / fps بدلاً من sum(durations).
-5) Test #14: التحقق من السلوك الجديد للهروب (اقتباس فردي آمن).
+5) Test #14: التحقق من السلوك الجديد للهروب (اقتباس فردي آمن) + محمول على المنصات.
+6) إزالة علم success الميت و except الميت.
+7) كاش AI يشمل transitions + asyncio loop مستقل + inspect.signature آمن.
 """
 
 import wave
@@ -23,6 +25,7 @@ import logging
 import inspect
 import asyncio
 import threading
+import sys
 from pathlib import Path
 from typing import List, Dict, Any, Tuple, Optional
 
@@ -195,7 +198,11 @@ def _escape_filter_path(path: Path) -> str:
 
     - نحوّل المسار إلى صيغة posix (شرطة مائلة للأمام) لتفادي مشاكل
       Windows حيث الشرطة الخلفية قد تُفسَّر كهروب.
-    - نستبدل ' بـ '\\'' (close + escaped + open) وهي طريقة الاقتباس القياسية.
+    - نستبدل ' بـ '\\'' (close + escaped + open) وهي طريقة الاقتباس القياسية
+      في FFmpeg filtergraph syntax (انظر توثيق av_get_token: "The quote
+      character ' itself cannot be quoted, so you may need to close the
+      quote and escape it."). ملاحظة: \\' داخل '...' لا يعمل، لأن FFmpeg
+      ينسخ الـ backslash حرفياً ثم يُغلق الاقتباس عند الفاصلة.
 
     مثال:
         C:\\test\\my 'subs' [1]:draft.ass
@@ -285,6 +292,9 @@ def build_whoosh_timeline(
 
     base_samples = array.array("h")
     base_samples.frombytes(raw)
+    # [إصلاح 4] WAV قياسي little-endian؛ نُحوّل إلى التمثيل الأصلي عند BE.
+    if sys.byteorder == "big":
+        base_samples.byteswap()
     base_len = len(base_samples)
 
     total_samples = int(total_duration * sr)
@@ -322,6 +332,9 @@ def build_whoosh_timeline(
                 v = -32768
             out[pos] = v
 
+    # [إصلاح 4] WAV قياسي little-endian؛ نُحوّل عند الكتابة على BE.
+    if sys.byteorder == "big":
+        out.byteswap()
     with wave.open(str(output_path), "w") as wf:
         wf.setnchannels(1)
         wf.setsampwidth(2)
@@ -398,6 +411,9 @@ def _build_rhythm_timeline(
                     v = -32768
                 out[idx] = v
 
+        # [إصلاح 4] WAV قياسي little-endian؛ نُحوّل عند الكتابة على BE.
+        if sys.byteorder == "big":
+            out.byteswap()
         with wave.open(str(output_path), "w") as wf:
             wf.setnchannels(1)
             wf.setsampwidth(2)
@@ -418,10 +434,11 @@ def _build_rhythm_timeline(
 # ============================================================
 
 def _accepts_single_prompt(fn: Any) -> bool:
+    # [إصلاح 7] عند فشل التحقق نرفض الدالة (بدل قبولها ثم الفشل عند الاستدعاء).
     try:
         sig = inspect.signature(fn)
     except (TypeError, ValueError):
-        return True
+        return False
 
     required_positional = 0
     required_kwonly = 0
@@ -514,7 +531,10 @@ class _AIEditorialDirector:
         if not self.is_available():
             return {}
 
-        cache_key = self._timeline_signature(renderable_timeline, durations)
+        # [إصلاح 3] transitions جزء من مفتاح الكاش لأنها تُستخدم في بناء الـ prompt.
+        cache_key = self._timeline_signature(
+            renderable_timeline, durations, transitions
+        )
         cached = self._plan_cache.get(cache_key)
         if cached is not None:
             return cached
@@ -563,9 +583,13 @@ class _AIEditorialDirector:
             try:
                 res = fn(prompt)
                 if inspect.isawaitable(res):
-                    async def _wrap():
-                        return await res
-                    res = asyncio.run(_wrap())
+                    # [إصلاح 6] حلقة أحداث مستقلة بدل asyncio.run (تفشل داخل
+                    # حلقة قائمة مثل Jupyter / uvicorn).
+                    loop = asyncio.new_event_loop()
+                    try:
+                        res = loop.run_until_complete(res)
+                    finally:
+                        loop.close()
                 box["result"] = res
             except Exception as exc:  # noqa: BLE001
                 box["error"] = exc
@@ -714,10 +738,13 @@ class _AIEditorialDirector:
 
     @staticmethod
     def _timeline_signature(
-        timeline: List[Dict[str, Any]], durations: List[float]
+        timeline: List[Dict[str, Any]],
+        durations: List[float],
+        transitions: List[str],
     ) -> str:
+        # [إصلاح 3] transitions جزء من التوقيع لأنها تؤثر في الـ prompt.
         h = hashlib.sha256()
-        for it, d in zip(timeline, durations):
+        for i, (it, d) in enumerate(zip(timeline, durations)):
             role = str(it.get("narrative_role") or "")
             text = str(it.get("text") or "")[:200]
             h.update(role.encode("utf-8", "ignore"))
@@ -725,6 +752,9 @@ class _AIEditorialDirector:
             h.update(text.encode("utf-8", "ignore"))
             h.update(b"|")
             h.update(f"{round(float(d), 2)}".encode("ascii"))
+            h.update(b"|")
+            tr = transitions[i] if i < len(transitions) else ""
+            h.update(str(tr).encode("utf-8", "ignore"))
             h.update(b"\n")
         return h.hexdigest()[:24]
 
@@ -1020,9 +1050,17 @@ def _try_generate_ambience(
         str(output_path),
     ]
     try:
-        subprocess.run(cmd, check=True, timeout=180)
+        # [إصلاح 2 — موسّع] كتم المخرجات + ترميز UTF-8 متين، على غرار _run_ffmpeg.
+        subprocess.run(
+            cmd, check=True, timeout=180,
+            capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+        )
     except subprocess.CalledProcessError as e:
-        logger.warning(f"فشل توليد طبقة الـ ambience (exit={e.returncode}).")
+        err_tail = (e.stderr or "").strip()[-500:]
+        logger.warning(
+            f"فشل توليد طبقة الـ ambience (exit={e.returncode}): {err_tail}"
+        )
         return False
     except subprocess.TimeoutExpired:
         logger.warning("انتهت مهلة توليد طبقة الـ ambience.")
@@ -1505,7 +1543,6 @@ def render_final_video(
     rhythm_file = temp_dir / "rhythm.wav"
     staged_output_video = temp_dir / "final_output_staged.mp4"
 
-    success = False
     try:
         create_synthetic_whoosh(sfx_whoosh)
         if not sfx_whoosh.exists() or sfx_whoosh.stat().st_size <= 0:
@@ -1769,9 +1806,11 @@ def render_final_video(
             str(staged_output_video),
         ]
 
+        # [إصلاح 2] _run_ffmpeg يحوّل CalledProcessError إلى RuntimeError،
+        # لذا الالتقاط هنا يقتصر على RuntimeError.
         try:
             _run_ffmpeg(cmd_final, FINAL_TIMEOUT_SEC, "التصدير الموحّد")
-        except (subprocess.CalledProcessError, RuntimeError) as e:
+        except RuntimeError as e:
             logger.warning(
                 f"⚠️ فشل التصدير الموحّد: {e} — "
                 f"fallback: concat + تمريرة موحّدة (مع الحفاظ على المؤثرات)."
@@ -1946,8 +1985,6 @@ def render_final_video(
             f"المرجع الصوتي = {audio_duration:.3f}s)"
         )
 
-        success = True
-
     finally:
         try:
             if temp_dir.exists() and temp_dir.is_dir():
@@ -1956,9 +1993,6 @@ def render_final_video(
             logger.warning(
                 f"تعذّر تنظيف المجلد المؤقت {temp_dir}: {cleanup_err}"
             )
-
-    if not success:
-        raise RuntimeError("فشلت الرندرة دون استثناء صريح (حالة غير متوقعة).")
 
 
 # ============================================================
@@ -2037,6 +2071,8 @@ if __name__ == "__main__":
             with wave.open(str(p), "rb") as w:
                 arr = array.array("h")
                 arr.frombytes(w.readframes(w.getnframes()))
+            if sys.byteorder == "big":
+                arr.byteswap()
             return max((abs(v) for v in arr), default=0)
 
         out_a = td_path / "wa.wav"
@@ -2157,9 +2193,18 @@ if __name__ == "__main__":
     # ------------------------------------------------------------
     # [إصلاح 5] 14. اختبار الهروب الآمن لمسار ASS
     # ------------------------------------------------------------
-    # ملاحظة: المسار محاط باقتباس فردي في سطر الفلتر، لذا يجب ألا نُهرّب
-    # : أو [ ] (FFmpeg لا يفك هروبها داخل '...'). الحرف الوحيد المهروب هو '.
-    esc_win = _escape_filter_path(Path("C:\\test\\my 'subs' [1]:draft.ass"))
+    # ملاحظة مهمة: النمط المُستخدم '\'' (close-escape-reopen) هو القياسي
+    # في FFmpeg filtergraph syntax، وليس مقتصراً على الشل. توثيق FFmpeg
+    # ينص: "The quote character ' itself cannot be quoted, so you may
+    # need to close the quote and escape it." — انظر av_get_token() في
+    # libavutil/avstring.c. ملاحظة: استخدام \' داخل '...' لا يعمل، لأن
+    # FFmpeg ينسخ الـ backslash حرفياً ثم يُغلق الاقتباس عند الفاصلة،
+    # مما يُنتج "Unterminated quote in filtergraph".
+    #
+    # ملاحظة إضافية: نستخدم مسارًا بشرطة مائلة أمامية ليكون الاختبار
+    # محمولاً على Linux/macOS؛ _escape_filter_path يستدعي .as_posix()
+    # فينتج دائمًا شرطات مائلة أمامية بغض النظر عن المنصة.
+    esc_win = _escape_filter_path(Path("C:/test/my 'subs' [1]:draft.ass"))
     assert "C:/test" in esc_win, esc_win                    # تحويل للشرطة المائلة
     assert "'\\''" in esc_win, esc_win                       # هروب الفاصلة العليا
     assert "\\:" not in esc_win, esc_win                     # لا تشويه للنقطتين
