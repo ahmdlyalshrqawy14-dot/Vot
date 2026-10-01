@@ -1,7 +1,7 @@
 [
 {
 "id": 1,
-"status": "pending",
+"status": "Completed",
 "topic": "Why do we protect the identity we want to outgrow?",
 "the_myth": "People believe that clinging to an old identity is a sign of loyalty or consistency.",
 "the_truth": "William James argued that the self is not a fixed substance but a stream of consciousness that constantly changes. Clinging to an outdated identity often reflects fear of the unknown rather than true loyalty.",
@@ -21,7 +21,7 @@
 },
 {
 "id": 2,
-"status": "pending",
+"status": "Completed",
 "topic": "Why does courage begin before fear disappears?",
 "the_myth": "Courage means being fearless.",
 "the_truth": "Aristotle in Nicomachean Ethics describes courage as a virtue that involves feeling fear but choosing action for the right reason. Courage is not the absence of fear but the willingness to act despite it.",
