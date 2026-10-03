@@ -2180,6 +2180,7 @@ def render_final_video(
         for vf in video_inputs:
             final_inputs += ["-i", str(Path(vf).resolve())]
 
+        final_inputs += ["-i", str(audio_file.resolve())]
         idx_audio = n_video_inputs
         next_idx = idx_audio + 1
 
@@ -2415,6 +2416,7 @@ def render_final_video(
             fb_inputs: List[str] = [
                 "-f", "concat", "-safe", "0",
                 "-i", "concat_list.txt",
+                "-i", str(audio_file.resolve()),
             ]
             fb_idx_audio = 1
             fb_next = 2
