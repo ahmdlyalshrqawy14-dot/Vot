@@ -118,7 +118,7 @@ def _fresh_session():
         "manual_current": None,           # Path الحالية
         "manual_unindexed_files": [],     # [Path, ...]
         "manual_missing_indices": [],     # [int, ...]
-        "ocr_indexed_map": {},            # {int(slot): str(path)} من آخر فحص OCR
+        "ocr_indexed_map": {},            # {int(slot): str(path)} من آخر ترتيب حسب اسم الملف
         # =============================================================
         # نظام مراجعة وترتيب الصور المستقل (قبل المونتاج)
         # =============================================================
@@ -1179,7 +1179,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         )
 
     # -------------------------------------------------------------
-    # بدء فحص الصور
+    # بدء ترتيب الصور
     # -------------------------------------------------------------
     elif data == "btn_start_render":
         user_tasks[chat_id] = asyncio.create_task(
@@ -1199,7 +1199,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_caption(
                 caption=(
                     "❌ <b>تم إلغاء الوضع اليدوي.</b>\n"
-                    "يمكنك رفع الصور الناقصة ثم إعادة الفحص."
+                    "يمكنك رفع الصور الناقصة ثم إعادة الترتيب."
                 ),
                 parse_mode=ParseMode.HTML,
             )
@@ -1860,11 +1860,11 @@ async def run_stage3(query, context):
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"1️⃣ قم بتوليد الصور على منصة الصور عبر ملفات الـ TXT المرسلة لك.\n"
             f"2️⃣ أرسل الصور هنا في الشات (كصور أو كملفات دفعة واحدة).\n"
-            f"3️⃣ سيتعرف السيرفر تلقائياً على ترتيب كل صورة بالـ OCR.\n\n"
+            f"3️⃣ سمّي كل صورة برقمها فقط (مثال: 1.webp أو 2.png أو 3.jpg) ثم ارفعها هنا.\n\n"
             f"👇 <b>عند الانتهاء من رفع كافة الصور ({len(sentences)} صورة)، اضغط الزر أدناه:</b>"
         )
         keyboard = [
-            [InlineKeyboardButton("🎬 فحص الصور وبدء المراجعة", callback_data="btn_start_render")]
+            [InlineKeyboardButton("🎬 ترتيب الصور حسب الاسم", callback_data="btn_start_render")]
         ]
         await wait_msg.edit_text(
             ready_card, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML
@@ -1984,7 +1984,7 @@ async def handle_media_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
         await file_obj.download_to_drive(save_path)
         session["uploaded_count"] += 1
 
-        # أي رفع جديد يُبطل أي اعتماد سابق (سيُعاد الفحص من الصفر)
+        # أي رفع جديد يُبطل أي اعتماد سابق (سيُعاد الترتيب من الصفر)
         session["image_review_confirmed_flag"] = False
         session["final_image_map"] = {}
 
@@ -1993,14 +1993,14 @@ async def handle_media_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
             pct = int((current / total_expected * 100)) if total_expected > 0 else 0
             keyboard = [
                 [InlineKeyboardButton(
-                    "🎬 فحص الصور وبدء المراجعة",
+                    "🎬 ترتيب الصور حسب الاسم",
                     callback_data="btn_start_render",
                 )]
             ]
             await update.message.reply_text(
                 f"📥 <b>تم استلام وحفظ:</b> <code>{current} / {total_expected}</code> "
                 f"صورة ({pct}%)\n"
-                f"إذا انتهيت من رفع الحزمة كاملة، اضغط على الزر أدناه لبدء الفحص.",
+                f"إذا انتهيت من رفع الحزمة كاملة، اضغط على الزر أدناه لبدء الترتيب.",
                 reply_markup=InlineKeyboardMarkup(keyboard),
                 parse_mode=ParseMode.HTML,
             )
@@ -2041,7 +2041,7 @@ async def handle_manual_assign(query, context, slot):
 
 
 async def _build_map_from_ocr_and_manual(session) -> dict:
-    """يدمج نتيجة OCR + التعيين اليدوي. اختيار المستخدم يطغى."""
+    """يدمج نتيجة الترتيب + التعيين اليدوي. اختيار المستخدم يطغى."""
     merged = {}
     for k, v in (session.get("ocr_indexed_map") or {}).items():
         try:
@@ -2099,7 +2099,7 @@ def _reset_image_review_state(session, review_map, total_expected):
 async def _finalize_after_manual(context, chat_id):
     """
     بعد انتهاء المستخدم من التعيين اليدوي:
-    - نبني الخريطة من OCR + Manual ونُعيد ضبط كل حالة المراجعة.
+    - نبني الخريطة من الترتيب + Manual ونُعيد ضبط كل حالة المراجعة.
     - لا نعرض أبداً خيار رندرة جزئية.
     """
     session = get_session(chat_id)
@@ -2134,7 +2134,7 @@ async def _finalize_after_manual(context, chat_id):
     else:
         missing_txt = _format_missing_indices(missing) if missing else "—"
         keyboard = [
-            [InlineKeyboardButton("🔄 إعادة الفحص بعد رفع النواقص", callback_data="btn_start_render")],
+            [InlineKeyboardButton("🔄 إعادة الترتيب بعد رفع النواقص", callback_data="btn_start_render")],
             [InlineKeyboardButton("❌ إلغاء والعودة", callback_data="btn_back_main")],
         ]
         text = (
@@ -2144,7 +2144,7 @@ async def _finalize_after_manual(context, chat_id):
             f"⚠️ <b>الناقص:</b> <code>{len(missing)}</code>\n"
             f"    └ {_esc(missing_txt)}\n"
             f"🔁 <b>التكرارات:</b> <code>{len(duplicates)}</code>\n\n"
-            f"<i>ارفع الصور الناقصة، ثم اضغط «إعادة الفحص».</i>\n"
+            f"<i>ارفع الصور الناقصة، ثم اضغط «إعادة الترتيب».</i>\n"
             f"<i>لا يوجد خيار للرندرة الجزئية.</i>"
         )
 
@@ -2215,15 +2215,15 @@ async def show_next_manual_image(context, chat_id):
 
 
 # =================================================================
-# 7. فحص الصور — لا يوجد allow_partial من الـ UI
+# 7. ترتيب الصور — لا يوجد allow_partial من الـ UI
 # =================================================================
 
 async def run_image_verification(msg_obj, context):
     """
     يشغّل process_and_verify_images مع allow_partial=False دائماً.
-    بعد الفحص الناجح: يُعيد بناء كل حالة المراجعة من الخريطة الجديدة
-    (لا توجد بيانات ناقصة قديمة).
-    عند MissingAssetsError: يعرض فقط: تعيين يدوي / إعادة فحص / إلغاء.
+    الترتيب الآن يعتمد على أسماء الملفات فقط (بدون OCR / بدون ركن سفلي).
+    بعد النجاح الكامل: يُعيد بناء كل حالة المراجعة من الخريطة الجديدة.
+    عند MissingAssetsError: يعرض الصور الناقصة + الصور المتجاهلة + إعادة الترتيب + إلغاء.
     """
     chat_id = msg_obj.chat_id
     session = get_session(chat_id)
@@ -2250,8 +2250,7 @@ async def run_image_verification(msg_obj, context):
         progress_msg = await context.bot.send_message(
             chat_id=chat_id,
             text=(
-                "🔍 <b>فحص كامل</b>\n"
-                f"<i>جاري فحص الركن السفلي الأيمن للصور بالـ OCR ومطابقة الترتيب...</i>"
+                "🔍 <b>جاري ترتيب الصور حسب اسم الملف...</b>"
             ),
             parse_mode=ParseMode.HTML,
         )
@@ -2268,7 +2267,7 @@ async def run_image_verification(msg_obj, context):
             manual_assignments=session.get("manual_map", {}),
         )
         if _is_stale(chat_id, session):
-            logger.info(f"⛔ تم إلغاء فحص الصور للحلقة {ep_id}")
+            logger.info(f"⛔ تم إلغاء ترتيب الصور للحلقة {ep_id}")
             return
     except MissingAssetsError as m_err:
         if _is_stale(chat_id, session):
@@ -2278,7 +2277,7 @@ async def run_image_verification(msg_obj, context):
         unindexed_files = list(getattr(m_err, "unindexed_files", []) or [])
         missing_indices = [int(x) for x in (m_err.missing_indices or [])]
 
-        # ✅ إعادة بناء الحالة من نتيجة الفحص الجديدة فقط
+        # ✅ إعادة بناء الحالة من نتيجة الترتيب الجديدة فقط
         ocr_map = getattr(m_err, "indexed_images", None) or {}
         ocr_map_int = {}
         for k, v in ocr_map.items():
@@ -2292,10 +2291,8 @@ async def run_image_verification(msg_obj, context):
         session["manual_missing_indices"] = missing_indices
 
         # لا تمسح manual_map (اختيارات المستخدم النهائية)
-        # لكن لا تسمح ببقاء نتائج OCR قديمة تتعارض مع الفحص الجديد
         _reset_image_review_state(session, ocr_map_int, total_expected)
-        # بعد reset، خريطة المراجعة هي OCR فقط + أي manual_valid مدمج لاحقاً.
-        # لكن دعنا نطبّق manual_map فوقها إذا كان الملف موجوداً
+
         merged = dict(session["image_review_map"])
         for slot, p in (session.get("manual_map") or {}).items():
             try:
@@ -2311,17 +2308,18 @@ async def run_image_verification(msg_obj, context):
         ]
         session["image_review_duplicates"] = _compute_duplicates_from_map(merged)
 
+        # ✅ الأزرار الجديدة
         keyboard = []
         if unindexed_files:
-            keyboard.append([
+            keyboard.insert(0, [
                 InlineKeyboardButton(
-                    f"🧩 تعيين يدوي لـ {len(unindexed_files)} صورة",
-                    callback_data="btn_manual_assign",
+                    f"🗑️ عرض الصور المتجاهلة ({len(unindexed_files)})",
+                    callback_data="btn_show_ignored",
                 )
             ])
         keyboard.append([
             InlineKeyboardButton(
-                "🔄 إعادة الفحص بعد رفع النواقص",
+                "🔄 إعادة الترتيب بعد رفع النواقص",
                 callback_data="btn_start_render",
             )
         ])
@@ -2329,23 +2327,14 @@ async def run_image_verification(msg_obj, context):
             InlineKeyboardButton("❌ إلغاء والعودة للقائمة", callback_data="btn_back_main")
         ])
 
-        extra_note = (
-            f"\n🧩 <b>صور فشل قراءة رقمها (تحتاج تعيين يدوي):</b> "
-            f"<code>{len(unindexed_files)}</code>"
-            if unindexed_files else ""
-        )
-
+        # ✅ الرسالة الجديدة (بدون أي ذكر لـ OCR أو الركن السفلي)
         await progress_msg.edit_text(
-            f"📊 <b>جرد الصور</b>\n"
+            f"⚠️ <b>ترتيب الصور اكتمل جزئيًا</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"✅ تم التحقق من <b>{m_err.found_count}</b> صورة من أصل "
-            f"<b>{m_err.total_expected}</b>.{extra_note}\n\n"
-            f"⚠️ <b>الأرقام الناقصة ({len(missing_indices)}):</b>\n"
-            f"<code>{_esc(missing_preview)}</code>\n\n"
-            f"<i>⚠️ لا يمكن بدء المونتاج قبل اكتمال كل الأرقام.</i>\n\n"
-            f"👇 <b>اختار:</b>\n"
-            f"• <b>تعيين يدوي</b>: لو فيه صور زيادة أو فشل الـ OCR — هتشوف الصورة وتختار رقمها.\n"
-            f"• <b>إعادة الفحص</b>: بعد ما ترفع الصور الناقصة.",
+            f"✅ <b>الصور الموجودة:</b> <code>{m_err.found_count}</code> من <code>{m_err.total_expected}</code>\n"
+            f"❌ <b>النواقص:</b> <code>{_esc(missing_preview)}</code>\n\n"
+            f"📌 ارفع الصور الناقصة بأسماء صحيحة فقط (مثال: 3.webp)\n"
+            f"ثم اضغط الزر أدناه.",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode=ParseMode.HTML,
         )
@@ -2355,7 +2344,7 @@ async def run_image_verification(msg_obj, context):
     except Exception as e:
         if _is_stale(chat_id, session):
             return
-        logger.exception(f"خطأ أثناء فحص الصور للحلقة {ep_id}")
+        logger.exception(f"خطأ أثناء ترتيب الصور للحلقة {ep_id}")
         await progress_msg.edit_text(
             f"❌ <b>خطأ أثناء معالجة الصور:</b>\n<code>{_esc(str(e))}</code>",
             parse_mode=ParseMode.HTML,
@@ -2363,13 +2352,13 @@ async def run_image_verification(msg_obj, context):
         return
 
     # -------------------------------------------------------------
-    # فحص ناجح كامل → إعادة بناء كل الحالة من الصفر
+    # ترتيب ناجح كامل → إعادة بناء كل الحالة من الصفر
     # -------------------------------------------------------------
     review_map = {}
     for idx, path in enumerate(frames):
         review_map[idx + 1] = str(path)
 
-    # manual_map له الأولوية على نتيجة OCR في نفس الخانة
+    # manual_map له الأولوية على نتيجة الترتيب في نفس الخانة
     for slot, path in (session.get("manual_map") or {}).items():
         try:
             sp = int(slot)
@@ -2392,12 +2381,13 @@ async def run_image_verification(msg_obj, context):
         [InlineKeyboardButton("📊 عرض الملخص النهائي مباشرة", callback_data="review_finish")],
     ]
 
+    # ✅ رسالة النجاح الكامل الجديدة
     await progress_msg.edit_text(
-        f"<b>✅ تم فحص الصور بنجاح — جاهز للمراجعة</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📸 <b>الصور المكتشفة:</b> <code>{found}</code> من أصل <code>{total_expected}</code>\n"
+        f"✅ <b>تم ترتيب كل الصور بنجاح حسب اسم الملف</b>\n"
+        f"📊 عدد الصور: <code>{found}</code> من <code>{total_expected}</code>\n"
         f"⚠️ <b>الأرقام المفقودة:</b> <code>{missing_count}</code>\n"
         f"🔁 <b>التكرارات:</b> <code>{duplicates_count}</code>\n\n"
+        f"🎬 جاهز للمراجعة والمونتاج\n\n"
         f"<i>⚠️ لن تبدأ الرندرة إلا بعد اعتمادك الصريح من شاشة الملخص، وبشرط اكتمال كل الأرقام.</i>\n\n"
         f"👇 <b>اختر وضع المراجعة:</b>",
         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -2438,7 +2428,7 @@ async def start_image_review(chat_id, context, mode: str):
     if not review_map:
         await context.bot.send_message(
             chat_id=chat_id,
-            text="⚠️ لا توجد صور لمراجعتها. ارفع الصور ثم اضغط زر الفحص.",
+            text="⚠️ لا توجد صور لمراجعتها. ارفع الصور ثم اضغط زر الترتيب.",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -2883,7 +2873,7 @@ async def show_review_summary(chat_id, context):
         ))
     else:
         row1.append(InlineKeyboardButton(
-            "🔄 إعادة الفحص بعد رفع النواقص",
+            "🔄 إعادة الترتيب بعد رفع النواقص",
             callback_data="btn_start_render",
         ))
 
@@ -2989,7 +2979,7 @@ async def approve_and_render(msg_obj, context):
     if not ok:
         errors_txt = "\n".join(f"• {_esc(e)}" for e in errors[:8])
         keyboard = [
-            [InlineKeyboardButton("🔄 إعادة الفحص", callback_data="btn_start_render")],
+            [InlineKeyboardButton("🔄 إعادة الترتيب", callback_data="btn_start_render")],
             [InlineKeyboardButton("📋 العودة للمراجعة", callback_data="review_mode_full")],
             [InlineKeyboardButton("❌ إلغاء", callback_data="review_summary_cancel")],
         ]
@@ -3000,7 +2990,7 @@ async def approve_and_render(msg_obj, context):
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"{errors_txt}\n\n"
                 f"<i>لا يوجد خيار للرندرة الجزئية. ارفع الصور الناقصة، صحّح الأرقام، "
-                f"ثم أعد الفحص.</i>"
+                f"ثم أعد الترتيب.</i>"
             ),
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode=ParseMode.HTML,
@@ -3044,7 +3034,7 @@ async def run_final_render(msg_obj, context):
             text=(
                 f"❌ <b>تم رفض بدء المونتاج — خريطة الصور غير مكتملة.</b>\n"
                 f"{errors_txt}\n\n"
-                f"<i>ارفع الصور الناقصة أو صحّح الأرقام ثم أعد الفحص.</i>"
+                f"<i>ارفع الصور الناقصة أو صحّح الأرقام ثم أعد الترتيب.</i>"
             ),
             parse_mode=ParseMode.HTML,
         )
