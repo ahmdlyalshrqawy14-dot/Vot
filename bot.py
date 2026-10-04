@@ -1269,6 +1269,45 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await show_next_manual_image(context, chat_id)
 
     # =============================================================
+    # ✅ عرض الصور المتجاهلة (اسم غير صالح / مكرر / بدون رقم)
+    # =============================================================
+    elif data == "btn_show_ignored":
+        unindexed = session.get("manual_unindexed_files", []) or []
+
+        if not unindexed:
+            try:
+                await query.answer(
+                    "لا توجد صور متجاهلة حالياً.",
+                    show_alert=True,
+                )
+            except Exception:
+                pass
+            return
+
+        names = [Path(p).name for p in unindexed[:20]]
+        extra = len(unindexed) - 20 if len(unindexed) > 20 else 0
+
+        text = (
+            f"🗑️ <b>الصور المتجاهلة</b> ({len(unindexed)})\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"هذه الصور تم تجاهلها لأنها مكررة أو اسمها غير صالح "
+            f"(مثال: <code>12.2.webp</code>):\n\n"
+            + "\n".join(f"• <code>{_esc(n)}</code>" for n in names)
+        )
+        if extra > 0:
+            text += f"\n\n... و<code>{extra}</code> صورة إضافية."
+
+        try:
+            await query.answer()
+        except Exception:
+            pass
+
+        try:
+            await query.message.reply_text(text, parse_mode=ParseMode.HTML)
+        except Exception as e:
+            logger.error(f"فشل إرسال قائمة الصور المتجاهلة: {e}")
+
+    # =============================================================
     # نظام مراجعة الصور — اختيار الوضع
     # =============================================================
     elif data == "review_mode_quick":
