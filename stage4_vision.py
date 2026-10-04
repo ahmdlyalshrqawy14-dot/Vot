@@ -8,8 +8,6 @@ from typing import List, Dict, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 
-from gemini_engine import call_gemini_vision_with_fallback
-
 logger = logging.getLogger("Stage4Vision")
 
 VALID_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".jfif", ".bmp"}
@@ -63,91 +61,23 @@ def write_image_safe(path: Path, img: np.ndarray):
         raise IOError(f"فشل تشفير وحفظ الصورة: {path}")
 
 
-def extract_index_using_gemini_vision(image_path: Path) -> Optional[int]:
-    """قص مؤقت في الرام للركن الأيمن وقراءة الرقم عبر Gemini Vision مع تحسينات"""
-    try:
-        img = read_image_safe(image_path)
-        if img is None:
-            return None
-
-        h, w, _ = img.shape
-        if h == 0 or w == 0:
-            return None
-
-        # [FIX 3] توسيع هامش الأمان إلى 18% لضمان بقاء الرقم كاملاً داخل الكادر
-        crop_y = int(h * 0.82)
-        crop_x = int(w * 0.82)
-        corner_crop = img[crop_y:h, crop_x:w]
-
-        if corner_crop.size == 0:
-            return None
-
-        # [FIX 1] تكبير 3x فقط بدون تحويل للرمادي أو رفع تباين حاد
-        corner_crop = cv2.resize(corner_crop, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
-
-        _, buffer = cv2.imencode(".jpg", corner_crop, [cv2.IMWRITE_JPEG_QUALITY, 95])
-        crop_bytes = buffer.tobytes()
-
-        prompt = (
-            "Look at this image crop from the bottom-right corner. "
-            "There is a small, faint number printed there. "
-            "What is this integer number? Return ONLY the integer digits (e.g. 1, 2, 45). "
-            "If there is absolutely no number visible, reply with NONE."
-        )
-
-        response_text = call_gemini_vision_with_fallback(
-            image_bytes=crop_bytes,
-            mime_type="image/jpeg",
-            user_prompt=prompt
-        )
-
-        if not isinstance(response_text, str) or not response_text:
-            return None
-
-        numbers = re.findall(r"\b\d+\b", response_text)
-        if numbers:
-            detected = int(numbers[0])
-            # [FIX] فحص سلامة أولي فقط؛ النطاق الحقيقي يُفحص مقابل expected_total في المستدعي
-            if 1 <= detected <= 500:
-                return detected
+def extract_index_from_filename(file_path: Path) -> Optional[int]:
+    """
+    استخراج الرقم من اسم الملف فقط.
+    يقبل فقط الأسماء اللي كلها أرقام (مثل: 1.webp, 12.png).
+    أي اسم فيه نقطة أو شرطة أو حروف أو underscore يُتجاهل (مثل: 12.2.webp).
+    """
+    stem = file_path.stem.strip()
+    if not stem:
         return None
-
-    except Exception as e:
-        logger.warning(f"تعذر قراءة الصورة {Path(image_path).name}: {e}")
-        return None
-
-
-def apply_seamless_inpainting(input_img_path: Path, output_img_path: Path):
-    """إخفاء الرقم الباهت بالرقعة الذكية من الصورة الكاملة الأصلية"""
-    img = read_image_safe(input_img_path)
-    if img is None:
-        raise ValueError(f"تعذر فتح الصورة: {input_img_path}")
-
-    h, w, _ = img.shape
-    start_y = int(h * 0.88)
-    end_y = int(h * 0.98)
-    start_x = int(w * 0.88)
-    end_x = int(w * 0.98)
-
-    sample_region = img[start_y - 20 : start_y, start_x:end_x]
-    mean_color = np.mean(sample_region, axis=(0, 1)).astype(np.uint8)
-
-    mask = np.zeros((h, w), dtype=np.uint8)
-    mask[start_y:end_y, start_x:end_x] = 255
-
-    feathered_mask = cv2.GaussianBlur(mask, (15, 15), 0) / 255.0
-    feathered_mask = np.repeat(feathered_mask[:, :, np.newaxis], 3, axis=2)
-
-    solid_bg = np.full_like(img, mean_color)
-    blended = (feathered_mask * solid_bg + (1.0 - feathered_mask) * img).astype(np.uint8)
-    refined = cv2.inpaint(blended, mask, inpaintRadius=5, flags=cv2.INPAINT_TELEA)
-
-    write_image_safe(output_img_path, refined)
-
-
-def _scan_single_image(img_path: Path) -> Tuple[Path, Optional[int]]:
-    num = extract_index_using_gemini_vision(img_path)
-    return img_path, num
+    if re.fullmatch(r"\d+", stem):
+        try:
+            num = int(stem)
+            if 1 <= num <= 500:
+                return num
+        except ValueError:
+            return None
+    return None
 
 
 def rename_images_with_detected_numbers(
@@ -157,10 +87,7 @@ def rename_images_with_detected_numbers(
     skip_paths: Optional[set] = None,
 ) -> Tuple[Dict[int, Path], List[Path], List[Tuple[int, Path, Path]]]:
     """
-    يقرأ كل الصور، يكتشف الرقم من الركن الأيمن، ويعيد قاموساً بالأرقام المكتشفة.
-
-    [FIX-MANUAL-SKIP] أي مسار موجود في skip_paths (تعيين يدوي نهائي للمستخدم)
-    لا يُمرَّر إلى Gemini إطلاقًا، وبذلك لا يُسجَّل كفشل OCR ولا يُعاد فحصه.
+    ترتيب الصور اعتمادًا على اسم الملف فقط (بدون Gemini).
     """
     skip_paths = skip_paths or set()
 
@@ -175,53 +102,42 @@ def rename_images_with_detected_numbers(
         try:
             if not p.is_file() or p.suffix.lower() not in VALID_EXTENSIONS:
                 continue
-        except Exception:
-            continue
-        # تخطّي أي صورة المستخدم عيّنها يدويًا — لا OCR عليها أبدًا
-        try:
             if p.resolve() in skip_paths:
-                logger.info(f"🔒 تخطّي OCR (تعيين يدوي نهائي): {p.name}")
+                logger.info(f"🔒 تخطّي (تعيين يدوي نهائي): {p.name}")
                 continue
         except Exception:
-            pass
+            continue
         uploaded_files.append(p)
 
     if not uploaded_files:
-        # قد يكون كل شيء معيَّنًا يدويًا — لا نرفع استثناء، نعيد قوائم فارغة
-        logger.info("ℹ️ لا توجد صور بحاجة إلى OCR (كل الملفات معيَّنة يدويًا أو لا ملفات صالحة).")
+        logger.info("ℹ️ لا توجد صور صالحة للترتيب.")
         return {}, [], []
 
     indexed_images: Dict[int, Path] = {}
     unindexed_files: List[Path] = []
     conflicts: List[Tuple[int, Path, Path]] = []
 
-    logger.info(f"🔍 بدء فحص {len(uploaded_files)} صورة بالتوازي...")
+    logger.info(f"🔍 بدء ترتيب {len(uploaded_files)} صورة حسب اسم الملف...")
 
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = {executor.submit(_scan_single_image, p): p for p in uploaded_files}
+    for img_path in uploaded_files:
+        detected_index = extract_index_from_filename(img_path)
 
-        for future in as_completed(futures):
-            img_path = futures[future]
-            try:
-                _, detected_index = future.result()
-
-                if detected_index is not None and 1 <= detected_index <= expected_total:
-                    if detected_index in indexed_images:
-                        conflicts.append((detected_index, indexed_images[detected_index], img_path))
-                        unindexed_files.append(img_path)
-                        logger.warning(f"⚠️ رقم متكرر {detected_index}: {img_path.name} → أُرسلت للتعيين اليدوي")
-                    else:
-                        indexed_images[detected_index] = img_path
-                        logger.info(f"✅ تم التعرف على {img_path.name} → رقم {detected_index}")
-                else:
-                    unindexed_files.append(img_path)
-                    logger.warning(f"❌ لم يتم التعرف على رقم: {img_path.name}")
-
-            except Exception as e:
-                logger.error(f"خطأ في معالجة {img_path.name}: {e}")
+        if detected_index is not None and 1 <= detected_index <= expected_total:
+            if detected_index in indexed_images:
+                conflicts.append((detected_index, indexed_images[detected_index], img_path))
                 unindexed_files.append(img_path)
+                logger.warning(f"⚠️ رقم متكرر {detected_index}: {img_path.name} → تم تجاهله")
+            else:
+                indexed_images[detected_index] = img_path
+                logger.info(f"✅ {img_path.name} → رقم {detected_index}")
+        else:
+            unindexed_files.append(img_path)
+            logger.warning(f"❌ اسم غير صالح أو خارج النطاق: {img_path.name}")
 
-    logger.info(f"📊 النتائج: {len(indexed_images)} مكتشفة | {len(unindexed_files)} غير مكتشفة | {len(conflicts)} متكررة")
+    logger.info(
+        f"📊 النتائج: {len(indexed_images)} مرتبة | "
+        f"{len(unindexed_files)} غير صالحة | {len(conflicts)} متكررة"
+    )
 
     return indexed_images, unindexed_files, conflicts
 
