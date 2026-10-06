@@ -117,6 +117,9 @@ class AIEditorialDirector:
             '    {"idx": int, "motion": str, "intensity": float, '
             '"transition_after": str, "whoosh_strength": float, '
             '"ambience_boost": float, "keyword": str|null}\n'
+            "  ],\n"
+            '  "visual_overlays": [\n'
+            '    {"timestamp_start": float, "duration": float, "keyword": str, "screen_position": "top_right" | "center_pop" | "lower_third_corner"}\n'
             "  ]\n"
             "}\n\n"
             "قواعد الحركة (motion):\n"
@@ -221,6 +224,31 @@ class AIEditorialDirector:
             "calm": _safe_int_list(pacing_raw.get("calm")),
             "breathing_after": _safe_int_list(pacing_raw.get("breathing_after")),
         }
+
+        # Fix visual_overlays
+        visual_overlays_raw = data.get("visual_overlays", [])
+        if not isinstance(visual_overlays_raw, list):
+            visual_overlays_raw = []
+
+        cleaned_overlays = []
+        for overlay in visual_overlays_raw:
+            if not isinstance(overlay, dict):
+                continue
+
+            ts = self._safe_float(overlay.get("timestamp_start"), -1.0)
+            dur = self._safe_float(overlay.get("duration"), -1.0)
+            kw = str(overlay.get("keyword", "")).strip()
+            pos = str(overlay.get("screen_position", "")).strip()
+
+            if ts >= 0 and dur > 0 and kw and pos in ("top_right", "center_pop", "lower_third_corner"):
+                cleaned_overlays.append({
+                    "timestamp_start": ts,
+                    "duration": dur,
+                    "keyword": kw,
+                    "screen_position": pos
+                })
+
+        data["visual_overlays"] = cleaned_overlays
 
         return data
 

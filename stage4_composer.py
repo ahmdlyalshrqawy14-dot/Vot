@@ -21,6 +21,11 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import List, Dict, Any, Tuple, Optional, Set
 
+try:
+    from stage4_assets import get_asset_for_keyword
+except ImportError:
+    get_asset_for_keyword = None
+
 logger = logging.getLogger("Stage4Composer")
 
 
@@ -1568,10 +1573,14 @@ def render_final_video(
     )
 
     ai_shots_by_idx: Dict[int, Dict[str, Any]] = {}
-    if ai_plan and isinstance(ai_plan.get("shots"), list):
-        for s in ai_plan["shots"]:
-            if isinstance(s, dict) and isinstance(s.get("idx"), int):
-                ai_shots_by_idx[s["idx"]] = s
+    visual_overlays_plan = []
+    if ai_plan:
+        if isinstance(ai_plan.get("shots"), list):
+            for s in ai_plan["shots"]:
+                if isinstance(s, dict) and isinstance(s.get("idx"), int):
+                    ai_shots_by_idx[s["idx"]] = s
+        if isinstance(ai_plan.get("visual_overlays"), list):
+            visual_overlays_plan = ai_plan.get("visual_overlays")
 
     final_motions: List[Dict[str, Any]] = []
     final_transitions: List[str] = []
@@ -1963,6 +1972,8 @@ def render_final_video(
                 main_required.append("xfade")
             if pad_needed > 0.001:
                 main_required.append("tpad")
+            if overlay_inputs:
+                main_required.append("overlay")
             if ducked_tracks:
                 main_required.append("sidechaincompress")
             if whoosh_idx is not None or ducked_tracks:
@@ -2175,6 +2186,11 @@ def render_final_video(
             fb_required = ["ass", "alimiter", "amix"]
             if fb_pad > 0.001:
                 fb_required.append("tpad")
+            try:
+                if overlay_inputs:
+                    fb_required.append("overlay")
+            except NameError:
+                pass
             if fb_ducked:
                 fb_required.append("sidechaincompress")
             if fb_whoosh_idx is not None or fb_ducked:
