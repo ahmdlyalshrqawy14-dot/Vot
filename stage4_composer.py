@@ -1354,6 +1354,157 @@ def get_ken_burns_filter(
 
 
 # ============================================================
+# الموشن جرافيك والبطاقات التوضيحية
+# ============================================================
+
+def _escape_ass_text(text: str) -> str:
+    if not text:
+        return ""
+    return (
+        text.replace("\\", "\\\\")
+            .replace("{", "\\{")
+            .replace("}", "\\}")
+            .replace("\n", "\\N")
+    )
+
+
+def format_ass_time(seconds: float) -> str:
+    if seconds is None or seconds < 0:
+        seconds = 0.0
+    total_cs = int(round(float(seconds) * 100.0))
+    if total_cs < 0:
+        total_cs = 0
+    hrs = total_cs // 360000
+    rem = total_cs % 360000
+    mins = rem // 6000
+    rem = rem % 6000
+    secs = rem // 100
+    centis = rem % 100
+    return f"{hrs}:{mins:02d}:{secs:02d}.{centis:02d}"
+
+
+ROLE_LOWER_THIRDS: Dict[str, Tuple[str, str]] = {
+    "hook":          ("✦ THE HOOK", "Core Narrative Concept"),
+    "revelation":    ("💡 REVELATION", "The Key Insight"),
+    "myth":          ("❌ THE MYTH", "Common Misconception"),
+    "contradiction": ("⚡ CONTRADICTION", "The Paradox"),
+    "payoff":        ("🎯 CORE PAYOFF", "Key Takeaway"),
+    "actionable":    ("🚀 ACTION STEP", "Practical Application"),
+    "analogy":       ("🔍 ANALOGY", "Visual Metaphor"),
+    "explanation":   ("📌 EXPLANATION", "How It Works"),
+    "setup":         ("🎬 THE SETUP", "Setting The Stage"),
+    "cta":           ("🔔 CALL TO ACTION", "Join The Conversation"),
+    "tension":       ("⚠️ TENSION", "The Challenge"),
+    "question":      ("❓ THE QUESTION", "Food For Thought"),
+}
+
+ROLE_AUTO_KEYWORDS: Dict[str, str] = {
+    "hook":          "CORE CONCEPT",
+    "revelation":    "KEY TRUTH",
+    "payoff":        "TAKEAWAY",
+    "actionable":    "ACTION STEP",
+    "myth":          "MYTH BUSTED",
+    "contradiction": "PARADOX",
+}
+
+
+def enrich_ass_file(
+    input_ass: Path,
+    timeline: List[Dict[str, Any]],
+    ai_shots: Dict[int, Dict[str, Any]],
+    output_ass: Path,
+) -> Path:
+    """
+    إثراء ملف الترجمة ASS بعناصر موشن جرافيك احترافية:
+    - بطاقات أسفل الشاشة (Lower Thirds) للمشاهد الرئيسية مع حركة ظهور وانضباط.
+    - استيكرات وبادجات توضيحية للكلمات المفتاحية (Keyword Badges).
+    """
+    if not input_ass.exists():
+        return input_ass
+
+    try:
+        content = input_ass.read_text(encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"تعذّر قراءة ASS لإضافة الموشن جرافيك: {e}")
+        return input_ass
+
+    extra_styles = (
+        "Style: LowerThirdTitle,Arial,36,&H00FFFFFF,&H0000FFFF,&H00000000,&HE6181824,-1,0,0,0,100,100,0,0,3,14.0,1.0,1,80,80,140,1\n"
+        "Style: LowerThirdSub,Arial,22,&H0000E6FF,&H0000FFFF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,1.0,1.0,1,80,80,182,1\n"
+        "Style: KeywordBadge,Arial,36,&H0000F5FF,&H0000FFFF,&H00000000,&HE60F1A2E,-1,0,0,0,100,100,0,0,3,16.0,2.0,9,80,80,110,1\n"
+        "Style: RoleSticker,Arial,28,&H00FFFFFF,&H0000FFFF,&H00000000,&HCCFF6B00,-1,0,0,0,100,100,0,0,3,10.0,1.0,7,80,80,110,1\n"
+    )
+
+    if "[V4+ Styles]" in content:
+        parts = content.split("[V4+ Styles]\n")
+        header = parts[0] + "[V4+ Styles]\n"
+        rest = parts[1]
+        if "Format:" in rest:
+            fmt_end = rest.find("\n", rest.find("Format:"))
+            content = header + rest[:fmt_end + 1] + extra_styles + rest[fmt_end + 1:]
+        else:
+            content = header + extra_styles + rest
+
+    new_events: List[str] = []
+
+    shot_starts: List[float] = []
+    curr = 0.0
+    for item in timeline:
+        st = item.get("start")
+        if st is not None:
+            try:
+                curr = float(st)
+            except (ValueError, TypeError):
+                pass
+        shot_starts.append(curr)
+        dur = float(item.get("duration", 2.5))
+        curr += dur
+
+    for i, item in enumerate(timeline):
+        role = str(item.get("narrative_role") or "").lower().strip()
+        shot_start = shot_starts[i]
+        try:
+            shot_dur = float(item.get("duration", 2.5))
+        except (ValueError, TypeError):
+            shot_dur = 2.5
+
+        if shot_dur < 1.2:
+            continue
+
+        ai_s = ai_shots.get(i) or {}
+        kw = ai_s.get("keyword") or ROLE_AUTO_KEYWORDS.get(role)
+
+        # 1. Lower Thirds for narrative roles
+        if role in ROLE_LOWER_THIRDS:
+            title_main, sub_title = ROLE_LOWER_THIRDS[role]
+            t_start = format_ass_time(shot_start + 0.2)
+            t_end = format_ass_time(shot_start + min(3.2, shot_dur - 0.1))
+
+            evt_main = f"Dialogue: 1,{t_start},{t_end},LowerThirdTitle,,0,0,0,,{{\\fad(250,250)}}{_escape_ass_text(title_main)}"
+            evt_sub = f"Dialogue: 1,{t_start},{t_end},LowerThirdSub,,0,0,0,,{{\\fad(250,250)}}{_escape_ass_text(sub_title)}"
+            new_events.extend([evt_main, evt_sub])
+
+        # 2. Keyword Badges / Callout stickers
+        if kw:
+            t_start = format_ass_time(shot_start + 0.3)
+            t_end = format_ass_time(shot_start + min(3.5, shot_dur - 0.1))
+            badge_text = f"✦ {str(kw).strip().upper()}"
+            evt_kw = f"Dialogue: 2,{t_start},{t_end},KeywordBadge,,0,0,0,,{{\\fad(200,200)}}{_escape_ass_text(badge_text)}"
+            new_events.append(evt_kw)
+
+    if new_events:
+        content = content.rstrip() + "\n" + "\n".join(new_events) + "\n"
+
+    try:
+        output_ass.parent.mkdir(parents=True, exist_ok=True)
+        output_ass.write_text(content, encoding="utf-8")
+        return output_ass
+    except Exception as e:
+        logger.warning(f"تعذّر كتابة ASS المنسق بالموشن جرافيك: {e}")
+        return input_ass
+
+
+# ============================================================
 # أدوات المسارات والتحقق
 # ============================================================
 
@@ -2076,7 +2227,7 @@ def render_final_video(
                 "-vf", kb_filter,
                 "-frames:v", str(seg_frames),
                 "-c:v", "libx264", "-preset", "fast",
-                "-crf", "22", "-pix_fmt", "yuv420p",
+                "-crf", "24", "-pix_fmt", "yuv420p",
                 "-r", str(fps),
                 "-an",
                 str(seg_output),
@@ -2111,7 +2262,7 @@ def render_final_video(
                     *g_inputs,
                     "-filter_complex", g_filter,
                     "-map", g_label,
-                    "-c:v", "libx264", "-preset", "fast", "-crf", "16",
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "22",
                     "-pix_fmt", "yuv420p", "-r", str(fps),
                     "-an",
                     str(g_out),
@@ -2172,8 +2323,14 @@ def render_final_video(
         else:
             logger.info("🎵 لا توجد أدوار مسموحة بالإيقاع.")
 
+        # إثراء ASS بالموشن جرافيك والبادجات والـ Lower Thirds
+        enriched_ass_path = temp_dir / "enriched_subtitles.ass"
+        motion_ass = enrich_ass_file(
+            subtitles_ass, renderable_timeline, ai_shots_by_idx, enriched_ass_path
+        )
+
         # ASS آمن: نسخ إلى temp_dir واستخدام اسم نسبي.
-        safe_ass, safe_ass_dir = _prepare_safe_ass(subtitles_ass, temp_dir)
+        safe_ass, safe_ass_dir = _prepare_safe_ass(motion_ass, temp_dir)
         ass_filename = safe_ass.name
 
         final_inputs: List[str] = []
@@ -2292,9 +2449,10 @@ def render_final_video(
             "-map", "[vout]",
             "-map", "[aout]",
             "-t", f"{audio_duration:.4f}",
-            "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+            "-c:v", "libx264", "-preset", "medium", "-crf", "24",
+            "-maxrate", "2200k", "-bufsize", "4400k",
             "-pix_fmt", "yuv420p", "-r", str(fps),
-            "-c:a", "aac", "-b:a", "224k",
+            "-c:a", "aac", "-b:a", "192k",
             "-movflags", "+faststart",
             str(staged_output_video),
         ]
@@ -2397,7 +2555,7 @@ def render_final_video(
                         "-i", str(seg.resolve()),
                         "-vf",
                         f"trim=start_frame={a}:end_frame={b},setpts=PTS-STARTPTS",
-                        "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+                        "-c:v", "libx264", "-preset", "fast", "-crf", "24",
                         "-pix_fmt", "yuv420p", "-r", str(fps),
                         "-an",
                         str(trimmed),
@@ -2531,9 +2689,10 @@ def render_final_video(
                     "-map", "[vout]",
                     "-map", "[aout]",
                     "-t", f"{audio_duration:.4f}",
-                    "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+                    "-c:v", "libx264", "-preset", "medium", "-crf", "24",
+                    "-maxrate", "2200k", "-bufsize", "4400k",
                     "-pix_fmt", "yuv420p", "-r", str(fps),
-                    "-c:a", "aac", "-b:a", "224k",
+                    "-c:a", "aac", "-b:a", "192k",
                     "-movflags", "+faststart",
                     str(staged_output_video),
                 ],
@@ -2967,5 +3126,36 @@ if __name__ == "__main__":
     assert chosen["type"] != "zoom_pan_right", chosen
     assert _motion_allowed_for_duration(chosen["type"], 2.0), chosen
     print("[OK] test #20: motion duration constraints and AI merge hardened")
+
+    # ------------------------------------------------------------
+    # 21. اختبار إثراء ASS بالموشن جرافيك والبطاقات
+    # ------------------------------------------------------------
+    with tempfile.TemporaryDirectory() as td21:
+        base_ass = Path(td21) / "sub.ass"
+        out_ass = Path(td21) / "enriched.ass"
+        base_ass.write_text(
+            "[Script Info]\nScriptType: v4.00+\nPlayResX: 1920\nPlayResY: 1080\n\n"
+            "[V4+ Styles]\nFormat: Name, Fontname, Fontsize\nStyle: Default,Arial,64\n\n"
+            "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n",
+            encoding="utf-8"
+        )
+
+        timeline_m = [
+            {"start": 0.0, "duration": 3.0, "narrative_role": "hook"},
+            {"start": 3.0, "duration": 4.0, "narrative_role": "revelation"},
+        ]
+        ai_shots_m = {
+            0: {"keyword": "MINDSET"},
+            1: {"keyword": "THE TRUTH"},
+        }
+        res_p = enrich_ass_file(base_ass, timeline_m, ai_shots_m, out_ass)
+        assert res_p.is_file()
+        txt = res_p.read_text(encoding="utf-8")
+        assert "Style: LowerThirdTitle" in txt
+        assert "Style: KeywordBadge" in txt
+        assert "MINDSET" in txt
+        assert "THE HOOK" in txt
+        assert "💡 REVELATION" in txt
+        print("[OK] test #21: ASS motion graphics and lower thirds enrichment")
 
     print("[ALL TESTS PASSED]")
