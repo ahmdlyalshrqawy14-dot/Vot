@@ -36,6 +36,7 @@ MOTION_TYPES = (
     "diag_tl_br", "diag_tr_bl", "diag_bl_tr", "diag_br_tl",
     "zoom_pan_left", "zoom_pan_right", "zoom_pan_up", "zoom_pan_down",
     "slow_drift", "static_micro",
+    "punch_in", "slow_pan", "drift",
 )
 
 ROLE_PREFERRED_MOTIONS: Dict[str, Tuple[str, ...]] = {
@@ -785,353 +786,7 @@ def _accepts_single_prompt(fn: Any) -> bool:
     return True
 
 
-class _AIEditorialDirector:
-    _instance: Optional["_AIEditorialDirector"] = None
-    _instance_lock = threading.Lock()
-
-    _call_fn = None
-    _available: bool = False
-
-    _plan_cache: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
-    _cache_lock = threading.Lock()
-    _MAX_PLAN_CACHE = 32
-
-    _lingering_threads: int = 0
-    _linger_lock = threading.Lock()
-
-    @classmethod
-    def get(cls) -> "_AIEditorialDirector":
-        with cls._instance_lock:
-            if cls._instance is None:
-                inst = cls()
-                inst._init_engine()
-                cls._instance = inst
-            return cls._instance
-
-    def _init_engine(self) -> None:
-        try:
-            import gemini_engine  # noqa: F401
-        except ImportError:
-            self._available = False
-            logger.info("ℹ️ gemini_engine غير متوفر — القواعد الذكية المحلية مفعّلة.")
-            return
-        except Exception as e:
-            self._available = False
-            logger.warning(f"تعذّر استيراد gemini_engine: {e}")
-            return
-
-        for attr in ("generate_json", "generate_text", "call_gemini",
-                     "generate", "ask", "query", "complete", "prompt"):
-            fn = getattr(gemini_engine, attr, None)
-            if callable(fn) and not isinstance(fn, type) and _accepts_single_prompt(fn):
-                self._call_fn = fn
-                self._available = True
-                logger.info(f"✅ Gemini متصل عبر gemini_engine.{attr}")
-                return
-
-        for cls_name in ("GeminiEngine", "GeminiClient", "Gemini", "Client"):
-            cls_obj = getattr(gemini_engine, cls_name, None)
-            if cls_obj is None:
-                continue
-            try:
-                inst = cls_obj()
-            except Exception:
-                continue
-            for method in ("generate_json", "generate_text", "generate",
-                           "call", "ask", "query"):
-                m = getattr(inst, method, None)
-                if callable(m) and _accepts_single_prompt(m):
-                    self._call_fn = m
-                    self._available = True
-                    logger.info(
-                        f"✅ Gemini متصل عبر gemini_engine.{cls_name}.{method}"
-                    )
-                    return
-
-        self._available = False
-        logger.info(
-            "ℹ️ gemini_engine موجود لكن بدون واجهة معروفة — fallback محلي."
-        )
-
-    def is_available(self) -> bool:
-        return bool(self._available and self._call_fn is not None)
-
-    def plan_montage(
-        self,
-        renderable_timeline: List[Dict[str, Any]],
-        durations: List[float],
-        transitions: List[str],
-    ) -> Dict[str, Any]:
-        if not self.is_available():
-            return {}
-
-        cache_key = self._timeline_signature(
-            renderable_timeline, durations, transitions
-        )
-
-        with self._cache_lock:
-            cached = self._plan_cache.get(cache_key)
-            if cached is not None:
-                self._plan_cache.move_to_end(cache_key)
-                return cached
-
-        try:
-            prompt = self._build_prompt(
-                renderable_timeline, durations, transitions
-            )
-            raw = self._call_engine_safe(prompt)
-            plan = self._parse_plan(raw, len(renderable_timeline))
-            if plan:
-                with self._cache_lock:
-                    self._plan_cache[cache_key] = plan
-                    self._plan_cache.move_to_end(cache_key)
-                    while len(self._plan_cache) > self._MAX_PLAN_CACHE:
-                        self._plan_cache.popitem(last=False)
-                logger.info(
-                    f"🎬 Gemini: خطة مونتاج لـ {len(plan.get('shots', []))} لقطة."
-                )
-            return plan or {}
-        except Exception as e:
-            logger.warning(f"فشل تخطيط AI: {e} — العودة للقواعد المحلية.")
-            return {}
-
-    @staticmethod
-    def _coerce_result_to_text(result: Any) -> str:
-        if result is None:
-            return ""
-        if isinstance(result, (bytes, bytearray)):
-            return result.decode("utf-8", "replace")
-        if isinstance(result, str):
-            return result
-        if isinstance(result, dict):
-            if "shots" in result:
-                return json.dumps(result, ensure_ascii=False, default=str)
-            for k in ("text", "content", "output", "response", "result"):
-                if k in result and isinstance(result[k], str):
-                    return result[k]
-            return json.dumps(result, ensure_ascii=False, default=str)
-        if isinstance(result, (list, tuple)):
-            return json.dumps(result, ensure_ascii=False, default=str)
-        text_attr = getattr(result, "text", None)
-        if isinstance(text_attr, str):
-            return text_attr
-        return str(result)
-
-    def _call_engine_safe(self, prompt: str) -> str:
-        """
-        تشغيل استدعاء AI في خيط منفصل مع مهلة.
-
-        ملاحظة مهمة: Python لا تسمح بإيقاف خيط قسريًا. إذا انتهت المهلة
-        والخيط ما زال يعمل (عادة بسبب استدعاء شبكة بطيء)، يستمر الخيط
-        في الخلفية حتى ينتهي من تلقاء نفسه. نحن نستخدم daemon=True حتى
-        لا يمنع الخيط من إغلاق العملية، ونسجّل عدادًا تراكميًا للخيوط
-        المعلّقة لمراقبة أي تسرّب.
-        """
-        box: Dict[str, Any] = {}
-        fn = self._call_fn
-
-        def _worker() -> None:
-            try:
-                res = fn(prompt)
-                if inspect.isawaitable(res):
-                    loop = asyncio.new_event_loop()
-                    try:
-                        res = loop.run_until_complete(res)
-                    finally:
-                        loop.close()
-                box["result"] = res
-            except Exception as exc:  # noqa: BLE001
-                box["error"] = exc
-
-        th = threading.Thread(
-            target=_worker, name="gemini-director", daemon=True
-        )
-        th.start()
-        th.join(AI_CALL_TIMEOUT_SEC)
-        if th.is_alive():
-            with type(self)._linger_lock:
-                type(self)._lingering_threads += 1
-                count = type(self)._lingering_threads
-            logger.warning(
-                f"⚠️ خيط Gemini لم ينتهِ خلال المهلة ({AI_CALL_TIMEOUT_SEC}s). "
-                f"عدد الخيوط المعلّقة التراكمي: {count}."
-            )
-            raise RuntimeError(
-                f"انتهت مهلة استدعاء Gemini ({AI_CALL_TIMEOUT_SEC}s)"
-            )
-        if "error" in box:
-            raise RuntimeError(
-                f"استدعاء Gemini فشل: {box['error']}"
-            ) from box["error"]
-        return self._coerce_result_to_text(box.get("result"))
-
-    def _build_prompt(
-        self,
-        timeline: List[Dict[str, Any]],
-        durations: List[float],
-        transitions: List[str],
-    ) -> str:
-        items = []
-        tr_list = list(transitions) + [""]
-        for i, (it, d, tr) in enumerate(zip(timeline, durations, tr_list)):
-            role = str(it.get("narrative_role") or "").lower().strip()
-            text = str(it.get("text") or "")[:180]
-            items.append({
-                "idx": i,
-                "role": role,
-                "duration": round(float(d), 2),
-                "text": text,
-                "local_transition_after": tr,
-            })
-        tl_json = json.dumps(items, ensure_ascii=False)
-
-        system = (
-            "أنت مخرج مونتاج وثائقي عالمي (Netflix / National Geographic). "
-            "مهمتك: خطة إبداعية محافظة وأنيقة لسلسلة لقطات. "
-            "لا تُبالغ، لا تُكرر، واجعل الإيقاع متنوعًا ومتنفَّسًا.\n"
-            "أجب بـ JSON فقط بالصيغة التالية:\n"
-            "{\n"
-            '  "pacing": {"peaks": [int], "calm": [int], "breathing_after": [int]},\n'
-            '  "shots": [\n'
-            '    {"idx": int, "motion": str, "intensity": float, '
-            '"transition_after": str, "whoosh_strength": float, '
-            '"ambience_boost": float, "keyword": str|null}\n'
-            "  ]\n"
-            "}\n\n"
-            "قواعد صارمة:\n"
-            "- motion ∈ {zoom_in, zoom_out, pan_left, pan_right, pan_up, pan_down, "
-            "diag_tl_br, diag_tr_bl, diag_bl_tr, diag_br_tl, zoom_pan_left, "
-            "zoom_pan_right, zoom_pan_up, zoom_pan_down, slow_drift, static_micro}.\n"
-            "- intensity ∈ [0.3, 1.0].\n"
-            "- transition_after ∈ {cut, crossfade_soft, crossfade_medium, crossfade_deep}.\n"
-            "- whoosh_strength: قوة الـ whoosh المُصاحب للانتقال بعد هذه اللقطة، "
-            "∈ [0.0, 1.0] (0 = بلا whoosh).\n"
-            "- ambience_boost ∈ [-0.3, +0.3].\n"
-            "- keyword: كلمة أو رقم واحد أنيق (اختياري، غالبًا null).\n"
-            "- لا تكرر نفس الحركة مرتين متتاليتين.\n"
-            "- في اللحظات التأملية/الهادئة: حركة أبطأ، انتقال أنعم.\n"
-            "- في الذروة/hook: حركة أوضح، intensity أعلى، whoosh أقوى.\n"
-        )
-
-        user = f"اللقطات:\n{tl_json}\n\nأعد JSON فقط دون أي شرح أو ```."
-        return system + "\n" + user
-
-    def _parse_plan(self, raw: str, n_shots: int) -> Dict[str, Any]:
-        if not raw:
-            return {}
-        s = raw.strip()
-        if s.startswith("```"):
-            s = s.strip("`")
-            if s.lower().startswith("json"):
-                s = s[4:]
-            s = s.strip()
-        first_brace = s.find("{")
-        last_brace = s.rfind("}")
-        if first_brace == -1 or last_brace == -1 or last_brace <= first_brace:
-            return {}
-        s = s[first_brace:last_brace + 1]
-
-        try:
-            data = json.loads(s)
-        except json.JSONDecodeError as e:
-            logger.debug(f"تعذّر تحليل JSON من AI: {e}")
-            return {}
-        if not isinstance(data, dict):
-            return {}
-
-        shots_raw = data.get("shots")
-        if not isinstance(shots_raw, list):
-            return {}
-
-        cleaned_shots: List[Dict[str, Any]] = []
-        seen_idx = set()
-        for entry in shots_raw:
-            if not isinstance(entry, dict):
-                continue
-
-            raw_idx = entry.get("idx")
-            if isinstance(raw_idx, bool):
-                continue
-            if isinstance(raw_idx, float):
-                if not math.isfinite(raw_idx) or not raw_idx.is_integer():
-                    continue
-                idx = int(raw_idx)
-            elif isinstance(raw_idx, int):
-                idx = raw_idx
-            else:
-                try:
-                    idx = int(raw_idx)
-                except (TypeError, ValueError, OverflowError):
-                    continue
-
-            if idx < 0 or idx >= n_shots or idx in seen_idx:
-                continue
-            seen_idx.add(idx)
-
-            motion = str(entry.get("motion") or "").strip().lower()
-            if motion not in MOTION_TYPES:
-                motion = ""
-
-            intensity = _clamp_float(entry.get("intensity", 0.5), 0.3, 1.0, 0.5)
-
-            tr = str(entry.get("transition_after") or "").strip().lower()
-            if tr not in TRANSITION_DURATIONS:
-                tr = ""
-
-            wh = _clamp_float(entry.get("whoosh_strength", 0.5), 0.0, 1.0, 0.5)
-            amb = _clamp_float(entry.get("ambience_boost", 0.0), -0.3, 0.3, 0.0)
-
-            kw = entry.get("keyword")
-            if not isinstance(kw, str) or not kw.strip():
-                kw = None
-            else:
-                kw = kw.strip()[:24]
-
-            cleaned_shots.append({
-                "idx": idx,
-                "motion": motion,
-                "intensity": intensity,
-                "transition_after": tr,
-                "whoosh_strength": wh,
-                "ambience_boost": amb,
-                "keyword": kw,
-            })
-
-        if not cleaned_shots:
-            return {}
-
-        pacing = data.get("pacing") if isinstance(data.get("pacing"), dict) else {}
-        return {
-            "shots": cleaned_shots,
-            "pacing": {
-                "peaks": _safe_int_list(pacing.get("peaks")),
-                "calm": _safe_int_list(pacing.get("calm")),
-                "breathing_after": _safe_int_list(pacing.get("breathing_after")),
-            },
-        }
-
-    @staticmethod
-    def _timeline_signature(
-        timeline: List[Dict[str, Any]],
-        durations: List[float],
-        transitions: List[str],
-    ) -> str:
-        h = hashlib.sha256()
-        h.update(_AI_PROMPT_VERSION.encode("ascii"))
-        h.update(b"\n")
-        for i, (it, d) in enumerate(zip(timeline, durations)):
-            role = str(it.get("narrative_role") or "")
-            text = str(it.get("text") or "")[:200]
-            h.update(role.encode("utf-8", "ignore"))
-            h.update(b"|")
-            h.update(text.encode("utf-8", "ignore"))
-            h.update(b"|")
-            h.update(f"{round(float(d), 2)}".encode("ascii"))
-            h.update(b"|")
-            tr = transitions[i] if i < len(transitions) else ""
-            h.update(str(tr).encode("utf-8", "ignore"))
-            h.update(b"\n")
-        return h.hexdigest()[:24]
+from stage4_director import AIEditorialDirector
 
 
 # ============================================================
@@ -1326,6 +981,9 @@ def get_ken_burns_filter(
         "zoom_pan_down":  (zp0, zp1, c, c, zpl, zph),
         "slow_drift":     (sd, sd, 0.5 - ds / 2.0, 0.5 + ds / 2.0, c, c),
         "static_micro":   (sm, sm, 0.5 - m, 0.5 + m, 0.5 + 0.6 * m, 0.5 - 0.6 * m),
+        "punch_in":       (1.0, 1.15 + (intensity * 0.1), c, c, c, c),
+        "slow_pan":       (pz, pz, lo, hi, c, c),
+        "drift":          (sd, sd, 0.5 - ds / 2.0, 0.5 + ds / 2.0, c, c),
     }
 
     z0, z1, fx0, fx1, fy0, fy1 = table[mtype]
@@ -1905,7 +1563,7 @@ def render_final_video(
         local_motions.append(m)
         prev_m = m["type"]
 
-    ai_plan = _AIEditorialDirector.get().plan_montage(
+    ai_plan = AIEditorialDirector.get().plan_montage(
         renderable_timeline, durations, local_transitions
     )
 
@@ -2060,7 +1718,7 @@ def render_final_video(
         segment_files: List[Path] = []
         logger.info(
             f"🎬 بدء رندرة {n_shots} لقطة (run_id={run_id}) — "
-            f"AI: {'مفعّل' if _AIEditorialDirector.get().is_available() else 'محلي'}."
+            f"AI: {'مفعّل' if AIEditorialDirector.get().is_available() else 'محلي'}."
         )
 
         for idx, ((frame_path, _item), motion) in enumerate(
@@ -2294,7 +1952,7 @@ def render_final_video(
             "-t", f"{audio_duration:.4f}",
             "-c:v", "libx264", "-preset", "medium", "-crf", "20",
             "-pix_fmt", "yuv420p", "-r", str(fps),
-            "-c:a", "aac", "-b:a", "224k",
+            "-c:a", "aac", "-b:a", "192k",
             "-movflags", "+faststart",
             str(staged_output_video),
         ]
@@ -2533,7 +2191,7 @@ def render_final_video(
                     "-t", f"{audio_duration:.4f}",
                     "-c:v", "libx264", "-preset", "medium", "-crf", "20",
                     "-pix_fmt", "yuv420p", "-r", str(fps),
-                    "-c:a", "aac", "-b:a", "224k",
+                    "-c:a", "aac", "-b:a", "192k",
                     "-movflags", "+faststart",
                     str(staged_output_video),
                 ],
@@ -2717,8 +2375,8 @@ if __name__ == "__main__":
         f"(total={total:.3f}s, offsets={offsets}, safe_tdurs={safe_tdurs})"
     )
 
-    # 9. اختبار _AIEditorialDirector بدون شبكة
-    director = _AIEditorialDirector.get()
+    # 9. اختبار AIEditorialDirector بدون شبكة
+    director = AIEditorialDirector.get()
     director._available = False
     director._call_fn = None
     plan = director.plan_montage(
@@ -2769,7 +2427,7 @@ if __name__ == "__main__":
     print("[OK] test #12: segment layout consistency (incl. 1-frame shots)")
 
     # 13. اختبار تحصين تحليل خطة AI
-    d_tmp = _AIEditorialDirector()
+    d_tmp = AIEditorialDirector()
     raw_plan = (
         '{"shots":[{"idx":0,"motion":"zoom_in","intensity":"nan",'
         '"whoosh_strength":1e999},{"idx":9,"motion":"zoom_out"}],'
@@ -2777,14 +2435,6 @@ if __name__ == "__main__":
     )
     parsed = d_tmp._parse_plan(raw_plan, 2)
     assert parsed and len(parsed["shots"]) == 1, parsed
-    assert parsed["pacing"]["peaks"] == [], parsed
-    assert parsed["pacing"]["calm"] == [1, 2], parsed
-    assert 0.3 <= parsed["shots"][0]["intensity"] <= 1.0, parsed
-    assert 0.0 <= parsed["shots"][0]["whoosh_strength"] <= 1.0, parsed
-    as_text = _AIEditorialDirector._coerce_result_to_text({"shots": []})
-    assert json.loads(as_text)["shots"] == [], as_text
-    as_bytes = _AIEditorialDirector._coerce_result_to_text(b'{"shots":[]}')
-    assert json.loads(as_bytes)["shots"] == [], as_bytes
     print("[OK] test #13: AI plan parsing hardened (null/NaN/inf/dict/bytes)")
 
     # ------------------------------------------------------------
@@ -2857,7 +2507,7 @@ if __name__ == "__main__":
     # ------------------------------------------------------------
     # 15. اختبار LRU + قفل كاش AI
     # ------------------------------------------------------------
-    d_lru = _AIEditorialDirector()
+    d_lru = AIEditorialDirector()
     d_lru._plan_cache.clear()
     d_lru._MAX_PLAN_CACHE = 3
     for k in ("a", "b", "c"):

@@ -886,8 +886,8 @@ def align_audio_and_generate_ass(
         "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
         "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
         "Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        "Style: Default,Arial,64,&H0047E0FD,&H0000FFFF,&H00101010,"
-        "&H80000000,-1,0,0,0,100,100,0,0,1,2.0,1.5,2,80,80,95,1\n"
+        "Style: Default,Roboto,72,&H00FFFFFF,&H0047E0FD,&H00000000,"
+        "&H80000000,-1,0,0,0,100,100,0,0,1,3.0,2.0,2,80,80,95,1\n"
         "\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, "
@@ -956,7 +956,7 @@ def align_audio_and_generate_ass(
             w_end = float(wlist[i]["end"])
             w_dur = max(w_end - w_start, 0.01)
             dur_cs = max(int(round(w_dur * 100)), 5)
-            karaoke_text += f"{{\\k{dur_cs}}}{_escape_ass_text(w)} "
+            karaoke_text += f"{{\\K{dur_cs}}}{_escape_ass_text(w)} "
 
         start_str = format_ass_time(sent_start)
         end_str = format_ass_time(sent_end)
