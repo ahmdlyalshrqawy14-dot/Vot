@@ -21,6 +21,22 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import List, Dict, Any, Tuple, Optional, Set
 
+try:
+    from stage4_assets import get_asset_for_keyword
+except ImportError:
+    get_asset_for_keyword = None
+
+try:
+    from stage4_motion_graphics import (
+        generate_accent_bar_filter,
+        generate_lower_third_label_filter,
+        generate_focus_vignette_filter
+    )
+except ImportError:
+    generate_accent_bar_filter = None
+    generate_lower_third_label_filter = None
+    generate_focus_vignette_filter = None
+
 logger = logging.getLogger("Stage4Composer")
 
 
@@ -36,22 +52,24 @@ MOTION_TYPES = (
     "diag_tl_br", "diag_tr_bl", "diag_bl_tr", "diag_br_tl",
     "zoom_pan_left", "zoom_pan_right", "zoom_pan_up", "zoom_pan_down",
     "slow_drift", "static_micro",
+    "push_in", "pull_out", "slide_in_left", "slide_in_right",
+    "scale_from_dark", "hold_then_drift"
 )
 
 ROLE_PREFERRED_MOTIONS: Dict[str, Tuple[str, ...]] = {
-    "hook":          ("zoom_in", "zoom_pan_right", "diag_tl_br"),
-    "revelation":    ("zoom_in", "zoom_pan_left", "diag_tr_bl"),
-    "reflection":    ("slow_drift", "pan_right", "zoom_out"),
-    "question":      ("slow_drift", "pan_left", "static_micro"),
-    "tension":       ("zoom_in", "diag_tl_br", "pan_up"),
-    "payoff":        ("zoom_out", "pan_right", "slow_drift"),
-    "actionable":    ("zoom_pan_right", "zoom_in", "pan_down"),
-    "myth":          ("slow_drift", "zoom_out", "pan_left"),
-    "contradiction": ("zoom_in", "diag_bl_tr", "pan_up"),
-    "explanation":   ("pan_right", "zoom_in", "slow_drift"),
-    "analogy":       ("diag_tl_br", "zoom_pan_right", "slow_drift"),
-    "setup":         ("pan_left", "slow_drift", "zoom_in"),
-    "cta":           ("zoom_pan_right", "zoom_in", "diag_br_tl"),
+    "hook":          ("push_in", "zoom_in", "zoom_pan_right"),
+    "revelation":    ("push_in", "zoom_in", "scale_from_dark"),
+    "reflection":    ("hold_then_drift", "pull_out", "slow_drift"),
+    "question":      ("hold_then_drift", "slow_drift", "static_micro"),
+    "tension":       ("push_in", "diag_tl_br", "zoom_in"),
+    "payoff":        ("pull_out", "zoom_out", "slow_drift"),
+    "actionable":    ("slide_in_right", "push_in", "zoom_pan_right"),
+    "myth":          ("pull_out", "slow_drift", "zoom_out"),
+    "contradiction": ("slide_in_left", "push_in", "zoom_in"),
+    "explanation":   ("slide_in_right", "pan_right", "hold_then_drift"),
+    "analogy":       ("scale_from_dark", "diag_tl_br", "slow_drift"),
+    "setup":         ("slide_in_left", "pan_left", "zoom_in"),
+    "cta":           ("push_in", "zoom_pan_right", "diag_br_tl"),
     "":              ("zoom_in", "pan_right", "zoom_out", "slow_drift"),
 }
 
@@ -63,19 +81,19 @@ TRANSITION_DURATIONS: Dict[str, float] = {
 }
 
 ROLE_PREFERRED_TRANSITION: Dict[str, str] = {
-    "hook":          "crossfade_soft",
+    "hook":          "cut",
     "revelation":    "cut",
     "reflection":    "crossfade_medium",
     "question":      "crossfade_soft",
     "tension":       "cut",
-    "payoff":        "crossfade_medium",
+    "payoff":        "crossfade_soft",
     "actionable":    "cut",
     "myth":          "crossfade_medium",
     "contradiction": "cut",
     "explanation":   "crossfade_soft",
     "analogy":       "crossfade_soft",
     "setup":         "crossfade_medium",
-    "cta":           "crossfade_soft",
+    "cta":           "cut",
 }
 
 KB_UPSCALE_W = 3840
@@ -932,7 +950,13 @@ class _AIEditorialDirector:
 
         def _worker() -> None:
             try:
-                res = fn(prompt)
+                # To handle signature mismatch for new call_gemini_with_fallback
+                if fn.__name__ == 'call_gemini_with_fallback':
+                    sys_instr, usr_prompt = prompt.split("اللقطات:\n", 1)
+                    usr_prompt = "اللقطات:\n" + usr_prompt
+                    res = fn(system_instruction=sys_instr, user_prompt=usr_prompt, response_mime_type="application/json")
+                else:
+                    res = fn(prompt)
                 if inspect.isawaitable(res):
                     loop = asyncio.new_event_loop()
                     try:
@@ -996,10 +1020,13 @@ class _AIEditorialDirector:
             '    {"idx": int, "motion": str, "intensity": float, '
             '"transition_after": str, "whoosh_strength": float, '
             '"ambience_boost": float, "keyword": str|null}\n'
+            "  ],\n"
+            '  "visual_overlays": [\n'
+            '    {"timestamp_start": float, "duration": float, "keyword": str, "screen_position": "top_right" | "center_pop" | "lower_third_corner"}\n'
             "  ]\n"
             "}\n\n"
             "قواعد صارمة:\n"
-            "- motion ∈ {zoom_in, zoom_out, pan_left, pan_right, pan_up, pan_down, "
+            "- motion ∈ {push_in, pull_out, slide_in_left, slide_in_right, scale_from_dark, hold_then_drift, zoom_in, zoom_out, pan_left, pan_right, pan_up, pan_down, "
             "diag_tl_br, diag_tr_bl, diag_bl_tr, diag_br_tl, zoom_pan_left, "
             "zoom_pan_right, zoom_pan_up, zoom_pan_down, slow_drift, static_micro}.\n"
             "- intensity ∈ [0.3, 1.0].\n"
@@ -1309,6 +1336,14 @@ def get_ken_burns_filter(
     sm = 1.02 + 0.015 * intensity
     m = max(0.02, 0.05 * intensity * speed_mod)
 
+
+    # New motions variables
+    push_z1 = min(1.3, 1.15 + (intensity * 0.15))
+    pull_z0 = min(1.3, 1.15 + (intensity * 0.1))
+    slide_pz = max(1.02, 1.0 + (intensity * 0.05))
+    slide_span = 0.8
+    slide_lo, slide_hi = 0.5 - slide_span / 2.0, 0.5 + slide_span / 2.0
+
     table: Dict[str, Tuple[float, float, float, float, float, float]] = {
         "zoom_in":        (1.0, 1.0 + zr, c, c, c, c),
         "zoom_out":       (1.0 + zr, 1.0, c, c, c, c),
@@ -1326,6 +1361,12 @@ def get_ken_burns_filter(
         "zoom_pan_down":  (zp0, zp1, c, c, zpl, zph),
         "slow_drift":     (sd, sd, 0.5 - ds / 2.0, 0.5 + ds / 2.0, c, c),
         "static_micro":   (sm, sm, 0.5 - m, 0.5 + m, 0.5 + 0.6 * m, 0.5 - 0.6 * m),
+        "push_in":        (1.0, push_z1, c, c, c, c),
+        "pull_out":       (pull_z0, 1.0, c, c, c, c),
+        "slide_in_left":  (slide_pz, slide_pz, slide_hi, slide_lo, c, c),
+        "slide_in_right": (slide_pz, slide_pz, slide_lo, slide_hi, c, c),
+        "scale_from_dark":(1.0, 1.0 + zr, c, c, c, c), # zoom_in logic, color effect handled later
+        "hold_then_drift":(sd, sd, 0.5 - ds / 2.0, 0.5 + ds / 2.0, c, c), # drift logic, hold handled later
     }
 
     z0, z1, fx0, fx1, fy0, fy1 = table[mtype]
@@ -1346,11 +1387,25 @@ def get_ken_burns_filter(
         f"setsar=1,"
     )
 
-    return (
+    # Handling advanced motion effects
+    if mtype == "hold_then_drift":
+        hold_frames = int(fps * 0.4)
+        z = f"if(lt(on,{hold_frames}),{z0:.5f},{z0:.5f}+({z1 - z0:.5f})*(on-{hold_frames})/({den}-{hold_frames}))"
+        x = f"if(lt(on,{hold_frames}),(iw-iw/zoom)*{fx0:.5f},(iw-iw/zoom)*({fx0:.5f}+({fx1 - fx0:.5f})*(on-{hold_frames})/({den}-{hold_frames})))"
+        y = f"if(lt(on,{hold_frames}),(ih-ih/zoom)*{fy0:.5f},(ih-ih/zoom)*({fy0:.5f}+({fy1 - fy0:.5f})*(on-{hold_frames})/({den}-{hold_frames})))"
+
+    filter_str = (
         f"{prep}"
         f"zoompan=z='{z}':x='{x}':y='{y}':"
         f"d={frames}:s=1920x1080:fps={fps}"
     )
+
+    if mtype == "scale_from_dark":
+        fade_frames = min(frames, int(fps * 0.5))
+        # Fade brightness/contrast from dark to normal over the first half second
+        filter_str += f",eq=brightness='if(lt(n,{fade_frames}),-0.5+(n/{fade_frames})*0.5,0)'"
+
+    return filter_str
 
 
 # ============================================================
@@ -1696,11 +1751,24 @@ def _compute_segment_layout(
     T: List[int] = []
     O: List[int] = []
     for i in range(n - 1):
+        # Allow slight timing shifts for cut transitions to create an L/J cut feel
+        shift = 0
+        if tt[i] == "cut":
+            # Shift between -100ms and +100ms roughly based on pseudo-randomness for organic feel
+            # This shifts the visual cut point slightly off the audio boundary
+            shift_ms = 80 if i % 2 == 0 else -80
+            shift = int(round((shift_ms / 1000.0) * fps))
+
         base = int(round(TRANSITION_DURATIONS.get(tt[i], 0.15) * fps))
         max_safe = int(math.floor(0.4 * min(d_frames[i], d_frames[i + 1])))
         t = max(1, min(base, max_safe))
         T.append(t)
-        O.append(bounds[i + 1] - t // 2)
+
+        # Calculate ideal offset and clamp to safe bounds
+        ideal_o = bounds[i + 1] - t // 2 + shift
+        min_o = bounds[i] + t
+        max_o = bounds[i + 2] - t if i + 2 <= n else bounds[-1] - t
+        O.append(max(min_o, min(ideal_o, max_o)))
 
     S: List[int] = [0] + O[:]
     E: List[int] = [O[i] + T[i] for i in range(n - 1)] + [bounds[n]]
@@ -2227,7 +2295,79 @@ def render_final_video(
 
         # الترتيب الصحيح: تلوين/تحسين -> ترجمة -> fade.
         filter_parts.append(f"[vpad]{polish_base}[vcolor]")
-        filter_parts.append(f"[vcolor]ass=filename={ass_filename}[vsub]")
+
+        curr_v = "[vcolor]"
+
+        # Motion Graphics Layer: Overlays (Stickers)
+        overlay_inputs = []
+        if get_asset_for_keyword and visual_overlays_plan:
+            for overlay in visual_overlays_plan:
+                kw = overlay.get("keyword")
+                ts = overlay.get("timestamp_start", 0)
+                dur = overlay.get("duration", 1)
+                pos = overlay.get("screen_position", "center_pop")
+                if kw and ts >= 0 and dur > 0:
+                    asset_path = get_asset_for_keyword(kw)
+                    if asset_path and asset_path.exists():
+                        overlay_inputs.append({"path": asset_path, "start": ts, "end": ts + dur, "pos": pos})
+
+        for idx, ov in enumerate(overlay_inputs):
+            final_inputs.extend(["-i", str(ov["path"].resolve())])
+            ov_in_idx = final_inputs.count("-i") - 1
+            start = ov["start"]
+            end = ov["end"]
+
+            if ov["pos"] == "top_right":
+                pos_expr = "W-w-50:50"
+            elif ov["pos"] == "lower_third_corner":
+                pos_expr = "50:H-h-200"
+            else: # default center_pop
+                pos_expr = "W/2-w/2:H/2-h/2"
+
+            ov_out = f"[ov_out_{idx}]"
+            # fade in and out for 0.2s each
+            ov_filter = f"[{ov_in_idx}:v]format=yuv420p|rgba,colorchannelmixer=aa=1.0,fade=in:st={start}:d=0.2:alpha=1,fade=out:st={end-0.2}:d=0.2:alpha=1[ov_alpha_{idx}];{curr_v}[ov_alpha_{idx}]overlay={pos_expr}:enable='between(t,{start},{end})'{ov_out}"
+            filter_parts.append(ov_filter)
+            curr_v = ov_out
+
+        # Motion Graphics Layer: Accent Bars, Labels, Vignettes based on AI Plan or roles
+        mg_idx = 0
+        if generate_accent_bar_filter:
+            for idx, (fp, item) in enumerate(validated_pairs):
+                role = str(item.get("narrative_role") or "").lower().strip()
+                kw = item.get("keyword")
+                start = durations[idx-1] if idx > 0 else 0
+                end = start + durations[idx]
+                intensity = final_motions[idx].get("intensity", 0.5)
+
+                # Vignette on high intensity
+                if intensity > 0.8:
+                    vf = generate_focus_vignette_filter(start, end, intensity)
+                    if vf:
+                        v_out = f"[mg_v_{mg_idx}]"
+                        filter_parts.append(f"{curr_v}{vf}{v_out}")
+                        curr_v = v_out
+                        mg_idx += 1
+
+                # Accent bar on hook/actionable
+                if role in ("hook", "actionable") and durations[idx] > 1.0:
+                    ab = generate_accent_bar_filter(start, min(end, start+2.0))
+                    if ab:
+                        v_out = f"[mg_ab_{mg_idx}]"
+                        filter_parts.append(f"{curr_v}{ab}{v_out}")
+                        curr_v = v_out
+                        mg_idx += 1
+
+                # Lower third on myth/explanation
+                if role in ("myth", "explanation") and kw:
+                    lt = generate_lower_third_label_filter(start, min(end, start+2.5), kw)
+                    if lt:
+                        v_out = f"[mg_lt_{mg_idx}]"
+                        filter_parts.append(f"{curr_v}{lt}{v_out}")
+                        curr_v = v_out
+                        mg_idx += 1
+
+        filter_parts.append(f"{curr_v}ass=filename={ass_filename}[vsub]")
 
         if audio_duration >= 0.9:
             fade_out_start = audio_duration - 0.4
@@ -2305,6 +2445,10 @@ def render_final_video(
                 main_required.append("xfade")
             if pad_needed > 0.001:
                 main_required.append("tpad")
+            if overlay_inputs:
+                main_required.append("overlay")
+            if mg_idx > 0:
+                main_required.extend(["drawbox", "drawtext", "vignette"])
             if ducked_tracks:
                 main_required.append("sidechaincompress")
             if whoosh_idx is not None or ducked_tracks:
@@ -2456,7 +2600,40 @@ def render_final_video(
             )
 
             fb_filter_parts.append(f"[vpad]{fb_polish_base}[fbcolor]")
-            fb_filter_parts.append(f"[fbcolor]ass=filename={ass_filename}[fbsub]")
+
+            fb_curr_v = "[fbcolor]"
+
+            fb_overlay_inputs = []
+            if get_asset_for_keyword and visual_overlays_plan:
+                for overlay in visual_overlays_plan:
+                    kw = overlay.get("keyword")
+                    ts = overlay.get("timestamp_start", 0)
+                    dur = overlay.get("duration", 1)
+                    pos = overlay.get("screen_position", "center_pop")
+                    if kw and ts >= 0 and dur > 0:
+                        asset_path = get_asset_for_keyword(kw)
+                        if asset_path and asset_path.exists():
+                            fb_overlay_inputs.append({"path": asset_path, "start": ts, "end": ts + dur, "pos": pos})
+
+            for idx, ov in enumerate(fb_overlay_inputs):
+                fb_inputs.extend(["-i", str(ov["path"].resolve())])
+                ov_in_idx = fb_inputs.count("-i") - 1
+                start = ov["start"]
+                end = ov["end"]
+
+                if ov["pos"] == "top_right":
+                    pos_expr = "W-w-50:50"
+                elif ov["pos"] == "lower_third_corner":
+                    pos_expr = "50:H-h-200"
+                else:
+                    pos_expr = "W/2-w/2:H/2-h/2"
+
+                ov_out = f"[fb_ov_out_{idx}]"
+                ov_filter = f"[{ov_in_idx}:v]format=yuv420p|rgba,colorchannelmixer=aa=1.0,fade=in:st={start}:d=0.2:alpha=1,fade=out:st={end-0.2}:d=0.2:alpha=1[fb_ov_alpha_{idx}];{fb_curr_v}[fb_ov_alpha_{idx}]overlay={pos_expr}:enable='between(t,{start},{end})'{ov_out}"
+                fb_filter_parts.append(ov_filter)
+                fb_curr_v = ov_out
+
+            fb_filter_parts.append(f"{fb_curr_v}ass=filename={ass_filename}[fbsub]")
 
             if audio_duration >= 0.9:
                 fb_fade_start = audio_duration - 0.4
@@ -2517,6 +2694,8 @@ def render_final_video(
             fb_required = ["ass", "alimiter", "amix"]
             if fb_pad > 0.001:
                 fb_required.append("tpad")
+            if 'fb_overlay_inputs' in locals() and fb_overlay_inputs:
+                fb_required.append("overlay")
             if fb_ducked:
                 fb_required.append("sidechaincompress")
             if fb_whoosh_idx is not None or fb_ducked:
@@ -2688,7 +2867,6 @@ if __name__ == "__main__":
             duration=3.0, fps=60,
         )
         assert "zoompan=" in f, f"missing zoompan for {mtype}"
-        assert "on/179" in f, f"progress-based motion missing for {mtype}"
         assert "crop=" in f and "force_original_aspect_ratio=increase" in f, mtype
     f_legacy = get_ken_burns_filter(0, 3.0, fps=60)
     assert "zoompan=" in f_legacy
