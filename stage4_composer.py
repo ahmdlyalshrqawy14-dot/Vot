@@ -2186,11 +2186,8 @@ def render_final_video(
             fb_required = ["ass", "alimiter", "amix"]
             if fb_pad > 0.001:
                 fb_required.append("tpad")
-            try:
-                if overlay_inputs:
-                    fb_required.append("overlay")
-            except NameError:
-                pass
+            if overlay_inputs:
+                fb_required.append("overlay")
             if fb_ducked:
                 fb_required.append("sidechaincompress")
             if fb_whoosh_idx is not None or fb_ducked:
