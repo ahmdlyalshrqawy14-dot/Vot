@@ -2026,32 +2026,52 @@ async def run_stage1_only(query, context, episode):
         if _is_stale(chat_id, session):
             return
         logger.exception(f"خطأ في المرحلة الأولى للحلقة {ep_id}")
-        _stage_mark_failed(session, 1)
+        _stage_mark_failed(session, 1, source="ai")
+
+        topic = episode.get("topic", "N/A")
+        tone = episode.get("tone", "N/A")
+        fallback_prompt = (
+            f"Write a documentary script about:\n"
+            f"Topic: {topic}\n"
+            f"Tone: {tone}\n\n"
+            f"Rules:\n"
+            f"1. Write exactly between {SENTENCE_MIN} and {SENTENCE_MAX} sentences.\n"
+            f"2. Write in English only.\n"
+            f"3. Output exactly ONE sentence per line.\n"
+            f"4. Each sentence must end with a period (.), exclamation mark (!), or question mark (?).\n"
+            f"5. Do not include any numbers, lists, or extra formatting (no bold/italics)."
+        )
+
+        is_exhausted = "exhausted" in str(e).lower() or "quota" in str(e).lower() or "429" in str(e).lower() or "403" in str(e).lower()
+        alert_msg = "⚠️ <b>جميع مفاتيح Gemini غير متاحة حاليًا. يمكنك تنفيذ هذه الخطوة يدويًا بالبرومبت أدناه، أو إعادة المحاولة لاحقًا.</b>\n\n" if is_exhausted else ""
+
+        reply_markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✍️ إدخال السكريبت يدويًا", callback_data=f"s1_man_{ep_id}")],
+            [InlineKeyboardButton("🔄 إعادة المحاولة", callback_data=f"regenerate_stage1_{ep_id}")],
+            [InlineKeyboardButton("❌ إلغاء", callback_data="soft_cancel")],
+        ])
+
+        msg_text = (
+            f"{alert_msg}❌ <b>فشل توليد السكريبت</b>\n\n"
+            f"السبب: <code>{_esc(str(e))}</code>\n\n"
+            f"انسخ هذا البرومبت ونفذه بنفسك، ثم اختر الإدخال اليدوي:\n"
+            f"<pre>{_esc(fallback_prompt)}</pre>"
+        )
+
         try:
-            await status_msg.edit_text(
-                f"❌ <b>خطأ أثناء توليد المرحلة الأولى:</b>\n"
-                f"<code>{_esc(str(e))}</code>",
-                parse_mode=ParseMode.HTML,
-            )
+            if len(msg_text) > 4000:
+                await context.bot.send_document(
+                    chat_id=chat_id,
+                    document=fallback_prompt.encode("utf-8"),
+                    filename="stage1_fallback_prompt.txt",
+                    caption=f"{alert_msg}❌ <b>فشل توليد السكريبت</b>\nانسخ البرومبت من الملف ثم اختر الإدخال اليدوي.",
+                    reply_markup=reply_markup,
+                    parse_mode=ParseMode.HTML
+                )
+            else:
+                await status_msg.edit_text(msg_text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
         except Exception:
             pass
-
-        # خيارات يدوية عند الفشل
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                "🛠️ <b>ماذا تريد أن تفعل؟</b>\n"
-                f"• <b>استخدام النتيجة يدويًا</b>: أرسل سكريبتك بنفسك.\n"
-                f"• <b>إعادة التوليد</b>: محاولة أخرى تلقائيًا.\n"
-                f"• <b>إلغاء</b>: العودة للقائمة."
-            ),
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✍️ إدخال السكريبت يدويًا", callback_data=f"s1_man_{ep_id}")],
-                [InlineKeyboardButton("🔄 إعادة التوليد", callback_data=f"regenerate_stage1_{ep_id}")],
-                [InlineKeyboardButton("❌ إلغاء", callback_data="soft_cancel")],
-            ]),
-            parse_mode=ParseMode.HTML,
-        )
 
 
 # =================================================================
@@ -2134,6 +2154,7 @@ async def run_stage2_auto(query, context):
             return
 
         sent_files = []
+        unified_content = []
         for idx, batch in enumerate(batches, start=1):
             if _is_stale(chat_id, session):
                 return
@@ -2141,15 +2162,27 @@ async def run_stage2_auto(query, context):
             with open(p_file, "w", encoding="utf-8") as f:
                 f.write("\n\n".join(batch))
             sent_files.append(p_file)
-            with open(p_file, "rb") as fp:
-                await context.bot.send_document(
-                    chat_id=chat_id, document=fp,
-                    caption=(
-                        f"📦 <b>حزمة أوامر الصور: الجزء [{idx:02d}]</b>\n"
-                        f"└ يحتوي على <b>{len(batch)}</b> برومبت."
-                    ),
-                    parse_mode=ParseMode.HTML,
-                )
+
+            # Prepare unified content
+            start_num = (idx - 1) * 24 + 1
+            end_num = min(start_num + len(batch) - 1, sum(len(b) for b in batches))
+            unified_content.append(f"===== BATCH {idx:02d} (prompts {start_num:02d}–{end_num:02d}) =====")
+            unified_content.append("\n\n".join(batch))
+            unified_content.append("")
+
+        unified_file_path = prompts_dir / f"unified_prompts_{ep_id}.txt"
+        with open(unified_file_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(unified_content))
+
+        with open(unified_file_path, "rb") as fp:
+            await context.bot.send_document(
+                chat_id=chat_id, document=fp,
+                caption=(
+                    f"📦 <b>أوامر الصور (النسخة الموحدة)</b>\n"
+                    f"└ يحتوي على كل البرومبتات مجزأة لنسخ سهل."
+                ),
+                parse_mode=ParseMode.HTML,
+            )
 
         _stage_set(
             session, 2,
@@ -2187,36 +2220,38 @@ async def run_stage2_auto(query, context):
         logger.exception(f"خطأ في المرحلة الثانية للحلقة {ep_id}")
         _stage_mark_failed(session, 2, source="ai")
 
-        # لا نحذف الملفات الجزئية
-        partial_files = sorted(prompts_dir.glob("prompts_part_*.txt"))
-        partial_note = ""
-        if partial_files:
-            partial_note = f"\n📁 <b>ملفات جزئية محفوظة:</b> <code>{len(partial_files)}</code>"
+        fallback_prompt_lines = [
+            "We need EXACTLY 1 image prompt for EACH sentence below.",
+            "Write the image prompt focusing on realism, subject description, and atmosphere.",
+            "Keep prompts under 30 words. Maintain the exact numbering.",
+            "---- SCRIPT ----"
+        ]
+
+        for i, s in enumerate(sentences, start=1):
+            fallback_prompt_lines.append(f"{i:02d}) {s}")
+
+        fallback_prompt = "\n".join(fallback_prompt_lines)
+
+        is_exhausted = "exhausted" in str(e).lower() or "quota" in str(e).lower() or "429" in str(e).lower() or "403" in str(e).lower()
+        alert_msg = "⚠️ <b>جميع مفاتيح Gemini غير متاحة حاليًا. يمكنك تنفيذ هذه الخطوة يدويًا بالبرومبت أدناه، أو إعادة المحاولة لاحقًا.</b>\n\n" if is_exhausted else ""
+
+        reply_markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✍️ إدخال الأوامر يدويًا", callback_data=f"s2_man_{ep_id}")],
+            [InlineKeyboardButton("🔄 إعادة المحاولة", callback_data=f"s2_retry_{ep_id}")],
+            [InlineKeyboardButton("❌ إلغاء", callback_data="soft_cancel")],
+        ])
 
         try:
-            await status_msg.edit_text(
-                f"❌ <b>خطأ في المرحلة الثانية:</b>\n"
-                f"<code>{_esc(str(e))}</code>{partial_note}",
-                parse_mode=ParseMode.HTML,
+            await context.bot.send_document(
+                chat_id=chat_id,
+                document=fallback_prompt.encode("utf-8"),
+                filename="stage2_fallback_prompt.txt",
+                caption=f"{alert_msg}❌ <b>فشل توليد أوامر الصور</b>\nالسبب: <code>{_esc(str(e))}</code>\nانسخ البرومبت من الملف ثم اختر الإدخال اليدوي.",
+                reply_markup=reply_markup,
+                parse_mode=ParseMode.HTML
             )
         except Exception:
             pass
-
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                "🛠️ <b>ماذا تريد أن تفعل؟</b>\n"
-                "• <b>رفع أوامر يدوية</b>: أرسل ملفات .txt أو نصًا مباشرًا.\n"
-                "• <b>إعادة المحاولة</b>.\n"
-                "• <b>إلغاء</b>."
-            ),
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✍️ رفع أوامر يدويًا", callback_data=f"s2_man_{ep_id}")],
-                [InlineKeyboardButton("🔄 إعادة المحاولة", callback_data=f"s2_retry_{ep_id}")],
-                [InlineKeyboardButton("❌ إلغاء", callback_data="soft_cancel")],
-            ]),
-            parse_mode=ParseMode.HTML,
-        )
 
 
 async def finalize_stage2_manual(query, session, context):
@@ -2474,18 +2509,25 @@ async def run_stage3(query, context):
             return
         logger.exception(f"خطأ في المرحلة الثالثة للحلقة {ep_id}")
         _stage_mark_failed(session, 3, source="ai")
+
+        script_text = "\n".join(sentences)
+        reply_markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📤 رفع صوت يدوي", callback_data=f"s3_man_{ep_id}")],
+            [InlineKeyboardButton("🔄 إعادة المحاولة", callback_data=f"s3_retry_{ep_id}")],
+            [InlineKeyboardButton("❌ إلغاء", callback_data="soft_cancel")],
+        ])
+
+        is_exhausted = "exhausted" in str(e).lower() or "quota" in str(e).lower() or "429" in str(e).lower() or "403" in str(e).lower()
+        alert_msg = "⚠️ <b>جميع مفاتيح Gemini غير متاحة حاليًا. يمكنك تنفيذ هذه الخطوة يدويًا بالبرومبت أدناه، أو إعادة المحاولة لاحقًا.</b>\n\n" if is_exhausted else ""
+
         try:
-            await wait_msg.edit_text(
-                text=(
-                    f"❌ <b>فشل توليد الصوت:</b>\n<code>{_esc(str(e))}</code>\n\n"
-                    f"👇 يمكنك رفع ملف صوت خارجي أو إعادة المحاولة."
-                ),
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📤 رفع ملف صوت خارجي", callback_data=f"s3_man_{ep_id}")],
-                    [InlineKeyboardButton("🔄 إعادة المحاولة", callback_data=f"s3_retry_{ep_id}")],
-                    [InlineKeyboardButton("❌ إلغاء", callback_data="soft_cancel")],
-                ]),
-                parse_mode=ParseMode.HTML,
+            await context.bot.send_document(
+                chat_id=chat_id,
+                document=script_text.encode("utf-8"),
+                filename="stage3_fallback_script.txt",
+                caption=f"{alert_msg}❌ <b>فشل توليد الصوت</b>\nالسبب: <code>{_esc(str(e))}</code>\nانسخ السكريبت من الملف، ولده خارجيًا، ثم اختر الرفع اليدوي.",
+                reply_markup=reply_markup,
+                parse_mode=ParseMode.HTML
             )
         except Exception:
             pass
@@ -3778,20 +3820,46 @@ async def run_stage5(msg_obj, context):
             return
         logger.exception(f"فشل بيانات النشر للحلقة {ep_id}")
         _stage_mark_failed(session, 5, source="ai")
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                f"❌ <b>فشل توليد بيانات النشر</b>\n"
-                f"<code>{_esc(str(e))}</code>\n\n"
-                f"<i>الفيديو النهائي محفوظ على السيرفر ولم يُمس.</i>"
-            ),
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✍️ إدخال البيانات يدويًا", callback_data=f"s5_man_{ep_id}")],
-                [InlineKeyboardButton("🔄 إعادة المحاولة", callback_data=f"s5_retry_{ep_id}")],
-                [InlineKeyboardButton("⏭️ تخطي بيانات النشر", callback_data=f"s5_skip_{ep_id}")],
-            ]),
-            parse_mode=ParseMode.HTML,
+
+        ep = session.get("episode_data", {})
+        topic = ep.get("topic", "N/A")
+
+        fallback_prompt = (
+            f"Write youtube metadata for a video about:\n"
+            f"Topic: {topic}\n\n"
+            f"Please provide exactly this JSON structure:\n"
+            f"{{\n"
+            f'  "titles": ["Title 1", "Title 2", "Title 3"],\n'
+            f'  "thumbnails": ["Idea 1", "Idea 2", "Idea 3"],\n'
+            f'  "description": "Video description here...",\n'
+            f'  "tags": ["tag1", "tag2", "tag3"]\n'
+            f"}}\n"
         )
+
+        is_exhausted = "exhausted" in str(e).lower() or "quota" in str(e).lower() or "429" in str(e).lower() or "403" in str(e).lower()
+        alert_msg = "⚠️ <b>جميع مفاتيح Gemini غير متاحة حاليًا. يمكنك تنفيذ هذه الخطوة يدويًا بالبرومبت أدناه، أو إعادة المحاولة لاحقًا.</b>\n\n" if is_exhausted else ""
+
+        reply_markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✍️ إدخال البيانات يدويًا", callback_data=f"s5_man_{ep_id}")],
+            [InlineKeyboardButton("🔄 إعادة المحاولة", callback_data=f"s5_retry_{ep_id}")],
+            [InlineKeyboardButton("⏭️ تخطي بيانات النشر", callback_data=f"s5_skip_{ep_id}")],
+        ])
+
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"{alert_msg}❌ <b>فشل توليد بيانات النشر</b>\n"
+                    f"السبب: <code>{_esc(str(e))}</code>\n\n"
+                    f"انسخ البرومبت التالي لتوليد البيانات بنفسك:\n"
+                    f"<pre>{_esc(fallback_prompt)}</pre>\n\n"
+                    f"<i>الفيديو النهائي محفوظ على السيرفر ولم يُمس.</i>"
+                ),
+                reply_markup=reply_markup,
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
         return
 
     # ❌ لا نستدعي _finalize_episode هنا — القرار للمستخدم عبر أزرار الاعتماد/التخطي
