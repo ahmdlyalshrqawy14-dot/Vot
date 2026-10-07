@@ -54,23 +54,14 @@ class AIEditorialDirector:
                 return cached
 
         try:
-            prompt = self._build_prompt(
+            system, user = self._build_prompt(
                 renderable_timeline, durations, transitions
             )
             raw = call_gemini_with_fallback(
-                payload={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.2}},
-                operation="plan_montage"
+                system_instruction=system,
+                user_prompt=user,
+                response_mime_type="application/json"
             )
-
-            # extract text
-            if isinstance(raw, dict) and "candidates" in raw and raw["candidates"]:
-                content = raw["candidates"][0].get("content", {})
-                if "parts" in content and content["parts"]:
-                    raw = content["parts"][0].get("text", "")
-            elif isinstance(raw, str):
-                pass
-            else:
-                raw = str(raw)
 
             plan = self._parse_plan(raw, len(renderable_timeline))
             if plan:
@@ -92,7 +83,7 @@ class AIEditorialDirector:
         timeline: List[Dict[str, Any]],
         durations: List[float],
         transitions: List[str],
-    ) -> str:
+    ) -> tuple[str, str]:
         items = []
         tr_list = list(transitions) + [""]
         for i, (it, d, tr) in enumerate(zip(timeline, durations, tr_list)):
@@ -133,7 +124,7 @@ class AIEditorialDirector:
         )
 
         user = f"اللقطات:\n{tl_json}\n\nأعد JSON فقط دون أي شرح."
-        return system + "\n" + user
+        return system, user
 
     def _parse_plan(self, raw: str, n_shots: int) -> Dict[str, Any]:
         if not raw:

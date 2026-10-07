@@ -2190,6 +2190,8 @@ def render_final_video(
                 fb_required.append("overlay")
             if fb_ducked:
                 fb_required.append("sidechaincompress")
+            if 'fb_overlay_inputs' in locals() and fb_overlay_inputs:
+                fb_required.append("overlay")
             if fb_whoosh_idx is not None or fb_ducked:
                 fb_required.append("pan")
             _require_ffmpeg_filters(fb_required)
