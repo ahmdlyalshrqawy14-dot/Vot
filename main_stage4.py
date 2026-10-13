@@ -1,9 +1,11 @@
 import json
 import sys
 from pathlib import Path
+
 from stage4_vision import process_and_verify_images, MissingAssetsError
 from stage4_subtitles import align_audio_and_generate_ass
 from stage4_composer import render_final_video
+from stage4_layering import process_layers_batch   # ← الجديد
 
 BASE_DIR = Path(__file__).resolve().parent
 OUTPUTS_DIR = BASE_DIR / "outputs"
@@ -35,7 +37,7 @@ def main():
     print(f"📊 إجمالي جمل السكربت والصور المستهدفة: {total_expected}")
     print("=" * 60)
 
-    # 1. الفحص البصري وكشف النواقص والرقعة الذكية
+    # 1. الفحص البصري وكشف النواقص
     clean_frames_dir = OUTPUTS_DIR / f"episode_{target_id}_clean_frames"
     try:
         frames = process_and_verify_images(
@@ -47,6 +49,16 @@ def main():
         print("\n🚨 توقف مسار الرندرة مؤقتاً بسبب نقص الأصول:")
         print(str(missing_err))
         return
+
+    # 1.5  ← الجديد: Auto-Layering (قص + خلفية + حافة ورق)
+    layers_dir = OUTPUTS_DIR / f"episode_{target_id}_layers"
+    print("\n✂️  جاري عمل Auto-Layering على كل الصور (rembg)...")
+    layers_map = process_layers_batch(
+        frames=frames,
+        output_dir=layers_dir,
+        max_workers=4          # ممكن تزوده لو جهازك قوي
+    )
+    print(f"✅ تم إنشاء طبقات لـ {len(layers_map)} صورة في: {layers_dir}")
 
     # 2. المزامنة الزمنية وتوليد الترجمة الحركية
     subtitles_ass = OUTPUTS_DIR / f"episode_{target_id}_subtitles.ass"
@@ -66,6 +78,7 @@ def main():
         audio_file=audio_file,
         subtitles_ass=subtitles_ass,
         output_video_path=final_video
+        # ملاحظة: الطبقات جاهزة في layers_map، وهنستخدمها في المرحلة الجاية (القوالب الحركية)
     )
 
     print("\n" + "=" * 60)
@@ -75,6 +88,7 @@ def main():
     print(f"🎨 الترجمة: أصفر باهت (#FDE047) - Word-by-Word بدون صندوق خلفي")
     print(f"🎥 حركات الكاميرا: Ken Burns 6-Pattern Cycle متجددة")
     print(f"🔇 الموسيقى الخلفية: محظورة 100% (Zero BGM)")
+    print(f"✂️  الطبقات (FG + BG): {layers_dir}")
     print(f"💾 مسار الفيديو النهائي: {final_video}")
     print("=" * 60)
 
