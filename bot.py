@@ -30,6 +30,7 @@ from stage3_audio import generate_stage3_audio, generate_voice_preview
 from stage4_vision import process_and_verify_images, MissingAssetsError
 from stage4_subtitles import align_audio_and_generate_ass
 from stage4_composer import render_final_video
+from stage4_layering import process_layers_batch
 from stage5_metadata import generate_stage5_metadata
 
 # -----------------------------------------------------------------
@@ -3652,6 +3653,30 @@ async def run_final_render(msg_obj, context):
         )
         if _is_stale(chat_id, session):
             return
+
+        # ← Auto-Layering قبل الرندرة
+        layers_dir = OUTPUTS_DIR / f"episode_{ep_id}_layers"
+        await progress_msg.edit_text(
+            f"<b>✂️ جاري عمل Auto-Layering على {len(frames)} صورة...</b>\n"
+            f"<i>قص العنصر + خلفية أرشيفية + حافة ورق</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        layers_map = await asyncio.to_thread(
+            process_layers_batch,
+            frames=[Path(f) for f in frames],
+            output_dir=layers_dir,
+            max_workers=4
+        )
+        if _is_stale(chat_id, session):
+            return
+        logger.info(f"✅ تم إنشاء طبقات لـ {len(layers_map)} صورة → {layers_dir}")
+
+        await progress_msg.edit_text(
+            f"<b>🎬 رندرة كاملة — FFmpeg 1080p 60fps</b>\n"
+            f"✅ الطبقات جاهزة ({len(layers_map)} صورة)\n"
+            f"⏳ المزامنة + الترجمة + Ken Burns...",
+            parse_mode=ParseMode.HTML,
+        )
 
         await asyncio.to_thread(
             render_final_video, frames, timeline, audio_file, subtitles_ass, final_video
